@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="description" content="Учебный симулятор: low-poly манекен на active ragdoll (three.js + Rapier) реагирует на попадания и пролёты пуль, с моделью кровопотери.">
+<meta name="description" content="Учебный симулятор: low-poly манекен на active ragdoll (three.js + Rapier) реагирует на попадания и пролёты пуль, с анатомией и моделью кровопотери.">
 <style>body { margin: 0; } [hidden] { display: none !important; }</style>
 <title>Баллистический манекен</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -108,6 +108,7 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
 .overlay { position: absolute; pointer-events: none; font-size: 13px; }
 #hint { left: 16px; bottom: 14px; right: 16px; color: var(--muted); max-width: 60ch; }
 #hint kbd { font-family: var(--font-data); font-size: 11px; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; background: var(--panel); color: var(--ink); }
+#aimChip { white-space: normal; max-width: 100%; }
 #chips { left: 16px; top: 14px; display: flex; gap: 6px; flex-wrap: wrap; right: 16px; }
 .chip { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; font-family: var(--font-data); font-size: 12px; white-space: nowrap; }
 .chip .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; background: var(--ok); }
@@ -125,6 +126,7 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
 #wounds li span:last-child { font-family: var(--font-data); font-size: 12px; color: var(--muted); white-space: nowrap; }
 #wounds li.art span:first-child { color: var(--hit); }
 .check { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 14px; cursor: pointer; }
+.check kbd { font-family: var(--font-data); font-size: 11px; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; color: var(--muted); }
 .check input { accent-color: var(--accent); width: 16px; height: 16px; }
 .subh { font-size: 13px; color: var(--muted); margin: 12px 0 6px; }
 #loading { inset: 0; display: grid; place-items: center; color: var(--muted); font-family: var(--font-data); }
@@ -149,7 +151,7 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
       <span class="chip" id="bloodChip">кровопотеря: 0 мл</span>
     </div>
     <div id="replayBadge" class="overlay" hidden>ПОВТОР ×0.25</div>
-    <div id="hint" class="overlay">Клик по манекену — выстрел из точки камеры. Клик рядом — пролёт пули или попадание в пол. Перетаскивание — вращение камеры, колесо — приближение. <kbd>Space</kbd> пауза, <kbd>R</kbd> сброс, <kbd>P</kbd> повтор.</div>
+    <div id="hint" class="overlay">Клик по манекену — выстрел из точки камеры. Клик рядом — пролёт пули или попадание в пол. Перетаскивание — вращение камеры, колесо — приближение. <kbd>Space</kbd> пауза, <kbd>R</kbd> сброс, <kbd>P</kbd> повтор, <kbd>X</kbd> рентген.</div>
     <div id="loading" class="overlay">загрузка физики…</div>
   </div>
 
@@ -162,6 +164,12 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
     <section aria-labelledby="h-weapon">
       <h2 id="h-weapon">Боеприпас</h2>
       <div class="weapons" id="weapons"></div>
+    </section>
+
+    <section aria-labelledby="h-anat">
+      <h2 id="h-anat">Анатомия</h2>
+      <label class="check" for="xrayBox"><input type="checkbox" id="xrayBox"> Рентген: органы и раневой канал <kbd>X</kbd></label>
+      <p class="note">Попадание считается по раневому каналу: что задела пуля на пути через сегмент, то и повреждено. Прицел показывает органы на линии выстрела.</p>
     </section>
 
     <section aria-labelledby="h-imp">
@@ -204,7 +212,7 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
         <button type="button" id="ph10" aria-pressed="false">Ускорить ×10</button>
       </div>
       <label class="check" for="showBlood"><input type="checkbox" id="showBlood" checked> Показывать кровь</label>
-      <p class="note">Скорости кровотечения — порядок величины для типа раны. Внутреннее кровотечение (грудь, живот) почти не видно снаружи.</p>
+      <p class="note">Скорости кровотечения — порядок величины для задетого органа или сосуда. Внутреннее кровотечение (грудь, живот) почти не видно снаружи.</p>
     </section>
 
     <section aria-labelledby="h-last">
@@ -257,9 +265,10 @@ const STRENGTH = {      // joint stiffness at full tone, N·m/rad
   abdomen: 1400, chest: 1000, head: 160, uArm: 160, fArm: 90, thigh: 1600, shin: 1600, foot: 700,
 };
 const WEAPONS = [
-  { id: 'pistol', name: 'Пистолет 9×19', m: 0.008, v: 360 },
-  { id: 'rifle', name: 'Винтовка 5,56×45', m: 0.004, v: 940 },
-  { id: 'slug', name: 'Дробовик, пуля 12 к.', m: 0.028, v: 450 },
+  // pen: how deep the bullet goes in tissue, m; reach: extra radius of damage around the track (temporary cavity), m
+  { id: 'pistol', name: 'Пистолет 9×19', m: 0.008, v: 360, pen: 0.4, reach: 0.004 },
+  { id: 'rifle', name: 'Винтовка 5,56×45', m: 0.004, v: 940, pen: 0.7, reach: 0.015 },
+  { id: 'slug', name: 'Дробовик, пуля 12 к.', m: 0.028, v: 450, pen: 0.45, reach: 0.012 },
 ];
 const G_GROUND = 0x1, G_TORSO = 0x2, G_ARML = 0x4, G_ARMR = 0x8, G_LEGL = 0x10, G_LEGR = 0x20;
 const groups = (member, filter) => (member << 16) | filter;
@@ -394,7 +403,14 @@ function buildWorld() {
 
   const defs = partDefs();
   const density = BODY_MASS / defs.reduce((s, d) => s + volume(d), 0);
-  if (!parts) parts = defs.map(d => ({ ...d, mesh: meshFor(d) }));
+  if (!parts) {
+    parts = defs.map(d => ({ ...d, mesh: meshFor(d) }));
+    for (const p of parts) {
+      p.organs = organsFor(p);
+      for (const o of p.organs) { o.mesh = organMesh(o); p.mesh.add(o.mesh); }
+    }
+  }
+  for (const p of parts) for (const o of p.organs) o.mesh.material.emissive.set(0x000000);
   byName = {};
   for (const p of parts) {
     byName[p.n] = p;
@@ -570,13 +586,26 @@ function collapse(fast) {
   }
 }
 
-function react(zone, side, hitDir) {
+function react(zone, side, hitDir, w) {
   const c = character;
   if (!c.conscious) return { text: 'Тело уже без мышечного контроля: только пассивное движение от импульса.' };
   if (c.state === 'ok') setState('wounded');
   if (zone === 'head') {
-    collapse(true);
-    return { text: 'Мгновенная потеря мышечного контроля. Тело оседает под собственным весом; куда оно упадёт, решает поза, а не пуля.' };
+    if (w.brain || w.cervical) {
+      collapse(true);
+      return { text: w.brain
+        ? 'Поражён мозг: мгновенная потеря мышечного контроля. Тело оседает под собственным весом; куда оно упадёт, решает поза, а не пуля.'
+        : 'Перебит спинной мозг в шее: мгновенный паралич всего тела, тело оседает.' };
+    }
+    flinch(0.8, side); startle(0.8, side);
+    if (w.organs.length) return { text: 'Ранение шеи без повреждения спинного мозга: человек в сознании, главная угроза — кровотечение.' };
+    return { text: 'Касательное ранение: пуля прошла по черепу, не задев мозг. Человек оглушён, но в сознании.' };
+  }
+  if ((zone === 'chest' || zone === 'abdomen') && w.spine) {
+    tone([...LEG('L'), ...LEG('R')], 0, 40);
+    c.balanceTarget = 0; c.balanceRate = 40;
+    flinch(0.6, side);
+    return { text: 'Задет позвоночник: ноги парализованы мгновенно, тело падает. Сознание сохраняется, руки работают.' };
   }
   if (zone === 'chest' || zone === 'abdomen') {
     c.torsoHits++;
@@ -589,7 +618,13 @@ function react(zone, side, hitDir) {
       ['uArm' + far]: arm(far, 0.75), ['fArm' + far]: [-1.8, 0, 0],
       chest: [0.2, 0, 0], head: [0.25, 0, 0],
     }, { peak: 1, attack: 0.35, hold: Infinity, release: 0.6, tag: 'clutch' }));
-    return { text: 'Рефлекторное сгибание, рука тянется к ране. Устоит ли человек, решает кровопотеря, а не удар.' };
+    return { text: w.arrest
+      ? 'Рефлекторное сгибание, рука тянется к ране. Несколько секунд человек ещё стоит и двигается: мозгу хватает кислорода.'
+      : 'Рефлекторное сгибание, рука тянется к ране. Устоит ли человек, решает кровопотеря, а не удар.' };
+  }
+  if (zone === 'pelvis' && !w.bone) {
+    flinch(0.6, side);
+    return { text: 'Кости таза целы: человек может стоять, хотя ходить больно.' };
   }
   if (zone === 'pelvis') {
     flinch(0.6, side);
@@ -597,7 +632,7 @@ function react(zone, side, hitDir) {
     c.balanceTarget = 0.12; c.balanceRate = 4;
     addLayer({ thighL: [-0.7, 0, 0], thighR: [-0.7, 0, 0], shinL: [1.3, 0, 0], shinR: [1.3, 0, 0] }, { attack: 0.3, hold: Infinity, tag: 'sag' });
     at(1.5, () => { if (c.state !== 'down') { c.balanceTarget = 0; } });
-    return { text: 'Таз — опора для обеих ног. Ноги не держат вес, тело падает сразу, без отброса.' };
+    return { text: 'Перелом таза: это опора для обеих ног. Ноги не держат вес, тело падает сразу, без отброса.' };
   }
   if (zone.startsWith('thigh') || zone.startsWith('shin') || zone.startsWith('foot')) {
     const S = zone.slice(-1), H = S === 'L' ? 'R' : 'L';
@@ -605,25 +640,26 @@ function react(zone, side, hitDir) {
     tone(LEG(S), 0.12, 10);
     c.balanceTarget = Math.min(c.balanceTarget, 0.6); c.balanceRate = 3;
     if (c.kneel) return { text: 'Ещё одно попадание в ногу: тело остаётся на колене.' };
-    if (Math.random() < 0.55) {
+    if (w.bone) {
       c.kneel = S;
+      tone(LEG(S), 0.05, 10);
       at(0.8, () => { if (c.state === 'wounded') setState('kneel'); });
       addLayer({
         ['thigh' + S]: [0.05, 0, 0], ['shin' + S]: [1.45, 0, 0],
         ['thigh' + H]: [-1.35, 0, 0], ['shin' + H]: [1.45, 0, 0], chest: [0.15, 0, 0],
       }, { attack: 0.7, hold: Infinity, tag: 'kneel' });
-      return { text: 'Нога подкашивается, тело опускается на колено раненой ноги и удерживает корпус.' };
+      return { text: 'Перелом: нога не держит вес. Тело опускается на колено раненой ноги и удерживает корпус.' };
     }
     const buckle = addLayer({ ['thigh' + S]: [-0.35, 0, 0], ['shin' + S]: [1.3, 0, 0] }, { attack: 0.25, hold: Infinity, tag: 'buckle' });
     at(1.8, () => { if (c.conscious) { tone(LEG(S), 0.45, 2); buckle.hold = buckle.age - buckle.attack; buckle.release = 0.8; } });
-    return { text: 'Нога подкашивается, вес уходит на другую. В этом прогоне устоял: раненая нога снова опирается, но слабо.' };
+    return { text: 'Кость цела: нога подкашивается, вес уходит на другую, потом раненая нога снова опирается, но слабо.' };
   }
   if (zone.startsWith('uArm') || zone.startsWith('fArm')) {
     const S = zone.slice(-1);
-    tone(ARM(S), 0.03, 12);
+    tone(ARM(S), w.bone ? 0.03 : 0.35, 12);
     flinch(0.35, side);
     addLayer({ chest: [0.1, S === 'L' ? 0.3 : -0.3, 0], head: [0, S === 'L' ? 0.5 : -0.5, 0] }, { attack: 0.1, hold: 0.4, release: 1 });
-    return { text: 'Рука повисает, корпус вздрагивает и поворачивается к ране.' };
+    return { text: w.bone ? 'Перелом: рука повисает, корпус вздрагивает и поворачивается к ране.' : 'Кость цела: рука работает, но слабо. Корпус вздрагивает и поворачивается к ране.' };
   }
   return { text: '' };
 }
@@ -662,9 +698,9 @@ function shoot(clientX, clientY) {
       .applyQuaternion(toQ(byName.chest.body.rotation(), new THREE.Quaternion()).invert());
     const side = Math.abs(local.x) < 0.04 ? 0 : Math.sign(local.x);
     const zone = partHit.n;
-    const res = react(zone, side, dir);
-    readout(ZONE_LABEL[zone], p, p / b.mass(), p / totalMass);
-    log('hit', ZONE_LABEL[zone], res.text, `Рана: ${wound.name}, ~${fmtRate(wound.rate)}. Δv тела ${(p / totalMass * 100).toFixed(1)} см/с`);
+    const res = react(zone, side, dir, wound);
+    readout(wound.zone, p, p / b.mass(), p / totalMass);
+    log('hit', wound.zone, res.text, `Канал${wound.perforating ? ' сквозной' : ', пуля осталась в теле'}: ${wound.name}. Кровотечение ~${fmtRate(wound.rate)}. Δv тела ${(p / totalMass * 100).toFixed(1)} см/с`);
     if (wound.arrest && character.conscious) log('info', 'Кровообращение', `Сердце или аорта: давление падает сразу, сознание уйдёт примерно через ${(character.arrestAt - character.physT).toFixed(0)} с.`);
     if (p / totalMass > 0.4 && character.balanceTarget > 0) { // only a movie-sized push can knock the body off balance
       character.balanceTarget = 0; character.balanceRate = 30;
@@ -727,51 +763,170 @@ function dust(pt) {
 }
 
 // ---------- blood loss ----------
-// Bleed rates are order-of-magnitude estimates (ml/s); `ext` is the share that leaves the body,
-// `clot` is the time constant (s) over which a minor wound slows down on its own.
-const BLOOD_VOLUME = 70 * BODY_MASS; // ~70 ml per kg
-const WOUND_TYPES = {
-  head: [{ p: 1, name: 'рана головы', rate: [2, 5], ext: 0.9, clot: 120 }],
-  chest: [{ p: 0.2, name: 'сердце или аорта', rate: [80, 140], ext: 0.3, arrest: true },
-    { p: 0.8, name: 'лёгкое', rate: [4, 12], ext: 0.2 }],
-  abdomen: [{ p: 0.3, name: 'печень или крупный сосуд', rate: [15, 35], ext: 0.2 },
-    { p: 0.7, name: 'брюшная полость', rate: [2, 6], ext: 0.25 }],
-  pelvis: [{ p: 0.25, name: 'подвздошная артерия', rate: [15, 30], ext: 0.4 },
-    { p: 0.75, name: 'мягкие ткани таза', rate: [1.5, 4], ext: 0.6, clot: 120 }],
-  thigh: [{ p: 0.2, name: 'бедренная артерия', rate: [15, 25], ext: 0.95 },
-    { p: 0.8, name: 'мышцы бедра', rate: [0.8, 2.5], ext: 0.9, clot: 90 }],
-  shin: [{ p: 0.1, name: 'артерия голени', rate: [4, 8], ext: 0.95 },
-    { p: 0.9, name: 'мягкие ткани голени', rate: [0.4, 1.2], ext: 0.9, clot: 60 }],
-  foot: [{ p: 1, name: 'стопа', rate: [0.3, 0.8], ext: 0.9, clot: 60 }],
-  uArm: [{ p: 0.15, name: 'плечевая артерия', rate: [6, 12], ext: 0.95 },
-    { p: 0.85, name: 'мышцы плеча', rate: [0.5, 1.5], ext: 0.9, clot: 60 }],
-  fArm: [{ p: 0.1, name: 'артерия предплечья', rate: [3, 6], ext: 0.95 },
-    { p: 0.9, name: 'мягкие ткани предплечья', rate: [0.3, 1], ext: 0.9, clot: 60 }],
-};
+// ---------- anatomy ----------
+// Organs in each segment's own frame (rest pose: the mannequin faces +Z, its left is +X).
+// An organ is an ellipsoid (c, r) or a capsule (a, b, r). rate: bleeding in ml/s (order of magnitude),
+// ext: share of that blood that leaves the body, clot: time constant (s) over which it slows by itself.
+const ORGAN_COLOR = { heart: '#a3122a', lung: '#e3a0a8', liver: '#7a3b1e', spleen: '#6b2d5c', kidney: '#a14c3c', artery: '#d32030', vein: '#3b4fa3', bone: '#e6dcc2', nerve: '#f0cf62', brain: '#e8b7ae', bowel: '#d9a37b', bladder: '#d8bf5c' };
+const TISSUE = { head: ['кожа и кость черепа', [1, 3]], chest: ['грудная стенка', [0.5, 1.5]], abdomen: ['брюшная стенка', [0.5, 2]], pelvis: ['мягкие ткани таза', [0.5, 2]], thigh: ['мышцы бедра', [0.8, 2.5]], shin: ['мягкие ткани голени', [0.4, 1.2]], foot: ['мягкие ткани стопы', [0.3, 0.8]], uArm: ['мышцы плеча', [0.5, 1.5]], fArm: ['мягкие ткани предплечья', [0.3, 1]] };
+function organsFor(p) {
+  const s = p.n.endsWith('L') ? 1 : -1; // +1 on the mannequin's left
+  const v = a => new THREE.Vector3(...a);
+  const E = (name, type, c, r, x) => ({ name, type, c: v(c), r, ...x });
+  const C = (name, type, a, b, r, x) => ({ name, type, a: v(a), b: v(b), r, ...x });
+  const side = (L, R) => s > 0 ? L : R;
+  switch (p.n.replace(/[LR]$/, '')) {
+    case 'head': return [
+      E('головной мозг', 'brain', [0, 0.012, -0.005], [0.08, 0.075, 0.088], { cns: 'brain', rate: [2, 5], ext: 0.6 }),
+      C('спинной мозг, шея', 'nerve', [0, -0.07, -0.035], [0, -0.19, -0.035], 0.012, { cns: 'cervical', rate: [0.5, 1], ext: 0.5 }),
+      C('левая сонная артерия', 'artery', [0.025, -0.07, 0.015], [0.025, -0.19, 0.015], 0.008, { rate: [30, 50], ext: 0.9 }),
+      C('правая сонная артерия', 'artery', [-0.025, -0.07, 0.015], [-0.025, -0.19, 0.015], 0.008, { rate: [30, 50], ext: 0.9 }),
+      C('левая яремная вена', 'vein', [0.04, -0.07, 0], [0.04, -0.19, 0], 0.008, { rate: [8, 15], ext: 0.9 }),
+      C('правая яремная вена', 'vein', [-0.04, -0.07, 0], [-0.04, -0.19, 0], 0.008, { rate: [8, 15], ext: 0.9 }),
+    ];
+    case 'chest': return [
+      E('сердце', 'heart', [0.03, -0.03, 0.035], [0.05, 0.06, 0.045], { arrest: true, rate: [80, 140], ext: 0.3 }),
+      C('грудная аорта', 'artery', [0.0, 0.07, 0.0], [-0.005, -0.13, -0.07], 0.016, { arrest: true, rate: [80, 140], ext: 0.2 }),
+      E('левое лёгкое', 'lung', [0.1, 0.01, -0.005], [0.07, 0.1, 0.09], { rate: [4, 12], ext: 0.2 }),
+      E('правое лёгкое', 'lung', [-0.095, 0.01, -0.005], [0.075, 0.1, 0.09], { rate: [4, 12], ext: 0.2 }),
+      C('грудной отдел позвоночника', 'bone', [0, 0.13, -0.1], [0, -0.13, -0.1], 0.022, { cns: 'spine', rate: [0.5, 1.5], ext: 0.3 }),
+    ];
+    case 'abdomen': return [
+      E('печень', 'liver', [-0.05, 0.07, 0.02], [0.08, 0.05, 0.07], { rate: [15, 35], ext: 0.15 }),
+      E('селезёнка', 'spleen', [0.07, 0.07, -0.03], [0.035, 0.04, 0.035], { rate: [10, 25], ext: 0.1 }),
+      E('левая почка', 'kidney', [0.055, 0, -0.07], [0.025, 0.04, 0.025], { rate: [5, 15], ext: 0.1 }),
+      E('правая почка', 'kidney', [-0.055, -0.01, -0.07], [0.025, 0.04, 0.025], { rate: [5, 15], ext: 0.1 }),
+      C('брюшная аорта', 'artery', [0.012, 0.16, -0.055], [0.012, -0.14, -0.055], 0.013, { rate: [40, 80], ext: 0.1 }),
+      C('нижняя полая вена', 'vein', [-0.016, 0.16, -0.05], [-0.016, -0.14, -0.05], 0.013, { rate: [20, 40], ext: 0.1 }),
+      C('поясничный отдел позвоночника', 'bone', [0, 0.16, -0.095], [0, -0.16, -0.095], 0.024, { cns: 'spine', rate: [0.5, 1.5], ext: 0.3 }),
+      E('кишечник', 'bowel', [0, -0.03, 0.04], [0.1, 0.08, 0.07], { rate: [1, 4], ext: 0.2, clot: 300 }),
+    ];
+    case 'pelvis': return [
+      E('левая подвздошная кость', 'bone', [0.12, 0.04, -0.02], [0.04, 0.07, 0.08], { bone: true, rate: [1, 3], ext: 0.5, clot: 300 }),
+      E('правая подвздошная кость', 'bone', [-0.12, 0.04, -0.02], [0.04, 0.07, 0.08], { bone: true, rate: [1, 3], ext: 0.5, clot: 300 }),
+      E('крестец', 'bone', [0, 0, -0.09], [0.05, 0.07, 0.03], { bone: true, rate: [1, 3], ext: 0.4, clot: 300 }),
+      C('левая подвздошная артерия', 'artery', [0.01, 0.09, -0.05], [0.09, -0.08, 0.04], 0.011, { rate: [15, 30], ext: 0.3 }),
+      C('правая подвздошная артерия', 'artery', [-0.01, 0.09, -0.05], [-0.09, -0.08, 0.04], 0.011, { rate: [15, 30], ext: 0.3 }),
+      E('мочевой пузырь', 'bladder', [0, -0.05, 0.06], [0.035, 0.035, 0.035], { rate: [1, 3], ext: 0.2, clot: 300 }),
+    ];
+    case 'thigh': return [
+      C('бедренная кость', 'bone', [0, 0.18, 0], [0, -0.19, 0], 0.017, { bone: true, rate: [1, 3], ext: 0.9, clot: 300 }),
+      C('бедренная артерия', 'artery', [-0.025 * s, 0.17, 0.035], [-0.035 * s, -0.12, -0.01], 0.011, { rate: [15, 25], ext: 0.95 }),
+      C('подколенная артерия', 'artery', [-0.035 * s, -0.12, -0.01], [0, -0.19, -0.03], 0.009, { rate: [8, 15], ext: 0.95 }),
+    ];
+    case 'shin': return [
+      C('большеберцовая кость', 'bone', [0, 0.19, 0.015], [0, -0.19, 0.015], 0.014, { bone: true, rate: [0.5, 1.5], ext: 0.9, clot: 200 }),
+      C('большеберцовая артерия', 'artery', [0, 0.18, -0.02], [0, -0.15, -0.02], 0.007, { rate: [3, 6], ext: 0.95 }),
+    ];
+    case 'foot': return [
+      E('кости стопы', 'bone', [0, 0, 0], [0.04, 0.025, 0.1], { bone: true, rate: [0.3, 0.8], ext: 0.9, clot: 120 }),
+    ];
+    case 'uArm': return [
+      C('плечевая кость', 'bone', [0, 0.12, 0], [0, -0.13, 0], 0.012, { bone: true, rate: [0.5, 1.5], ext: 0.9, clot: 200 }),
+      C('плечевая артерия', 'artery', [-0.025 * s, 0.12, 0.012], [-0.02 * s, -0.13, 0.02], 0.007, { rate: [6, 12], ext: 0.95 }),
+    ];
+    case 'fArm': return [
+      C('кости предплечья', 'bone', [0, 0.14, 0], [0, -0.14, 0], 0.012, { bone: true, rate: [0.3, 1], ext: 0.9, clot: 200 }),
+      C(side('артерии левого предплечья', 'артерии правого предплечья'), 'artery', [0, 0.13, 0.02], [0, -0.12, 0.025], 0.006, { rate: [3, 6], ext: 0.95 }),
+    ];
+  }
+  return [];
+}
+function organMesh(o) {
+  const mat = new THREE.MeshStandardMaterial({ color: ORGAN_COLOR[o.type], roughness: 0.55, flatShading: true });
+  let m;
+  if (o.c) { m = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 1), mat); m.scale.set(...o.r); m.position.copy(o.c); }
+  else {
+    const len = o.a.distanceTo(o.b);
+    m = new THREE.Mesh(new THREE.CapsuleGeometry(o.r, len, 2, 6), mat);
+    m.position.copy(o.a).add(o.b).multiplyScalar(0.5);
+    m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), o.b.clone().sub(o.a).normalize());
+  }
+  m.layers.set(1); // x-ray layer: rendered only in x-ray mode and never hit by aiming rays
+  return m;
+}
+
+// geometry helpers for the wound track
+function segPointDist(a, b, p) {
+  const ab = b.clone().sub(a), t = Math.max(0, Math.min(1, p.clone().sub(a).dot(ab) / Math.max(1e-9, ab.lengthSq())));
+  return a.clone().addScaledVector(ab, t).distanceTo(p);
+}
+function segSegDist(p1, q1, p2, q2) {
+  // closest distance between two segments (Ericson, Real-Time Collision Detection 5.1.9)
+  const d1 = q1.clone().sub(p1), d2 = q2.clone().sub(p2), r = p1.clone().sub(p2);
+  const a = d1.dot(d1), e = d2.dot(d2), f = d2.dot(r);
+  let sN, tN;
+  if (a < 1e-9 && e < 1e-9) return p1.distanceTo(p2);
+  if (a < 1e-9) { sN = 0; tN = Math.max(0, Math.min(1, f / e)); }
+  else {
+    const c = d1.dot(r);
+    if (e < 1e-9) { tN = 0; sN = Math.max(0, Math.min(1, -c / a)); }
+    else {
+      const b = d1.dot(d2), den = a * e - b * b;
+      sN = den > 1e-9 ? Math.max(0, Math.min(1, (b * f - c * e) / den)) : 0;
+      tN = (b * sN + f) / e;
+      if (tN < 0) { tN = 0; sN = Math.max(0, Math.min(1, -c / a)); }
+      else if (tN > 1) { tN = 1; sN = Math.max(0, Math.min(1, (b - c) / a)); }
+    }
+  }
+  return p1.clone().addScaledVector(d1, sN).distanceTo(p2.clone().addScaledVector(d2, tN));
+}
+function trackHits(o, A, B, reach) {
+  if (o.c) {
+    const k = new THREE.Vector3(o.r[0] + reach, o.r[1] + reach, o.r[2] + reach);
+    return segPointDist(A.clone().sub(o.c).divide(k), B.clone().sub(o.c).divide(k), new THREE.Vector3()) <= 1;
+  }
+  return segSegDist(A, B, o.a, o.b) <= o.r + reach;
+}
+// Wound track inside one segment: from the entry point to the exit, or as deep as the bullet goes.
+function woundTrack(part, entry, dir) {
+  const far = entry.clone().addScaledVector(dir, 1);
+  const back = new THREE.Raycaster(far, dir.clone().negate(), 0, 1).intersectObject(part.mesh, false)[0];
+  const through = back ? entry.distanceTo(back.point) : 0.1;
+  const depth = Math.min(through, weapon.pen);
+  const exit = entry.clone().addScaledVector(dir, depth);
+  part.mesh.updateMatrixWorld();
+  const A = part.mesh.worldToLocal(entry.clone()), B = part.mesh.worldToLocal(exit.clone());
+  return { A, B, exit, perforating: through <= weapon.pen, organs: part.organs.filter(o => trackHits(o, A, B, weapon.reach)) };
+}
+const BLOOD_VOLUME = 70 * BODY_MASS; // ~70 ml of blood per kg
 const fmtRate = r => r >= 1 ? `${r.toFixed(r < 10 ? 1 : 0)} мл/с` : `${Math.round(r * 60)} мл/мин`;
-let physMult = 1, showBlood = true;
+const rnd = ([lo, hi]) => lo + Math.random() * (hi - lo);
+let physMult = 1, showBlood = true, xray = false;
 const bloodGroup = new THREE.Group();
 scene.add(bloodGroup);
 const drops = [], pools = [];
 const dropGeo = new THREE.IcosahedronGeometry(1, 0), poolGeo = new THREE.CircleGeometry(1, 12).rotateX(-Math.PI / 2);
+const channelMat = new THREE.LineBasicMaterial({ color: 0xffd23f, depthTest: false });
 
 function addWound(part, hit, dir) {
   const c = character;
-  const options = WOUND_TYPES[part.n.replace(/[LR]$/, '')];
-  let r = Math.random(), t = options[0];
-  for (const o of options) { if (r < o.p) { t = o; break; } r -= o.p; }
-  part.mesh.updateMatrixWorld();
-  const local = part.mesh.worldToLocal(hit.point.clone());
+  const type = part.n.replace(/[LR]$/, '');
+  const track = woundTrack(part, hit.point, dir);
+  const [tissueName, tissueRate] = TISSUE[type];
+  const comps = [{ rate: rnd(tissueRate), ext: 0.9, clot: 90 }];
+  for (const o of track.organs) {
+    comps.push({ rate: rnd(o.rate), ext: o.ext, clot: o.clot });
+    if (o.mesh) o.mesh.material.emissive.set(0x5a0000);
+  }
+  const has = f => track.organs.some(f);
+  const local = track.A;
   const n = hit.face ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld) : dir.clone().negate();
   const nLocal = n.applyQuaternion(part.mesh.getWorldQuaternion(new THREE.Quaternion()).invert());
   const w = {
-    part, local, nLocal, name: t.name, ext: t.ext, clot: t.clot, arrest: !!t.arrest,
-    rate: t.rate[0] + Math.random() * (t.rate[1] - t.rate[0]), now: 0, t0: c.physT, lost: 0, extLost: 0, pending: 0,
+    part, local, nLocal, comps, organs: track.organs, perforating: track.perforating,
+    name: track.organs.length ? track.organs.map(o => o.name).join(', ') : tissueName,
+    zone: type === 'head' && local.y < -0.07 ? 'шея' : ZONE_LABEL[part.n],
+    arrest: has(o => o.arrest), brain: has(o => o.cns === 'brain'), cervical: has(o => o.cns === 'cervical'),
+    spine: has(o => o.cns === 'spine'), bone: has(o => o.bone),
+    rate: comps.reduce((a, k) => a + k.rate, 0), now: 0, ext: 0.9, t0: c.physT, lost: 0, extLost: 0, pending: 0,
     maxStain: Math.min(0.06, (part.r || 0.05) * 0.8),
   };
-  // entry mark and a stain that spreads with the external blood loss
+  // entry mark, the wound track (seen in x-ray) and a stain that spreads with the external blood loss
   const m = new THREE.Mesh(new THREE.IcosahedronGeometry(0.018, 0), hitMat);
   m.userData.marker = true; m.position.copy(local); part.mesh.add(m);
+  const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([track.A, track.B]), channelMat);
+  line.userData.marker = true; line.layers.set(1); line.renderOrder = 10; part.mesh.add(line);
   w.stain = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 1), bloodMat);
   w.stain.userData.marker = true;
   w.stain.position.copy(local);
@@ -782,6 +937,7 @@ function addWound(part, hit, dir) {
   c.wounds.push(w);
   if (w.arrest && c.arrestAt === null) c.arrestAt = c.physT + 8 + Math.random() * 7;
   spatter(hit.point, dir);
+  if (track.perforating) spatter(track.exit, dir);
   return w;
 }
 
@@ -793,7 +949,12 @@ function physiology(dt) {
   const pressure = Math.max(0.25, 1 - 1.6 * Math.max(0, f - 0.15)) * (c.arrestAt !== null && c.physT > c.arrestAt ? 0.15 : 1);
   let total = 0;
   for (const w of c.wounds) {
-    w.now = w.rate * pressure * (w.clot ? Math.exp(-(c.physT - w.t0) / w.clot) : 1);
+    let wr = 0, we = 0;
+    for (const k of w.comps) {
+      const r = k.rate * pressure * (k.clot ? Math.exp(-(c.physT - w.t0) / k.clot) : 1);
+      wr += r; we += r * k.ext;
+    }
+    w.now = wr; w.ext = wr > 0 ? we / wr : 0.9;
     const ml = w.now * dt;
     total += w.now; c.lost += ml; w.lost += ml; w.extLost += ml * w.ext; w.pending += ml * w.ext;
   }
@@ -934,6 +1095,15 @@ function clearBlood() {
   for (const pl of pools) bloodGroup.remove(pl.mesh);
   drops.length = 0; pools.length = 0;
 }
+function setXray(on) {
+  xray = on;
+  if (on) camera.layers.enable(1); else camera.layers.disable(1);
+  for (const p of parts) {
+    const m = p.mesh.material;
+    m.transparent = on; m.opacity = on ? 0.22 : 1; m.depthWrite = !on; m.needsUpdate = true;
+  }
+  document.getElementById('xrayBox').checked = on;
+}
 function setBloodVisible(v) {
   showBlood = v;
   bloodGroup.visible = v;
@@ -965,7 +1135,7 @@ function bloodReadout() {
     list.replaceChildren(...c.wounds.map(w => {
       const li = document.createElement('li');
       if (w.rate >= 3) li.className = 'art';
-      const a = document.createElement('span'); a.textContent = `${ZONE_LABEL[w.part.n]}: ${w.name}`;
+      const a = document.createElement('span'); a.textContent = `${w.zone}: ${w.name}`;
       const b = document.createElement('span'); b.textContent = fmtRate(w.now || w.rate);
       li.append(a, b);
       return li;
@@ -1102,6 +1272,7 @@ const setTime = id => { timeScale = { t1: 1, t025: 0.25, t0: 0 }[id]; };
 segment(['t1', 't025', 't0'], setTime);
 segment(['ph1', 'ph10'], id => { physMult = id === 'ph10' ? 10 : 1; });
 document.getElementById('showBlood').addEventListener('change', e => setBloodVisible(e.target.checked));
+document.getElementById('xrayBox').addEventListener('change', e => setXray(e.target.checked));
 function pickTime(id) { document.getElementById(id).click(); }
 function startReplay() {
   if (history.length < 10) return;
@@ -1120,6 +1291,7 @@ addEventListener('keydown', e => {
   if (e.code === 'Space') { e.preventDefault(); pickTime(timeScale === 0 ? 't1' : 't0'); }
   if (e.code === 'KeyR') reset();
   if (e.code === 'KeyP') startReplay();
+  if (e.code === 'KeyX') setXray(!xray);
 });
 
 // click = shot, drag = orbit
@@ -1137,10 +1309,13 @@ canvas.addEventListener('pointermove', e => {
   raycaster.setFromCamera(ndc, camera);
   const h = raycaster.intersectObjects(parts.map(p => p.mesh), false)[0];
   const part = h ? h.object.userData.part : null;
-  if (part !== hovered) {
-    hovered = part;
-    aimChip.textContent = 'прицел: ' + (part ? ZONE_LABEL[part] : '—');
+  hovered = part;
+  let text = '—';
+  if (part) {
+    const t = woundTrack(byName[part], h.point, raycaster.ray.direction.clone());
+    text = ZONE_LABEL[part] + (t.organs.length ? ' → ' + t.organs.map(o => o.name).join(', ') : '');
   }
+  aimChip.textContent = 'прицел: ' + text;
 });
 
 buildWorld();
