@@ -155,6 +155,7 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
 }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto; } }
 </style>
+
 </head>
 <body>
 <div id="app">
@@ -299,14 +300,19 @@ const WEAPONS = [
   { id: 'buck', name: 'Дробовик, картечь 00', m: 0.0035, v: 400, pellets: 9, spread: 0.02, pen: 0.3, reach: 0.004 },
   { id: 'slug', name: 'Дробовик, пуля 12 к.', m: 0.028, v: 450, pen: 0.45, reach: 0.012 },
 ];
-const G_GROUND = 0x1, G_TORSO = 0x2, G_ARML = 0x4, G_ARMR = 0x8, G_LEGL = 0x10, G_LEGR = 0x20;
+const G_GROUND = 0x1, G_CHEST = 0x2, G_ARML = 0x4, G_ARMR = 0x8, G_LEGL = 0x10, G_LEGR = 0x20, G_LOWER = 0x40, G_FARML = 0x80, G_FARMR = 0x100;
+const G_ARMS = G_ARML | G_ARMR | G_FARML | G_FARMR;
 const groups = (member, filter) => (member << 16) | filter;
 const FILTER = {
-  torso: groups(G_TORSO, G_GROUND),
-  armL: groups(G_ARML, G_GROUND | G_ARMR | G_LEGL | G_LEGR),
-  armR: groups(G_ARMR, G_GROUND | G_ARML | G_LEGL | G_LEGR),
-  legL: groups(G_LEGL, G_GROUND | G_ARML | G_ARMR | G_LEGR),
-  legR: groups(G_LEGR, G_GROUND | G_ARML | G_ARMR | G_LEGL),
+  // joined neighbours never collide (they overlap at the joint); everything else does
+  chest: groups(G_CHEST, G_GROUND | G_FARML | G_FARMR),
+  lower: groups(G_LOWER, G_GROUND | G_ARMS),
+  armL: groups(G_ARML, G_GROUND | G_LOWER | G_ARMR | G_FARMR | G_LEGL | G_LEGR),
+  armR: groups(G_ARMR, G_GROUND | G_LOWER | G_ARML | G_FARML | G_LEGL | G_LEGR),
+  farmL: groups(G_FARML, G_GROUND | G_CHEST | G_LOWER | G_ARMR | G_FARMR | G_LEGL | G_LEGR),
+  farmR: groups(G_FARMR, G_GROUND | G_CHEST | G_LOWER | G_ARML | G_FARML | G_LEGL | G_LEGR),
+  legL: groups(G_LEGL, G_GROUND | G_ARMS | G_LEGR),
+  legR: groups(G_LEGR, G_GROUND | G_ARMS | G_LEGL),
   ground: groups(G_GROUND, 0xffff),
 };
 const ZONE_LABEL = {
@@ -327,16 +333,16 @@ const RIG = {
 function partDefs() {
   const m = (v, s) => [v[0] * s, v[1], v[2]];
   const defs = [
-    { n: 'pelvis', shape: 'capX', r: 0.115, h: 0.02, c: [0, 1.0, -0.005], g: 'torso', S: [0.71, 0.96, 0.96] },
-    { n: 'abdomen', p: 'pelvis', shape: 'capY', r: 0.1, h: 0.04, c: [0, 1.21, 0.015], j: RIG.spine, g: 'torso', S: [0.83, 0.875, 0.83] },
-    { n: 'chest', p: 'abdomen', shape: 'capX', r: 0.12, h: 0.04, c: [0, 1.4, 0], j: RIG.chest, g: 'torso', S: [0.8, 0.92, 0.92] },
-    { n: 'head', p: 'chest', shape: 'ball', r: 0.1, c: [0, 1.69, 0.005], j: RIG.neck, g: 'torso', S: [0.95, 0.95, 0.95] },
+    { n: 'pelvis', shape: 'capX', r: 0.115, h: 0.02, c: [0, 1.0, -0.005], g: 'lower', S: [0.71, 0.96, 0.96] },
+    { n: 'abdomen', p: 'pelvis', shape: 'capY', r: 0.1, h: 0.04, c: [0, 1.21, 0.015], j: RIG.spine, g: 'lower', S: [0.83, 0.875, 0.83] },
+    { n: 'chest', p: 'abdomen', shape: 'capX', r: 0.12, h: 0.04, c: [0, 1.4, 0], j: RIG.chest, g: 'chest', S: [0.8, 0.92, 0.92] },
+    { n: 'head', p: 'chest', shape: 'ball', r: 0.1, c: [0, 1.69, 0.005], j: RIG.neck, g: 'lower', S: [0.95, 0.95, 0.95] },
   ];
   for (const [S, s] of [['L', 1], ['R', -1]]) defs.push(
-    limb('uArm' + S, 'chest', m(RIG.shoulder, s), m(RIG.elbow, s), 0.045, 'arm' + S, [1, 0.82, 1], 0.6),
-    limb('fArm' + S, 'uArm' + S, m(RIG.elbow, s), m(RIG.fingertip, s), 0.04, 'arm' + S, [1, 1.05, 1], 1, [-2.5, 0.05]),
-    limb('thigh' + S, 'pelvis', m(RIG.hip, s), m(RIG.knee, s), 0.075, 'leg' + S, [1.07, 1.11, 1.07], 0.6),
-    limb('shin' + S, 'thigh' + S, m(RIG.knee, s), m(RIG.ankle, s), 0.055, 'leg' + S, [1, 1.03, 1], 0.6, [-0.05, 2.5]),
+    limb('uArm' + S, 'chest', m(RIG.shoulder, s), m(RIG.elbow, s), 0.05, 'arm' + S, [1, 0.82, 1], 0.6),
+    limb('fArm' + S, 'uArm' + S, m(RIG.elbow, s), m(RIG.fingertip, s), 0.045, 'farm' + S, [1, 1.05, 1], 1, [-2.5, 0.05]),
+    limb('thigh' + S, 'pelvis', m(RIG.hip, s), m(RIG.knee, s), 0.078, 'leg' + S, [1.07, 1.11, 1.07], 0.6),
+    limb('shin' + S, 'thigh' + S, m(RIG.knee, s), m(RIG.ankle, s), 0.062, 'leg' + S, [1, 1.03, 1], 0.6, [-0.05, 2.5]),
     { n: 'foot' + S, p: 'shin' + S, shape: 'box', hx: 0.04, hy: 0.045, hz: 0.125, c: [0.08 * s, 0.045, 0.055], j: m(RIG.ankle, s), g: 'leg' + S, hinge: [-0.8, 0.8], S: [1, 1, 1] },
   );
   return defs;
@@ -620,7 +626,7 @@ function buildWorld() {
     if (p.axisQ) cd.setRotation(p.axisQ);
     cd.setDensity(density).setFriction(p.n.startsWith('foot') ? 1.2 : 0.6).setCollisionGroups(FILTER[p.g]);
     world.createCollider(cd, p.body);
-    p.tone = 1; p.toneTarget = 1; p.toneRate = 3;
+    p.tone = 1; p.baseTone = 1; p.boosts = {}; p.toneTarget = 1; p.toneRate = 3;
     if (p.p) {
       const par = byName[p.p];
       const a1 = { x: p.j[0] - par.c[0], y: p.j[1] - par.c[1], z: p.j[2] - par.c[2] };
@@ -661,8 +667,9 @@ function buildWorld() {
 const layers = [];
 const BASE = { thighL: [-0.05, 0, 0], thighR: [-0.05, 0, 0], shinL: [0.1, 0, 0], shinR: [0.1, 0, 0], uArmL: [0, 0, 0.06], uArmR: [0, 0, -0.06], fArmL: [-0.15, 0, 0], fArmR: [-0.15, 0, 0] };
 function addLayer(pose, { peak = 1, attack = 0.08, hold = 0.3, release = 0.8, tag } = {}) {
-  // a new pose of the same kind takes over from the old one instead of adding to it
-  if (tag) for (const o of layers) if (o.tag === tag) fadeOut(o, Math.min(o.release, 0.4));
+  // a new pose of the same kind takes over from the old one instead of adding to it. It is a crossfade over the
+  // new pose's attack: a faster fade-out would pass through the neutral pose, e.g. a straight leg between kneeling and sitting
+  if (tag) for (const o of layers) if (o.tag === tag) fadeOut(o, Math.max(0.05, attack));
   const l = { pose, peak, attack, hold, release, age: 0, tag };
   layers.push(l);
   return l;
@@ -690,6 +697,10 @@ function targetQuat(name, out) {
     const S = name.slice(-1);
     x -= targetEulerX('thigh' + S) + targetEulerX('shin' + S);
   }
+  // stacked poses must never ask for more than a joint can do: past half a turn the target wraps to the other side
+  const h = byName[name]?.hinge, lim = 2.4;
+  x = h ? Math.max(h[0], Math.min(h[1], x)) : Math.max(-lim, Math.min(lim, x));
+  y = Math.max(-lim, Math.min(lim, y)); z = Math.max(-lim, Math.min(lim, z));
   return out.setFromEuler(tmpE.set(x, y, z, 'XYZ'));
 }
 function targetEulerX(name) {
@@ -745,7 +756,7 @@ function muscles(dt) {
     const f = byName['foot' + (c.kneel === 'L' ? 'R' : 'L')].body.translation();
     sx = (knee.x + f.x) / 2; sz = knee.z * 0.65 + f.z * 0.35;
   }
-  const kl = BAL_LIN_K * c.balance * (c.seated ? 0 : 1), dl = BAL_LIN_D * c.balance;
+  const kl = BAL_LIN_K * c.balance * (c.seated || c.noLift ? 0 : 1), dl = BAL_LIN_D * c.balance;
   const rest = byName.pelvis.c;
   motorAxis(balanceJoint, 0, sx - rest[0], kl, dl);
   motorAxis(balanceJoint, 1, -(sz - rest[2]), kl, dl);
@@ -753,8 +764,17 @@ function muscles(dt) {
 
 // ---------- reactions ----------
 // caps hold what an injury makes impossible (a paralysed or broken limb cannot be tensed again)
-const tone = (names, target, rate) => names.forEach(n => { byName[n].toneTarget = Math.min(target, character.cap[n] ?? 1); byName[n].toneRate = rate; });
-const capTone = (names, v) => names.forEach(n => { character.cap[n] = Math.min(character.cap[n] ?? 1, v); });
+// Tone has a base, set by physiology and injuries, and temporary boosts from scripted beats. The target is the
+// larger of them, never above what the injury allows. A beat removes only its own boost, so it can never hand
+// back strength that blood loss or a wound has taken away in the meantime.
+function effTone(p) {
+  let v = p.baseTone;
+  for (const k in p.boosts) v = Math.max(v, p.boosts[k]);
+  return Math.min(v, character.cap[p.n] ?? 1);
+}
+const tone = (names, target, rate) => names.forEach(n => { const p = byName[n]; p.baseTone = target; p.toneRate = rate; p.toneTarget = effTone(p); });
+const capTone = (names, v) => names.forEach(n => { character.cap[n] = Math.min(character.cap[n] ?? 1, v); byName[n].toneTarget = effTone(byName[n]); });
+function clearBoosts(names) { for (const n of names) { byName[n].boosts = {}; byName[n].toneTarget = effTone(byName[n]); } }
 const LEG = S => ['thigh' + S, 'shin' + S, 'foot' + S];
 const ARM = S => ['uArm' + S, 'fArm' + S];
 const ALL = () => parts.filter(p => p.p).map(p => p.n);
@@ -789,7 +809,7 @@ function startle(intensity, side) {
   if (k < 0.08) return;
   const away = -side;
   const variant = Math.random();
-  const legs = { thighL: [-0.45, 0, 0], thighR: [-0.45, 0, 0], shinL: [0.8, 0, 0], shinR: [0.8, 0, 0] };
+  const legs = { thighL: [-0.35, 0, 0], thighR: [-0.35, 0, 0], shinL: [0.6, 0, 0], shinR: [0.6, 0, 0] };
   let pose;
   if (variant < 0.4) pose = { // arms come up over the head
     head: [0.35, away * 0.6, 0], chest: [0.3, away * 0.2, -side * 0.12], abdomen: [0.15, 0, 0],
@@ -797,7 +817,7 @@ function startle(intensity, side) {
   else if (variant < 0.75) pose = { // ducks and hunches, hands in front of the chest
     head: [0.5, away * 0.3, 0], chest: [0.4, 0, 0], abdomen: [0.2, 0, 0],
     uArmL: [-0.6, 0, 0.15], uArmR: [-0.6, 0, -0.15], fArmL: [-1.7, 0, 0], fArmR: [-1.7, 0, 0],
-    thighL: [-0.6, 0, 0], thighR: [-0.6, 0, 0], shinL: [1.05, 0, 0], shinR: [1.05, 0, 0] };
+    thighL: [-0.4, 0, 0], thighR: [-0.4, 0, 0], shinL: [0.7, 0, 0], shinR: [0.7, 0, 0] };
   else { // turns away and lifts the arm on the bullet's side
     const near = side > 0 ? 'L' : 'R', far = near === 'L' ? 'R' : 'L', sn = near === 'L' ? 1 : -1;
     pose = { head: [0.25, away * 0.9, 0], chest: [0.2, away * 0.45, -side * 0.15], abdomen: [0.1, away * 0.2, 0],
@@ -878,16 +898,22 @@ function armPose(kind, S, k = 1) {
   return { ['uArm' + S]: P[0].map(x => x * k), ['fArm' + S]: [P[1] * k, 0, 0] };
 }
 // tone for the beat; restored when it ends (only while conscious)
+let beatUid = 0;
 function beatTone(b, names, v, rate = 3) {
-  b.saved = b.saved || {};
-  for (const n of names) if (!(n in b.saved)) b.saved[n] = byName[n].toneTarget;
-  tone(names, v, rate);
+  b.uid = b.uid || ++beatUid;
+  b.boosted = b.boosted || new Set();
+  for (const n of names) { const p = byName[n]; p.boosts[b.uid] = v; p.toneRate = rate; p.toneTarget = effTone(p); b.boosted.add(n); }
+}
+function dropBoosts(b) {
+  if (!b.boosted) return;
+  for (const n of b.boosted) { const p = byName[n]; delete p.boosts[b.uid]; p.toneRate = Math.min(p.toneRate, 2.5); p.toneTarget = effTone(p); }
+  b.boosted = null;
 }
 
 // ground actions start from lying or from sitting (and end the sitting)
 function groundStart() {
   const c = character;
-  if (c.seated) { c.seated = false; c.balanceTarget = 0; return true; }
+  if (c.seated) { c.seated = false; c.noLift = true; c.balanceTarget = 0; return true; }
   return c.state === 'down';
 }
 const ACTIONS = {
@@ -916,11 +942,18 @@ const ACTIONS = {
     return { layer: addLayer(pose, { attack: 0.5, hold: Infinity, release: 0.7, tag: 'ai-arms' }) };
   },
   double_over(b) {
+    const c = character;
+    if (c.state === 'down' && !c.seated) return null; // on the ground the trunk flex rolls the body over its head
+    if (c.seated) { // sitting already bends the trunk: only a little more, and the legs stay as they are
+      const k = 0.4 * b.intensity;
+      return { layer: addLayer({ chest: [0.6 * k, 0, 0], abdomen: [0.4 * k, 0, 0], head: [0.4 * k, 0, 0] }, { attack: 0.8, hold: Infinity, release: 0.8, tag: 'ai-torso' }) };
+    }
     const k = b.intensity;
-    return { layer: addLayer({ chest: [0.6 * k, 0, 0], abdomen: [0.4 * k, 0, 0], head: [0.3 * k, 0, 0], thighL: [-0.35 * k, 0, 0], thighR: [-0.35 * k, 0, 0], shinL: [0.6 * k, 0, 0], shinR: [0.6 * k, 0, 0] }, { attack: 0.6, hold: Infinity, release: 0.8, tag: 'ai-torso' }) };
+    return { layer: addLayer({ chest: [0.6 * k, 0, 0], abdomen: [0.4 * k, 0, 0], head: [0.3 * k, 0, 0], thighL: [-0.2 * k, 0, 0], thighR: [-0.2 * k, 0, 0], shinL: [0.35 * k, 0, 0], shinR: [0.35 * k, 0, 0] }, { attack: 0.6, hold: Infinity, release: 0.8, tag: 'ai-torso' }) };
   },
   straighten(b) { return { layer: addLayer({ chest: [-0.12, 0, 0], abdomen: [-0.06, 0, 0], head: [-0.1, 0, 0] }, { attack: 0.8, hold: Infinity, release: 0.8, tag: 'ai-torso' }) }; },
   rock(b) {
+    if (character.state === 'down' && !character.seated) return null; // rocking is done sitting or kneeling
     const k = b.intensity, layer = addLayer({}, { attack: 0.5, hold: Infinity, release: 0.8, tag: 'ai-torso' });
     return { layer, update(t) { const v = 0.3 + 0.22 * Math.sin(t * 2.4); layer.pose.chest = [v * k, 0, 0]; layer.pose.abdomen = [v * 0.6 * k, 0, 0]; layer.pose.head = [v * 0.5 * k, 0, 0]; } };
   },
@@ -940,7 +973,7 @@ const ACTIONS = {
     if (character.state === 'down' || character.seated || character.kneel || !legsWork()) return null;
     const S = b.knee === 'L' || b.knee === 'R' ? b.knee : (character.cap.thighL ?? 1) < (character.cap.thighR ?? 1) ? 'L' : 'R', H = S === 'L' ? 'R' : 'L';
     character.kneel = S;
-    beatTone(b, LEG(S), 0.25, 3);
+    tone(LEG(S), Math.min(byName['thigh' + S].baseTone, 0.25), 3);
     return { layer: addLayer({ ['thigh' + S]: [0.05, 0, 0], ['shin' + S]: [1.45, 0, 0], ['thigh' + H]: [-1.35, 0, 0], ['shin' + H]: [1.45, 0, 0], chest: [0.15, 0, 0] }, { attack: 1.2, hold: Infinity, release: 1, tag: 'ai-body' }), keepTone: true, keepLayer: true };
   },
   sit(b) {
@@ -948,35 +981,46 @@ const ACTIONS = {
     if (c.state === 'down' || c.seated) return null;
     // sitting is held: the pelvis stays upright and the posture lasts until something else takes over
     c.seated = true; c.kneel = null;
-    beatTone(b, [...LEG('L'), ...LEG('R')], 0.4, 1.5);
+    // the injury's kneeling or buckled leg hands over to the sitting pose instead of adding to it
+    for (const l of layers) if (l.tag === 'kneel' || l.tag === 'buckle' || l.tag === 'sag') fadeOut(l, 1.4);
+    // the legs only fold: they carry no weight, otherwise the folded pose pushes off the ground and lifts the body
+    clearBoosts([...LEG('L'), ...LEG('R')]);
+    tone([...LEG('L'), ...LEG('R')], Math.min(byName.thighL.baseTone, 0.15), 5);
     c.balanceTarget = Math.min(c.balanceTarget, 0.35); c.balanceRate = 1;
     return { layer: addLayer({ thighL: [-1.4, 0, 0], thighR: [-1.4, 0, 0], shinL: [1.9, 0, 0], shinR: [1.9, 0, 0], chest: [0.45, 0, 0], abdomen: [0.2, 0, 0] }, { attack: 1.4, hold: Infinity, release: 1, tag: 'ai-body' }), keepTone: true, keepLayer: true };
   },
   lie_down(b) {
     const c = character;
     if (c.state === 'down' && !c.seated) return null;
-    for (const l of layers) if (l.tag === 'ai-body') fadeOut(l, 1.2);
-    c.seated = false; c.kneel = null;
-    beatTone(b, [...LEG('L'), ...LEG('R')], 0.15, 0.8);
-    c.balanceTarget = 0; c.balanceRate = 0.7;
+    // the kneeling or sitting pose stays until the body is on the ground, and the legs let go first:
+    // otherwise the healthy leg straightens and lifts the body before it goes down
+    // once sitting or kneeling, the balance never lifts the pelvis again: it only keeps the trunk from flopping
+    if (c.seated || c.kneel) c.noLift = true;
+    c.seated = false;
+    clearBoosts([...LEG('L'), ...LEG('R')]);
+    tone([...LEG('L'), ...LEG('R')], 0.12, 5);
+    c.balanceTarget = 0; c.balanceRate = 1.2;
     return { keepTone: true };
   },
   curl(b) {
     if (!groundStart()) return null;
     const k = b.intensity;
-    beatTone(b, ALL(), 0.35, 2);
-    return { layer: addLayer({ thighL: [-1.2 * k, 0, 0], thighR: [-1.2 * k, 0, 0], shinL: [1.8 * k, 0, 0], shinR: [1.8 * k, 0, 0], chest: [0.6 * k, 0, 0], abdomen: [0.45 * k, 0, 0], head: [0.5 * k, 0, 0], ...armPose('abdomen', 'L', k), ...armPose('abdomen', 'R', k) }, { attack: 1, hold: Infinity, release: 1, tag: 'ai-body' }) };
+    beatTone(b, UPPER, 0.35, 2);
+    beatTone(b, [...LEG('L'), ...LEG('R')], 0.2, 2);
+    // a gentle tuck: a full knees-to-chest flex on the back jackknifes the hips off the ground
+    return { layer: addLayer({ thighL: [-0.85 * k, 0, 0], thighR: [-0.85 * k, 0, 0], shinL: [1.4 * k, 0, 0], shinR: [1.4 * k, 0, 0], chest: [0.3 * k, 0, 0], abdomen: [0.2 * k, 0, 0], head: [0.35 * k, 0, 0], ...armPose('abdomen', 'L', k), ...armPose('abdomen', 'R', k) }, { attack: 1, hold: Infinity, release: 1, tag: 'ai-body' }) };
   },
   writhe(b) {
     if (!groundStart()) return null;
     const k = b.intensity;
-    beatTone(b, ALL(), 0.3, 2);
+    beatTone(b, UPPER, 0.35, 2);
+    beatTone(b, [...LEG('L'), ...LEG('R')], 0.15, 2);
     const layer = addLayer({}, { attack: 0.6, hold: Infinity, release: 1, tag: 'ai-body' });
     return { layer, update(t) {
       const a = Math.sin(t * 1.7), c2 = Math.sin(t * 1.1 + 1);
       layer.pose.abdomen = [0.3 * k * a, 0.4 * k * c2, 0.2 * k * a]; layer.pose.chest = [0.25 * k * c2, 0.3 * k * a, 0];
-      layer.pose.thighL = [-0.6 * k * (1 + a) / 2, 0, 0]; layer.pose.thighR = [-0.6 * k * (1 - a) / 2, 0, 0];
-      layer.pose.shinL = [0.9 * k * (1 + a) / 2, 0, 0]; layer.pose.shinR = [0.9 * k * (1 - a) / 2, 0, 0];
+      layer.pose.thighL = [-0.25 * k * (1 + a) / 2, 0, 0]; layer.pose.thighR = [-0.25 * k * (1 - a) / 2, 0, 0];
+      layer.pose.shinL = [0.35 * k * (1 + a) / 2, 0, 0]; layer.pose.shinR = [0.35 * k * (1 - a) / 2, 0, 0];
       layer.pose.head = [0.2 * k * c2, 0.3 * k * a, 0];
     } };
   },
@@ -985,8 +1029,7 @@ const ACTIONS = {
     const k = b.intensity, arms = ['L', 'R'].filter(S => (character.cap['uArm' + S] ?? 1) > 0.1);
     if (!arms.length) return null;
     beatTone(b, [...arms.flatMap(ARM), 'chest', 'abdomen', 'head'], 0.8, 3);
-    if (legsWork()) beatTone(b, [...LEG('L'), ...LEG('R')], 0.4, 2);
-    const pose = { chest: [-0.35 * k, 0, 0], head: [-0.3 * k, 0, 0], thighL: [-0.7 * k, 0, 0], thighR: [-0.7 * k, 0, 0], shinL: [1.2 * k, 0, 0], shinR: [1.2 * k, 0, 0] };
+    const pose = { chest: [-0.35 * k, 0, 0], head: [-0.3 * k, 0, 0] };
     for (const S of arms) Object.assign(pose, { ['uArm' + S]: [-0.5 * k, 0, (S === 'L' ? 0.3 : -0.3) * k], ['fArm' + S]: [-0.25, 0, 0] });
     return { layer: addLayer(pose, { attack: 0.8, hold: Infinity, release: 1.2, tag: 'ai-body' }) };
   },
@@ -1022,6 +1065,8 @@ const ACTIONS = {
 };
 
 // parts each action moves, for actions whose pose is written while they run
+const LEGS = ['thighL', 'thighR', 'shinL', 'shinR', 'footL', 'footR'];
+const UPPER = ['head', 'chest', 'abdomen', 'uArmL', 'uArmR', 'fArmL', 'fArmR'];
 const MOVES = { look: ['head', 'chest'], rock: ['chest', 'abdomen', 'head'], writhe: null, gasp: ['chest', 'abdomen', 'head', 'uArmL', 'uArmR'],
   tremble: ['uArmL', 'uArmR', 'fArmL', 'fArmR', 'head'] };
 function beginBeat(b) {
@@ -1032,7 +1077,7 @@ function beginBeat(b) {
   const c = character;
   const used = new Set([...(fx.layer ? Object.keys(fx.layer.pose) : []), ...(MOVES[b.action] || [])]);
   const need = c.state === 'down' || c.seated ? 0.6 : 0.85;
-  const weak = [...used].filter(n => byName[n] && byName[n].toneTarget < need);
+  const weak = [...used].filter(n => UPPER.includes(n) && byName[n].toneTarget < need);
   if (weak.length && c.conscious) beatTone(b, weak, need, 4);
   if (fx.layer) fx.layer.attack = Math.min(fx.layer.attack, Math.max(0.2, b.dur * 0.3));
 }
@@ -1042,8 +1087,7 @@ function endBeat(b, quiet) {
   if (!fx) return;
   if (fx.layer && !fx.keepLayer) fadeOut(fx.layer, Math.min(fx.layer.release, 0.9));
   fx.end?.();
-  if (b.saved && character.conscious && !quiet && !fx.keepTone)
-    for (const [n, v] of Object.entries(b.saved)) tone([n], character.state === 'down' ? Math.min(v, 0.06) : v, 2);
+  dropBoosts(b);
 }
 function stopScript() {
   if (!script) return;
@@ -1356,8 +1400,9 @@ function renderScript(sc, message, badge) {
 }
 
 function collapse(fast) {
+  clearBoosts(ALL());
   character.conscious = false;
-  character.seated = false;
+  character.seated = false; character.noLift = true;
   character.balanceTarget = 0; character.balanceRate = fast ? 40 : 2.2;
   for (const l of layers) if (l.hold === Infinity) l.hold = 0;
   if (fast) tone(ALL(), 0, 40);
@@ -1414,7 +1459,7 @@ function react(zone, side, hitDir, w) {
   if (zone === 'pelvis') {
     flinch(jitter(0.6, 0.25), side, fromFront);
     tone([...LEG('L'), ...LEG('R')], 0.1, 8);
-    c.balanceTarget = 0.12; c.balanceRate = 4;
+    c.balanceTarget = Math.min(c.balanceTarget, 0.12); c.balanceRate = 4; c.noLift = true;
     addLayer({ thighL: [-0.7, 0, 0], thighR: [-0.7, 0, 0], shinL: [1.3, 0, 0], shinR: [1.3, 0, 0] }, { attack: 0.3, hold: Infinity, tag: 'sag' });
     at(1.5, () => { if (c.state !== 'down') { c.balanceTarget = 0; } });
     return { text: 'Перелом таза: это опора для обеих ног. Ноги не держат вес, тело падает сразу, без отброса.' };
@@ -1437,7 +1482,7 @@ function react(zone, side, hitDir, w) {
       return { text: 'Перелом: нога не держит вес. Тело опускается на колено раненой ноги и удерживает корпус.' };
     }
     const buckle = addLayer({ ['thigh' + S]: [-0.35, 0, 0], ['shin' + S]: [1.3, 0, 0] }, { attack: 0.25, hold: Infinity, tag: 'buckle' });
-    at(1.8, () => { if (c.conscious) { tone(LEG(S), 0.45, 2); buckle.hold = buckle.age - buckle.attack; buckle.release = 0.8; } });
+    at(1.8, () => { if (c.conscious && c.state !== 'down' && !c.seated) { tone(LEG(S), 0.45, 2); buckle.hold = buckle.age - buckle.attack; buckle.release = 0.8; } });
     return { text: 'Кость цела: нога подкашивается, вес уходит на другую, потом раненая нога снова опирается, но слабо.' };
   }
   if (zone.startsWith('uArm') || zone.startsWith('fArm')) {
@@ -2012,14 +2057,31 @@ function step() {
   for (let i = events.length - 1; i >= 0; i--) if (events[i].t <= simTime) { const e = events.splice(i, 1)[0]; e.fn(); }
   physiology(DT * physMult);
   updateLife();
+  const pelvisT = byName.pelvis.body.translation();
+  if (!Number.isFinite(pelvisT.x + pelvisT.y + pelvisT.z)) { // the solver blew up: start over instead of freezing the page
+    buildWorld();
+    log('info', 'Сброс', 'Физика потеряла устойчивость, манекен поставлен заново.');
+    return;
+  }
+  // a sitter whose pelvis has toppled over is lying: the seated balance would keep fighting the ground.
+  // Bending forward from the waist does not count, the pelvis stays upright for that
+  if (character.seated) {
+    const q = byName.pelvis.body.rotation(), upY = 1 - 2 * (q.x * q.x + q.z * q.z);
+    character.tipped = upY < 0.42 ? (character.tipped || 0) + DT : 0;
+    if (character.tipped > 0.5) { character.seated = false; character.noLift = true; }
+  }
   if (character.seated && character.conscious && byName.pelvis.body.translation().y < 0.45) { if (character.state !== 'sit') setState('sit'); }
   else if (character.state !== 'down' && byName.pelvis.body.translation().y < (character.kneel && character.conscious ? 0.3 : 0.45)) {
     setState('down');
-    character.balanceTarget = 0;
+    // the uprighting torque goes quickly: with the head already on the ground it would push the hips up and roll the body over
+    character.balanceTarget = 0; character.balanceRate = Math.max(character.balanceRate, 6); character.noLift = true;
     if (character.conscious) { // conscious but on the ground: muscles relax instead of holding the standing pose
-      for (const p of parts) { p.toneTarget = Math.min(p.toneTarget, 0.06); p.toneRate = 4; }
-      for (const l of layers) if (l.hold === Infinity && l.tag !== 'life') l.hold = 0;
+      for (const p of parts) { p.baseTone = Math.min(p.baseTone, LEGS.includes(p.n) ? 0.02 : 0.06); p.toneRate = 4; p.toneTarget = effTone(p); }
+      clearBoosts(ALL());
+      // the held poses fade slowly: an abrupt release straightens the legs under the body and lifts it back up
+      for (const l of layers) if (l.hold === Infinity && l.tag !== 'life') fadeOut(l, l.tag === 'ai-torso' || l.tag === 'ai-body' ? 1 : 2.5);
     }
+    character.kneel = null;
   }
   if (++stepCount % 2 === 0) record();
 }
@@ -2059,7 +2121,7 @@ function frame(now) {
   if (followCam) { // keep the body in frame as it goes down or moves
     const pl = byName.pelvis.mesh.position, k = 1 - Math.exp(-dtReal * 2.5);
     tv.set(pl.x, Math.max(0.35, Math.min(1.0, pl.y + 0.05)), pl.z);
-    controls.target.lerp(tv, k);
+    if (Number.isFinite(tv.x + tv.y + tv.z)) controls.target.lerp(tv, k);
   }
   controls.update();
   const dist = camera.position.distanceTo(vecOf(byName.chest.body.translation()));
