@@ -1,0 +1,873 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Учебный симулятор: low-poly манекен на active ragdoll (three.js + Rapier) реагирует на попадания и пролёты пуль.">
+<style>body { margin: 0; } [hidden] { display: none !important; }</style>
+<title>Баллистический манекен</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: full-height 3D stage on the left, instrument panel on the right; stacks on phones. */
+:root {
+  --bg: #e4e7e8;
+  --panel: #f5f6f6;
+  --ink: #1b2226;
+  --muted: #5a666c;
+  --line: #c6cdd0;
+  --accent: #1d5bb8;
+  --accent-ink: #ffffff;
+  --hit: #c4302a;
+  --warn: #b8730f;
+  --ok: #2c7a4c;
+  --scene-bg: #dde2e4;
+  --scene-floor: #cdd4d7;
+  --scene-grid: #a3adb2;
+  --scene-grid2: #bac3c7;
+  --mannequin: #c7a57a;
+  --mannequin-hot: #e0bb87;
+  --font-display: "Barlow Condensed", "Arial Narrow", "Roboto Condensed", sans-serif;
+  --font-body: "Barlow", "Segoe UI", Roboto, sans-serif;
+  --font-data: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #13171a; --panel: #1a2024; --ink: #e2e7e9; --muted: #95a2a8; --line: #2d363b;
+    --accent: #6c9cff; --accent-ink: #0d1420; --hit: #ff6b5e; --warn: #e6a640; --ok: #5cc28a;
+    --scene-bg: #181d20; --scene-floor: #20272b; --scene-grid: #3b464c; --scene-grid2: #2b3439;
+    --mannequin: #ad8d66; --mannequin-hot: #d1ab7c;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #13171a; --panel: #1a2024; --ink: #e2e7e9; --muted: #95a2a8; --line: #2d363b;
+  --accent: #6c9cff; --accent-ink: #0d1420; --hit: #ff6b5e; --warn: #e6a640; --ok: #5cc28a;
+  --scene-bg: #181d20; --scene-floor: #20272b; --scene-grid: #3b464c; --scene-grid2: #2b3439;
+  --mannequin: #ad8d66; --mannequin-hot: #d1ab7c;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body { background: var(--bg); color: var(--ink); font-family: var(--font-body); font-size: 15px; line-height: 1.45; }
+* { box-sizing: border-box; }
+
+#app { display: grid; grid-template-columns: minmax(0, 1fr) 360px; height: 100%; }
+#stage { position: relative; min-width: 0; overflow: hidden; background: var(--scene-bg); }
+#c { display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+#panel { background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto;
+  padding-block: 20px 28px; padding-left: max(18px, env(safe-area-inset-left, 0px)); padding-right: max(18px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 22px; min-width: 0; }
+
+h1 { font-family: var(--font-display); font-weight: 700; font-size: 30px; line-height: 1; letter-spacing: 0.01em; margin: 0; text-wrap: balance; text-transform: uppercase; }
+.sub { color: var(--muted); margin: 6px 0 0; font-size: 14px; }
+h2 { font-family: var(--font-display); font-weight: 600; font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
+section { min-width: 0; }
+
+.weapons { display: grid; gap: 6px; }
+.weapon { display: grid; grid-template-columns: 1fr auto; align-items: baseline; gap: 2px 10px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; background: transparent; color: var(--ink); text-align: left; font: inherit; }
+.weapon:hover { border-color: var(--muted); }
+.weapon[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.weapon b { font-family: var(--font-display); font-weight: 600; font-size: 17px; }
+.weapon .p { font-family: var(--font-data); font-size: 13px; color: var(--accent); }
+.weapon .spec { grid-column: 1 / -1; font-family: var(--font-data); font-size: 12px; color: var(--muted); }
+
+.seg { display: flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg button { flex: 1; padding: 8px 6px; border: 0; background: transparent; color: var(--ink); font: 500 14px var(--font-body); cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+.note { font-size: 13px; color: var(--muted); margin: 6px 0 0; }
+
+.actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.btn { flex: 1; padding: 9px 10px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: var(--ink); font: 600 14px var(--font-body); cursor: pointer; white-space: nowrap; }
+.btn:hover { border-color: var(--muted); }
+.btn.primary { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.readout { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 14px; }
+.readout dt { color: var(--muted); }
+.readout dd { margin: 0; font-family: var(--font-data); font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; }
+
+#log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+#log li { display: grid; grid-template-columns: 48px 1fr; gap: 8px; font-size: 13.5px; padding-top: 8px; border-top: 1px solid var(--line); }
+#log li:first-child { border-top: 0; padding-top: 0; }
+#log time { font-family: var(--font-data); font-size: 12px; color: var(--muted); padding-top: 1px; }
+#log .tag { font-family: var(--font-display); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; font-size: 13px; margin-right: 4px; }
+#log .hit .tag { color: var(--hit); }
+#log .near .tag { color: var(--warn); }
+#log .info .tag { color: var(--muted); }
+#log .ex { color: var(--muted); font-size: 12px; font-style: italic; }
+
+details { border-top: 1px solid var(--line); padding-top: 14px; }
+summary { cursor: pointer; font-family: var(--font-display); font-weight: 600; font-size: 16px; }
+details p { font-size: 14px; margin: 8px 0 0; max-width: 65ch; }
+details .formula { font-family: var(--font-data); font-size: 12.5px; background: var(--bg); padding: 8px 10px; border-radius: 4px; overflow-x: auto; white-space: nowrap; }
+
+.overlay { position: absolute; pointer-events: none; font-size: 13px; }
+#hint { left: 16px; bottom: 14px; right: 16px; color: var(--muted); max-width: 60ch; }
+#hint kbd { font-family: var(--font-data); font-size: 11px; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; background: var(--panel); color: var(--ink); }
+#chips { left: 16px; top: 14px; display: flex; gap: 6px; flex-wrap: wrap; right: 16px; }
+.chip { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; font-family: var(--font-data); font-size: 12px; white-space: nowrap; }
+.chip .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; background: var(--ok); }
+.chip[data-s="wounded"] .dot, .chip[data-s="kneel"] .dot { background: var(--warn); }
+.chip[data-s="down"] .dot { background: var(--hit); }
+#replayBadge { right: 16px; top: 14px; background: var(--hit); color: #fff; border-radius: 4px; padding: 3px 8px; font-family: var(--font-display); font-weight: 600; letter-spacing: .08em; }
+#loading { inset: 0; display: grid; place-items: center; color: var(--muted); font-family: var(--font-data); }
+
+@media (max-width: 820px) {
+  #app { grid-template-columns: minmax(0, 1fr); grid-template-rows: 62svh auto; height: auto; }
+  html, body { height: auto; }
+  #panel { border-left: 0; border-top: 1px solid var(--line); overflow: visible; }
+  #hint { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="c" aria-label="3D-сцена: манекен на площадке. Клик — выстрел из позиции камеры."></canvas>
+    <div id="chips" class="overlay">
+      <span class="chip" id="stateChip" data-s="ok"><span class="dot"></span><span id="stateText">стоит</span></span>
+      <span class="chip" id="aimChip">прицел: —</span>
+      <span class="chip" id="distChip">дистанция: —</span>
+    </div>
+    <div id="replayBadge" class="overlay" hidden>ПОВТОР ×0.25</div>
+    <div id="hint" class="overlay">Клик по манекену — выстрел из точки камеры. Клик рядом — пролёт пули или попадание в пол. Перетаскивание — вращение камеры, колесо — приближение. <kbd>Space</kbd> пауза, <kbd>R</kbd> сброс, <kbd>P</kbd> повтор.</div>
+    <div id="loading" class="overlay">загрузка физики…</div>
+  </div>
+
+  <aside id="panel">
+    <header>
+      <h1>Баллистический манекен</h1>
+      <p class="sub">Active ragdoll на Rapier: тело держит позу «мышцами», а реакцию на попадание определяет зона, а не сила удара.</p>
+    </header>
+
+    <section aria-labelledby="h-weapon">
+      <h2 id="h-weapon">Боеприпас</h2>
+      <div class="weapons" id="weapons"></div>
+    </section>
+
+    <section aria-labelledby="h-imp">
+      <h2 id="h-imp">Импульс пули</h2>
+      <div class="seg" id="impSeg">
+        <button type="button" id="impReal" aria-pressed="true">Реальный</button>
+        <button type="button" id="impMovie" aria-pressed="false">Киношный ×30</button>
+      </div>
+      <p class="note" id="impNote">Физически верный импульс p = m·v. Тело почти не сдвигается.</p>
+    </section>
+
+    <section aria-labelledby="h-time">
+      <h2 id="h-time">Время</h2>
+      <div class="seg" id="timeSeg">
+        <button type="button" id="t1" aria-pressed="true">1×</button>
+        <button type="button" id="t025" aria-pressed="false">0.25×</button>
+        <button type="button" id="t0" aria-pressed="false">Пауза</button>
+      </div>
+      <div class="actions">
+        <button type="button" class="btn primary" id="replayBtn">Повтор 5 с ×0.25</button>
+        <button type="button" class="btn" id="resetBtn">Сбросить манекен</button>
+      </div>
+    </section>
+
+    <section aria-labelledby="h-last">
+      <h2 id="h-last">Последний выстрел</h2>
+      <dl class="readout">
+        <dt>Зона</dt><dd id="rZone">—</dd>
+        <dt>Импульс</dt><dd id="rImp">—</dd>
+        <dt>Δv сегмента</dt><dd id="rSeg">—</dd>
+        <dt>Δv всего тела</dt><dd id="rBody">—</dd>
+        <dt>Масса манекена</dt><dd id="rMass">—</dd>
+      </dl>
+    </section>
+
+    <section aria-labelledby="h-log">
+      <h2 id="h-log">Журнал реакций</h2>
+      <ul id="log"></ul>
+    </section>
+
+    <details>
+      <summary>Почему тело не отлетает назад</summary>
+      <p>Пуля передаёт телу столько же импульса, сколько оружие передаёт стрелку при отдаче. Для пистолета 9×19:</p>
+      <p class="formula">p = 0,008 кг × 360 м/с ≈ 2,9 Н·с → Δv = 2,9 / 80 кг ≈ 3,6 см/с</p>
+      <p>Это меньше скорости медленного шага. Видимая реакция почти целиком биологическая: рефлекторное вздрагивание, защита раны, потеря опоры при повреждении ног или таза, мгновенное «выключение» при поражении головного или спинного мозга. Падение при ранении корпуса обычно наступает с задержкой или не наступает вовсе.</p>
+      <p>Модель учебная: реакции упрощены и частично случайны, у реальных людей они сильно различаются. Режим «Киношный ×30» показывает, как выглядела бы голливудская версия, если бы импульс действительно был таким.</p>
+    </details>
+  </aside>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "@dimforge/rapier3d-compat": "https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.12.0/rapier.es.js"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import RAPIER from '@dimforge/rapier3d-compat';
+
+await RAPIER.init();
+
+// ---------- constants ----------
+const DT = 1 / 120;
+const BODY_MASS = 80;
+const BAL_K = 2500, BAL_D = 450;   // N·m/rad and N·m·s/rad of the upright assist
+const BAL_LIN_K = 2500, BAL_LIN_D = 500; // N/m and N·s/m keeping the pelvis above the feet
+const STRENGTH = {      // joint stiffness at full tone, N·m/rad
+  abdomen: 1400, chest: 1000, head: 160, uArm: 160, fArm: 90, thigh: 1600, shin: 1600, foot: 700,
+};
+const WEAPONS = [
+  { id: 'pistol', name: 'Пистолет 9×19', m: 0.008, v: 360 },
+  { id: 'rifle', name: 'Винтовка 5,56×45', m: 0.004, v: 940 },
+  { id: 'slug', name: 'Дробовик, пуля 12 к.', m: 0.028, v: 450 },
+];
+const G_GROUND = 0x1, G_TORSO = 0x2, G_ARML = 0x4, G_ARMR = 0x8, G_LEGL = 0x10, G_LEGR = 0x20;
+const groups = (member, filter) => (member << 16) | filter;
+const FILTER = {
+  torso: groups(G_TORSO, G_GROUND | G_ARML | G_ARMR),
+  armL: groups(G_ARML, G_GROUND | G_TORSO | G_ARMR | G_LEGL | G_LEGR),
+  armR: groups(G_ARMR, G_GROUND | G_TORSO | G_ARML | G_LEGL | G_LEGR),
+  legL: groups(G_LEGL, G_GROUND | G_ARML | G_ARMR | G_LEGR),
+  legR: groups(G_LEGR, G_GROUND | G_ARML | G_ARMR | G_LEGL),
+  ground: groups(G_GROUND, 0xffff),
+};
+const ZONE_LABEL = {
+  head: 'голова', chest: 'грудная клетка', abdomen: 'живот', pelvis: 'таз',
+  uArmL: 'левое плечо', fArmL: 'левое предплечье', uArmR: 'правое плечо', fArmR: 'правое предплечье',
+  thighL: 'левое бедро', shinL: 'левая голень', footL: 'левая стопа',
+  thighR: 'правое бедро', shinR: 'правая голень', footR: 'правая стопа',
+};
+
+// Character faces +Z. Its left side is +X. Rest pose has every body at identity rotation.
+function partDefs() {
+  const defs = [
+    { n: 'pelvis', shape: 'capX', r: 0.12, h: 0.07, c: [0, 0.98, 0], g: 'torso' },
+    { n: 'abdomen', p: 'pelvis', shape: 'capY', r: 0.12, h: 0.04, c: [0, 1.16, 0], j: [0, 1.07, 0], g: 'torso' },
+    { n: 'chest', p: 'abdomen', shape: 'capX', r: 0.13, h: 0.07, c: [0, 1.40, 0], j: [0, 1.27, 0], g: 'torso' },
+    { n: 'head', p: 'chest', shape: 'ball', r: 0.105, c: [0, 1.68, 0], j: [0, 1.56, 0], g: 'torso' },
+  ];
+  for (const [S, s] of [['L', 1], ['R', -1]]) {
+    defs.push(
+      { n: 'uArm' + S, p: 'chest', shape: 'capY', r: 0.045, h: 0.1, c: [0.26 * s, 1.33, 0], j: [0.26 * s, 1.47, 0], g: 'arm' + S },
+      { n: 'fArm' + S, p: 'uArm' + S, shape: 'capY', r: 0.04, h: 0.12, c: [0.26 * s, 1.04, 0], j: [0.26 * s, 1.19, 0], g: 'arm' + S, hinge: [-2.5, 0.05] },
+      { n: 'thigh' + S, p: 'pelvis', shape: 'capY', r: 0.07, h: 0.13, c: [0.1 * s, 0.72, 0], j: [0.1 * s, 0.92, 0], g: 'leg' + S },
+      { n: 'shin' + S, p: 'thigh' + S, shape: 'capY', r: 0.055, h: 0.155, c: [0.1 * s, 0.31, 0], j: [0.1 * s, 0.52, 0], g: 'leg' + S, hinge: [-0.05, 2.5] },
+      { n: 'foot' + S, p: 'shin' + S, shape: 'box', hx: 0.05, hy: 0.035, hz: 0.12, c: [0.1 * s, 0.035, 0.045], j: [0.1 * s, 0.09, 0], g: 'leg' + S, hinge: [-0.8, 0.8] },
+    );
+  }
+  return defs;
+}
+const volume = d => d.shape === 'box' ? 8 * d.hx * d.hy * d.hz
+  : d.shape === 'ball' ? 4 / 3 * Math.PI * d.r ** 3
+  : Math.PI * d.r * d.r * 2 * d.h + 4 / 3 * Math.PI * d.r ** 3;
+
+// ---------- rendering ----------
+const canvas = document.getElementById('c');
+const stage = document.getElementById('stage');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 200);
+camera.position.set(1.2, 1.55, 6);
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 1.0, 0);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI * 0.495;
+controls.minDistance = 1.5; controls.maxDistance = 25;
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x777777, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(3, 6, 4);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -4, right: 4, top: 4, bottom: -4, near: 0.5, far: 20 });
+scene.add(sun);
+
+const floorMat = new THREE.MeshStandardMaterial({ roughness: 0.95 });
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), floorMat);
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+scene.add(floor);
+let grid = null;
+const bodyMat = new THREE.MeshStandardMaterial({ flatShading: true, roughness: 0.75 });
+const hotMat = new THREE.MeshStandardMaterial({ flatShading: true, roughness: 0.75 });
+const hitMat = new THREE.MeshBasicMaterial();
+const tracerMat = new THREE.LineBasicMaterial({ transparent: true });
+
+function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+function applyTheme() {
+  scene.background = new THREE.Color(cssVar('--scene-bg'));
+  scene.fog = new THREE.Fog(scene.background, 14, 40);
+  floorMat.color.set(cssVar('--scene-floor'));
+  bodyMat.color.set(cssVar('--mannequin'));
+  hotMat.color.set(cssVar('--mannequin-hot'));
+  hitMat.color.set(cssVar('--hit'));
+  tracerMat.color.set(cssVar('--hit'));
+  if (grid) scene.remove(grid);
+  grid = new THREE.GridHelper(30, 120, cssVar('--scene-grid'), cssVar('--scene-grid2'));
+  grid.position.y = 0.002;
+  scene.add(grid);
+}
+applyTheme();
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+function meshFor(d) {
+  let geo;
+  if (d.shape === 'box') geo = new THREE.BoxGeometry(d.hx * 2, d.hy * 2, d.hz * 2);
+  else if (d.shape === 'ball') geo = new THREE.IcosahedronGeometry(d.r, 1);
+  else { geo = new THREE.CapsuleGeometry(d.r, d.h * 2, 2, 7); if (d.shape === 'capX') geo.rotateZ(Math.PI / 2); }
+  const m = new THREE.Mesh(geo, bodyMat);
+  m.castShadow = true;
+  if (d.n === 'head') { // nose and neck show which way the mannequin faces
+    const nose = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.04, 0.05), bodyMat);
+    nose.position.set(0, -0.01, 0.1); nose.castShadow = true; m.add(nose);
+    const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.05, 0.12, 6), bodyMat);
+    neck.position.set(0, -0.12, -0.01); m.add(neck);
+  }
+  if (d.n.startsWith('fArm')) {
+    const hand = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.1, 0.03), bodyMat);
+    hand.position.set(0, -0.19, 0); hand.castShadow = true; m.add(hand);
+  }
+  m.userData.part = d.n;
+  scene.add(m);
+  return m;
+}
+
+// ---------- physics world & mannequin ----------
+let world, parts, byName, totalMass, simTime, events, character, balanceJoint;
+
+function buildWorld() {
+  if (world) world.free();
+  world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+  world.timestep = DT;
+  const gb = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, -0.1, 0));
+  world.createCollider(RAPIER.ColliderDesc.cuboid(30, 0.1, 30).setFriction(1.2).setCollisionGroups(FILTER.ground), gb);
+
+  const defs = partDefs();
+  const density = BODY_MASS / defs.reduce((s, d) => s + volume(d), 0);
+  if (!parts) parts = defs.map(d => ({ ...d, mesh: meshFor(d) }));
+  byName = {};
+  for (const p of parts) {
+    byName[p.n] = p;
+    for (const ch of [...p.mesh.children]) if (ch.userData.marker) p.mesh.remove(ch);
+    p.body = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(...p.c)
+      .setLinearDamping(0.05).setAngularDamping(0.4).setCanSleep(false));
+    let cd = p.shape === 'box' ? RAPIER.ColliderDesc.cuboid(p.hx, p.hy, p.hz)
+      : p.shape === 'ball' ? RAPIER.ColliderDesc.ball(p.r)
+      : RAPIER.ColliderDesc.capsule(p.h, p.r);
+    if (p.shape === 'capX') cd.setRotation(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2));
+    cd.setDensity(density).setFriction(p.n.startsWith('foot') ? 1.2 : 0.6).setCollisionGroups(FILTER[p.g]);
+    world.createCollider(cd, p.body);
+    p.tone = 1; p.toneTarget = 1; p.toneRate = 3;
+    if (p.p) {
+      const par = byName[p.p];
+      const a1 = { x: p.j[0] - par.c[0], y: p.j[1] - par.c[1], z: p.j[2] - par.c[2] };
+      const a2 = { x: p.j[0] - p.c[0], y: p.j[1] - p.c[1], z: p.j[2] - p.c[2] };
+      let jd;
+      if (p.hinge) {
+        jd = RAPIER.JointData.revolute(a1, a2, { x: 1, y: 0, z: 0 });
+        jd.limitsEnabled = true; jd.limits = p.hinge;
+      } else jd = RAPIER.JointData.spherical(a1, a2);
+      p.joint = world.createImpulseJoint(jd, par.body, p.body, true);
+      p.k = STRENGTH[p.n.replace(/[LR]$/, '')];
+      if (p.hinge) p.joint.configureMotorModel(FORCE_BASED);
+      else for (const ax of ANG) p.joint.rawSet.jointConfigureMotorModel(p.joint.handle, ax, FORCE_BASED);
+    }
+  }
+  // world-to-pelvis joint with every axis free; only its angular motors act
+  const pel = byName.pelvis;
+  balanceJoint = world.createImpulseJoint(
+    RAPIER.JointData.generic({ x: pel.c[0], y: pel.c[1] + 0.1, z: pel.c[2] }, { x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 }, 0), gb, pel.body, true);
+  for (const ax of [0, 1, ...ANG]) balanceJoint.rawSet.jointConfigureMotorModel(balanceJoint.handle, ax, FORCE_BASED);
+  totalMass = parts.reduce((s, p) => s + p.body.mass(), 0);
+  document.getElementById('rMass').textContent = totalMass.toFixed(1) + ' кг';
+  simTime = 0; events = []; layers.length = 0; history.length = 0;
+  character = { balance: 1, balanceTarget: 1, balanceRate: 3, conscious: true, state: 'ok', torsoHits: 0, collapseAt: null, kneel: null };
+  setState('ok');
+  syncMeshes();
+}
+
+// ---------- pose layers ----------
+// Each layer is an additive pose (Euler XYZ offsets relative to the parent) with an envelope.
+const layers = [];
+const BASE = { thighL: [-0.05, 0, 0], thighR: [-0.05, 0, 0], shinL: [0.1, 0, 0], shinR: [0.1, 0, 0], uArmL: [0, 0, 0.06], uArmR: [0, 0, -0.06], fArmL: [-0.15, 0, 0], fArmR: [-0.15, 0, 0] };
+function addLayer(pose, { peak = 1, attack = 0.08, hold = 0.3, release = 0.8, tag } = {}) {
+  const l = { pose, peak, attack, hold, release, age: 0, tag };
+  layers.push(l);
+  return l;
+}
+function layerWeight(l) {
+  if (l.age < l.attack) return l.peak * l.age / l.attack;
+  if (l.age < l.attack + l.hold) return l.peak;
+  return l.peak * Math.max(0, 1 - (l.age - l.attack - l.hold) / l.release);
+}
+const tmpE = new THREE.Euler(), tmpQ = new THREE.Quaternion();
+function targetQuat(name, out) {
+  const b = BASE[name] || [0, 0, 0];
+  let x = b[0], y = b[1], z = b[2];
+  for (const l of layers) {
+    const v = l.pose[name]; if (!v) continue;
+    const w = layerWeight(l);
+    x += v[0] * w; y += v[1] * w; z += v[2] * w;
+  }
+  if (name.startsWith('foot')) { // keep the sole roughly parallel to the floor
+    const S = name.slice(-1);
+    x -= targetEulerX('thigh' + S) + targetEulerX('shin' + S);
+  }
+  return out.setFromEuler(tmpE.set(x, y, z, 'XYZ'));
+}
+function targetEulerX(name) {
+  let x = (BASE[name] || [0])[0];
+  for (const l of layers) { const v = l.pose[name]; if (v) x += v[0] * layerWeight(l); }
+  return x;
+}
+
+// ---------- muscle controller ----------
+// Muscles are force-based joint motors (implicit springs inside the solver), one per angular axis.
+const qT = new THREE.Quaternion();
+const toQ = (r, q) => q.set(r.x, r.y, r.z, r.w);
+const ANG = [3, 4, 5]; // RawJointAxis.AngX / AngY / AngZ
+const FORCE_BASED = 1;
+function motorAxis(joint, axis, target, k, d) {
+  joint.rawSet.jointConfigureMotorPosition(joint.handle, axis, target, k, d);
+}
+function muscles(dt) {
+  for (const p of parts) {
+    p.tone += (p.toneTarget - p.tone) * Math.min(1, p.toneRate * dt);
+    if (!p.p) continue;
+    const k = p.k * p.tone;
+    const d = p.k * (0.12 * p.tone + 0.006); // a little passive damping remains when limp
+    targetQuat(p.n, qT);
+    if (qT.w < 0) qT.set(-qT.x, -qT.y, -qT.z, -qT.w);
+    if (p.hinge) p.joint.configureMotorPosition(2 * Math.atan2(qT.x, qT.w), k, d);
+    else {
+      const v = [qT.x, qT.y, qT.z];
+      for (let i = 0; i < 3; i++) motorAxis(p.joint, ANG[i], 2 * Math.asin(Math.max(-1, Math.min(1, v[i]))), k, d);
+    }
+  }
+  // Upright assist: a motorized joint between the world and the pelvis stands in for balance reflexes.
+  const c = character;
+  c.balance += (c.balanceTarget - c.balance) * Math.min(1, c.balanceRate * dt);
+  if (balanceJoint && c.balanceTarget === 0 && c.balance < 0.01) {
+    // balance is gone for good: drop the assist joint, it only adds solver noise from here on
+    world.removeImpulseJoint(balanceJoint, true);
+    balanceJoint = null;
+  }
+  if (!balanceJoint) return;
+  const kb = BAL_K * c.balance, db = BAL_D * c.balance;
+  // A generic joint built on axis X has the local basis X = world X, Y = world −Z, Z = world Y.
+  motorAxis(balanceJoint, 3, 0, kb, db);              // pitch (about world X)
+  motorAxis(balanceJoint, 4, 0, kb, db);              // roll (about world −Z)
+  motorAxis(balanceJoint, 5, 0, kb * 0.08, db * 0.2); // yaw, kept loose
+  // keep the pelvis over the support area, weighted toward the leg that still carries load
+  const wL = byName.shinL.tone + 0.02, wR = byName.shinR.tone + 0.02;
+  const fL = byName.footL.body.translation(), fR = byName.footR.body.translation();
+  let sx = (fL.x * wL + fR.x * wR) / (wL + wR), sz = (fL.z * wL + fR.z * wR) / (wL + wR) - 0.03;
+  if (c.kneel) {
+    const k = byName['shin' + c.kneel].body, kt = k.translation();
+    const knee = new THREE.Vector3(0, 0.155, 0).applyQuaternion(toQ(k.rotation(), qT)).add(vecOf(kt));
+    const f = byName['foot' + (c.kneel === 'L' ? 'R' : 'L')].body.translation();
+    sx = (knee.x + f.x) / 2; sz = knee.z * 0.65 + f.z * 0.35;
+  }
+  const kl = BAL_LIN_K * c.balance, dl = BAL_LIN_D * c.balance;
+  const rest = byName.pelvis.c;
+  motorAxis(balanceJoint, 0, sx - rest[0], kl, dl);
+  motorAxis(balanceJoint, 1, -(sz - rest[2]), kl, dl);
+}
+
+// ---------- reactions ----------
+const tone = (names, target, rate) => names.forEach(n => { byName[n].toneTarget = target; byName[n].toneRate = rate; });
+const LEG = S => ['thigh' + S, 'shin' + S, 'foot' + S];
+const ARM = S => ['uArm' + S, 'fArm' + S];
+const ALL = () => parts.filter(p => p.p).map(p => p.n);
+const at = (delay, fn) => events.push({ t: simTime + delay, fn });
+
+function setState(s) {
+  character && (character.state = s);
+  const chip = document.getElementById('stateChip');
+  chip.dataset.s = s;
+  document.getElementById('stateText').textContent = { ok: 'стоит', wounded: 'ранен, на ногах', kneel: 'на колене', down: 'упал' }[s];
+}
+
+function startle(intensity, side) {
+  if (!character.conscious) return;
+  const k = Math.min(1, intensity);
+  addLayer({
+    head: [0.35, -side * 0.6, 0], chest: [0.3, -side * 0.2, side * 0.12], abdomen: [0.15, 0, 0],
+    uArmL: [-1.25, 0, -0.25], uArmR: [-1.25, 0, 0.25], fArmL: [-1.9, 0, 0], fArmR: [-1.9, 0, 0],
+    thighL: [-0.5, 0, 0], thighR: [-0.5, 0, 0], shinL: [0.85, 0, 0], shinR: [0.85, 0, 0],
+  }, { peak: 0.35 + 0.65 * k, attack: 0.09, hold: 0.25 + 0.4 * k, release: 0.9 });
+}
+
+function flinch(strength, side) {
+  if (!character.conscious) return;
+  addLayer({
+    chest: [0.45, side * 0.15, 0], abdomen: [0.3, 0, 0], head: [0.3, 0, 0],
+    thighL: [-0.25, 0, 0], thighR: [-0.25, 0, 0], shinL: [0.45, 0, 0], shinR: [0.45, 0, 0],
+  }, { peak: strength, attack: 0.06, hold: 0.15, release: 0.6 });
+}
+
+function collapse(fast) {
+  character.conscious = false;
+  character.balanceTarget = 0; character.balanceRate = fast ? 40 : 2.2;
+  for (const l of layers) if (l.hold === Infinity) l.hold = 0;
+  if (fast) tone(ALL(), 0, 40);
+  else {
+    tone([...LEG('L'), ...LEG('R')], 0.03, 4);
+    tone(['abdomen', 'chest', 'head'], 0.05, 2.2);
+    tone([...ARM('L'), ...ARM('R')], 0.03, 3);
+  }
+}
+
+function react(zone, side, hitDir) {
+  const c = character;
+  if (!c.conscious) return { text: 'Тело уже без мышечного контроля: только пассивное движение от импульса.' };
+  if (c.state === 'ok') setState('wounded');
+  if (zone === 'head') {
+    collapse(true);
+    return { text: 'Мгновенная потеря мышечного контроля. Тело оседает под собственным весом; куда оно упадёт, решает поза, а не пуля.' };
+  }
+  if (zone === 'chest' || zone === 'abdomen') {
+    c.torsoHits++;
+    flinch(0.9, side);
+    // hands go to the wound: shoulder flexion, inward rotation and adduction bring the forearms across the belly
+    const arm = (S, k) => { const s = S === 'L' ? 1 : -1; return [-0.65 * k, -0.85 * s * k, -0.3 * s * k]; };
+    const near = side >= 0 ? 'L' : 'R', far = near === 'L' ? 'R' : 'L';
+    at(0.25, () => c.conscious && addLayer({
+      ['uArm' + near]: arm(near, 1), ['fArm' + near]: [-2.0, 0, 0],
+      ['uArm' + far]: arm(far, 0.75), ['fArm' + far]: [-1.8, 0, 0],
+      chest: [0.2, 0, 0], head: [0.25, 0, 0],
+    }, { peak: 1, attack: 0.35, hold: Infinity, release: 0.6, tag: 'clutch' }));
+    const willFall = c.torsoHits > 1 || Math.random() < 0.65;
+    if (willFall) {
+      const delay = c.torsoHits > 1 ? 0.6 + Math.random() * 1.8 : 2.5 + Math.random() * 5;
+      const t = simTime + delay;
+      if (c.collapseAt === null || t < c.collapseAt) {
+        c.collapseAt = t;
+        at(delay, () => { if (c.collapseAt === t && c.conscious) { collapse(false); log('info', 'Оседание', 'Ноги перестают держать: тело складывается и падает почти на месте.'); } });
+      }
+      return { text: `Рефлекторное сгибание, рука тянется к ране. Падение не от удара: в этом прогоне ослабление начнётся примерно через ${delay.toFixed(1)} с.` };
+    }
+    return { text: 'Рефлекторное сгибание, рука тянется к ране. В этом прогоне остаётся на ногах: так бывает часто.' };
+  }
+  if (zone === 'pelvis') {
+    flinch(0.6, side);
+    tone([...LEG('L'), ...LEG('R')], 0.1, 8);
+    c.balanceTarget = 0.12; c.balanceRate = 4;
+    addLayer({ thighL: [-0.7, 0, 0], thighR: [-0.7, 0, 0], shinL: [1.3, 0, 0], shinR: [1.3, 0, 0] }, { attack: 0.3, hold: Infinity, tag: 'sag' });
+    at(1.5, () => { if (c.state !== 'down') { c.balanceTarget = 0; } });
+    return { text: 'Таз — опора для обеих ног. Ноги не держат вес, тело падает сразу, без отброса.' };
+  }
+  if (zone.startsWith('thigh') || zone.startsWith('shin') || zone.startsWith('foot')) {
+    const S = zone.slice(-1), H = S === 'L' ? 'R' : 'L';
+    flinch(0.4, side);
+    tone(LEG(S), 0.12, 10);
+    c.balanceTarget = Math.min(c.balanceTarget, 0.6); c.balanceRate = 3;
+    if (c.kneel) return { text: 'Ещё одно попадание в ногу: тело остаётся на колене.' };
+    if (Math.random() < 0.55) {
+      c.kneel = S;
+      at(0.8, () => { if (c.state === 'wounded') setState('kneel'); });
+      addLayer({
+        ['thigh' + S]: [0.05, 0, 0], ['shin' + S]: [1.45, 0, 0],
+        ['thigh' + H]: [-1.35, 0, 0], ['shin' + H]: [1.45, 0, 0], chest: [0.15, 0, 0],
+      }, { attack: 0.7, hold: Infinity, tag: 'kneel' });
+      return { text: 'Нога подкашивается, тело опускается на колено раненой ноги и удерживает корпус.' };
+    }
+    const buckle = addLayer({ ['thigh' + S]: [-0.35, 0, 0], ['shin' + S]: [1.3, 0, 0] }, { attack: 0.25, hold: Infinity, tag: 'buckle' });
+    at(1.8, () => { if (c.conscious) { tone(LEG(S), 0.45, 2); buckle.hold = buckle.age - buckle.attack; buckle.release = 0.8; } });
+    return { text: 'Нога подкашивается, вес уходит на другую. В этом прогоне устоял: раненая нога снова опирается, но слабо.' };
+  }
+  if (zone.startsWith('uArm') || zone.startsWith('fArm')) {
+    const S = zone.slice(-1);
+    tone(ARM(S), 0.03, 12);
+    flinch(0.35, side);
+    addLayer({ chest: [0.1, S === 'L' ? 0.3 : -0.3, 0], head: [0, S === 'L' ? 0.5 : -0.5, 0] }, { attack: 0.1, hold: 0.4, release: 1 });
+    return { text: 'Рука повисает, корпус вздрагивает и поворачивается к ране.' };
+  }
+  return { text: '' };
+}
+
+// ---------- shooting ----------
+let weapon = WEAPONS[0], impulseMult = 1;
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+const effects = [];
+
+function shoot(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  const ray = raycaster.ray;
+  const hits = raycaster.intersectObjects([...parts.map(p => p.mesh), floor], true);
+  const hit = hits[0];
+  let end = hit ? hit.point.clone() : ray.at(60, new THREE.Vector3());
+  const muzzle = camera.position.clone()
+    .add(new THREE.Vector3(0.12, -0.12, 0).applyQuaternion(camera.quaternion));
+  const p = weapon.m * weapon.v * impulseMult;
+  const dir = end.clone().sub(muzzle).normalize();
+  tracer(muzzle, end);
+
+  let partHit = null;
+  if (hit && hit.object !== floor) {
+    let o = hit.object; while (!o.userData.part) o = o.parent;
+    partHit = byName[o.userData.part];
+  }
+  if (partHit) {
+    const b = partHit.body;
+    b.applyImpulseAtPoint({ x: dir.x * p, y: dir.y * p, z: dir.z * p }, hit.point, true);
+    marker(partHit, hit.point);
+    // which side of the body was hit, in the mannequin's own frame (+1 = its left)
+    const local = hit.point.clone().sub(vecOf(byName.chest.body.translation()))
+      .applyQuaternion(toQ(byName.chest.body.rotation(), new THREE.Quaternion()).invert());
+    const side = Math.abs(local.x) < 0.04 ? 0 : Math.sign(local.x);
+    const zone = partHit.n;
+    const res = react(zone, side, dir);
+    readout(ZONE_LABEL[zone], p, p / b.mass(), p / totalMass);
+    log('hit', ZONE_LABEL[zone], res.text, `Δv тела ${(p / totalMass * 100).toFixed(1)} см/с`);
+    if (p / totalMass > 0.4 && character.balanceTarget > 0) { // only a movie-sized push can knock the body off balance
+      character.balanceTarget = 0; character.balanceRate = 30;
+      tone([...LEG('L'), ...LEG('R')], 0.3, 10);
+      log('info', 'Сбит с ног', 'Такой толчок выбивает из равновесия. Настоящая пуля этого не делает.');
+    }
+    return;
+  }
+
+  // near miss: closest approach of the bullet path to head / chest / pelvis
+  const travel = hit ? hit.distance : 60;
+  let best = Infinity, bestPt = null;
+  for (const n of ['head', 'chest', 'pelvis']) {
+    const c = vecOf(byName[n].body.translation());
+    const t = c.clone().sub(ray.origin).dot(ray.direction);
+    if (t < 0 || t > travel + 0.3) continue;
+    const d = ray.at(t, new THREE.Vector3()).distanceTo(c);
+    if (d < best) { best = d; bestPt = c; }
+  }
+  if (hit && hit.object === floor) dust(hit.point);
+  const pelvisPos = vecOf(byName.pelvis.body.translation());
+  const floorDist = hit && hit.object === floor ? Math.hypot(hit.point.x - pelvisPos.x, hit.point.z - pelvisPos.z) : Infinity;
+  readout('промах', p, 0, 0);
+  const side = sideOfShot(ray);
+  if (best < 0.9) {
+    startle(1 - best / 0.9, side);
+    log('near', `Пролёт ${Math.round(best * 100)} см`, character.conscious ? 'Рефлекс испуга: голова втягивается и отворачивается, руки к лицу, колени сгибаются.' : 'Реакции нет: тело без сознания.');
+  } else if (floorDist < 1.5) {
+    startle(0.5 * (1 - floorDist / 1.5), side);
+    log('near', `Пол в ${floorDist.toFixed(1)} м`, character.conscious ? 'Удар в пол рядом: короткое вздрагивание.' : 'Реакции нет.');
+  } else log('info', 'Промах', 'Слишком далеко, реакции нет.');
+}
+function sideOfShot(ray) {
+  // Which side of the mannequin did the bullet pass on (+1 = its left)?
+  const chest = byName.chest.body;
+  const c = vecOf(chest.translation());
+  const t = c.clone().sub(ray.origin).dot(ray.direction);
+  const local = ray.at(t, new THREE.Vector3()).sub(c).applyQuaternion(toQ(chest.rotation(), new THREE.Quaternion()).invert());
+  return local.x >= 0 ? 1 : -1;
+}
+const vecOf = v => new THREE.Vector3(v.x, v.y, v.z);
+
+function marker(part, point) {
+  const m = new THREE.Mesh(new THREE.IcosahedronGeometry(0.018, 0), hitMat);
+  m.userData.marker = true;
+  part.mesh.updateMatrixWorld();
+  m.position.copy(part.mesh.worldToLocal(point.clone()));
+  part.mesh.add(m);
+}
+function tracer(a, b) {
+  const g = new THREE.BufferGeometry().setFromPoints([a, b]);
+  const mat = tracerMat.clone(); mat.opacity = 0.9;
+  const line = new THREE.Line(g, mat);
+  scene.add(line);
+  effects.push({ obj: line, life: 0.35, age: 0, update(e, k) { e.obj.material.opacity = 0.9 * (1 - k); } });
+}
+function dust(pt) {
+  const geo = new THREE.IcosahedronGeometry(0.02, 0);
+  const mat = new THREE.MeshBasicMaterial({ color: cssVar('--scene-grid'), transparent: true });
+  for (let i = 0; i < 10; i++) {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.copy(pt);
+    const v = new THREE.Vector3((Math.random() - 0.5) * 1.2, 0.6 + Math.random() * 1.2, (Math.random() - 0.5) * 1.2);
+    scene.add(m);
+    effects.push({ obj: m, life: 0.6, age: 0, update(e, k, dt) { v.y -= 6 * dt; e.obj.position.addScaledVector(v, dt); mat.opacity = 1 - k; } });
+  }
+}
+
+// ---------- replay ----------
+const history = [];
+const HISTORY_FRAMES = 300; // 5 s at 60 Hz
+let stepCount = 0, replay = null;
+function record() {
+  const f = new Float32Array(parts.length * 7);
+  parts.forEach((p, i) => {
+    const t = p.body.translation(), q = p.body.rotation();
+    f.set([t.x, t.y, t.z, q.x, q.y, q.z, q.w], i * 7);
+  });
+  history.push(f);
+  if (history.length > HISTORY_FRAMES) history.shift();
+}
+function applyFrame(f) {
+  parts.forEach((p, i) => { p.mesh.position.set(f[i * 7], f[i * 7 + 1], f[i * 7 + 2]); p.mesh.quaternion.set(f[i * 7 + 3], f[i * 7 + 4], f[i * 7 + 5], f[i * 7 + 6]); });
+}
+
+// ---------- simulation loop ----------
+function step() {
+  muscles(DT);
+  world.step();
+  simTime += DT;
+  for (const l of layers) l.age += DT;
+  for (let i = layers.length - 1; i >= 0; i--) if (layers[i].age > layers[i].attack + layers[i].hold + layers[i].release) layers.splice(i, 1);
+  for (let i = events.length - 1; i >= 0; i--) if (events[i].t <= simTime) { const e = events.splice(i, 1)[0]; e.fn(); }
+  if (character.state !== 'down' && byName.pelvis.body.translation().y < (character.kneel && character.conscious ? 0.3 : 0.45)) {
+    setState('down');
+    character.balanceTarget = 0;
+    if (character.conscious) { // conscious but on the ground: muscles relax instead of holding the standing pose
+      for (const p of parts) { p.toneTarget = Math.min(p.toneTarget, 0.06); p.toneRate = 4; }
+      for (const l of layers) if (l.hold === Infinity) l.hold = 0;
+    }
+  }
+  if (++stepCount % 2 === 0) record();
+}
+function syncMeshes() {
+  for (const p of parts) {
+    const t = p.body.translation(), q = p.body.rotation();
+    p.mesh.position.set(t.x, t.y, t.z);
+    p.mesh.quaternion.set(q.x, q.y, q.z, q.w);
+  }
+}
+
+let timeScale = 1, acc = 0, last = performance.now();
+function frame(now) {
+  const dtReal = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (replay) {
+    replay.i += dtReal * 60 * 0.25;
+    if (replay.i >= replay.frames.length - 1) { replay = null; document.getElementById('replayBadge').hidden = true; syncMeshes(); }
+    else applyFrame(replay.frames[Math.floor(replay.i)]);
+  } else {
+    acc += dtReal * timeScale;
+    let n = 0;
+    while (acc >= DT && n < 8) { step(); acc -= DT; n++; }
+    if (n === 8) acc = 0;
+    syncMeshes();
+  }
+  for (let i = effects.length - 1; i >= 0; i--) {
+    const e = effects[i]; e.age += dtReal;
+    const k = Math.min(1, e.age / e.life);
+    e.update(e, k, dtReal);
+    if (k >= 1) { scene.remove(e.obj); effects.splice(i, 1); }
+  }
+  controls.update();
+  const dist = camera.position.distanceTo(vecOf(byName.chest.body.translation()));
+  distText.textContent = `дистанция: ${dist.toFixed(1)} м`;
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+const distText = document.getElementById('distChip');
+
+function resize() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(stage);
+
+// ---------- UI ----------
+const logEl = document.getElementById('log');
+function log(kind, tag, text, extra) {
+  const li = document.createElement('li');
+  li.className = kind;
+  const time = document.createElement('time'); time.textContent = simTime.toFixed(2) + ' с';
+  const body = document.createElement('div');
+  const t = document.createElement('span'); t.className = 'tag'; t.textContent = tag;
+  body.append(t, document.createTextNode(text));
+  if (extra) { const x = document.createElement('div'); x.className = 'ex'; x.textContent = extra; body.append(x); }
+  li.append(time, body);
+  logEl.prepend(li);
+  while (logEl.children.length > 30) logEl.lastChild.remove();
+}
+function readout(zone, p, dvSeg, dvBody) {
+  document.getElementById('rZone').textContent = zone;
+  document.getElementById('rImp').textContent = p.toFixed(1) + ' Н·с';
+  document.getElementById('rSeg').textContent = dvSeg ? (dvSeg < 1 ? (dvSeg * 100).toFixed(0) + ' см/с' : dvSeg.toFixed(1) + ' м/с') : '—';
+  document.getElementById('rBody').textContent = dvBody ? (dvBody < 1 ? (dvBody * 100).toFixed(1) + ' см/с' : dvBody.toFixed(2) + ' м/с') : '—';
+}
+
+const wEl = document.getElementById('weapons');
+WEAPONS.forEach((w, i) => {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'weapon'; b.id = 'w-' + w.id;
+  b.setAttribute('aria-pressed', i === 0);
+  b.innerHTML = `<b>${w.name}</b><span class="p">${(w.m * w.v).toFixed(1)} Н·с</span><span class="spec">${w.m * 1000} г × ${w.v} м/с</span>`;
+  b.onclick = () => { weapon = w; wEl.querySelectorAll('.weapon').forEach(x => x.setAttribute('aria-pressed', x === b)); };
+  wEl.append(b);
+});
+function segment(ids, onPick) {
+  ids.forEach(id => document.getElementById(id).onclick = () => {
+    ids.forEach(x => document.getElementById(x).setAttribute('aria-pressed', x === id));
+    onPick(id);
+  });
+}
+segment(['impReal', 'impMovie'], id => {
+  impulseMult = id === 'impMovie' ? 30 : 1;
+  document.getElementById('impNote').textContent = impulseMult === 1
+    ? 'Физически верный импульс p = m·v. Тело почти не сдвигается.'
+    : 'Импульс ×30, как в кино. Так пуля не работает: стрелка отбросило бы так же.';
+});
+const setTime = id => { timeScale = { t1: 1, t025: 0.25, t0: 0 }[id]; };
+segment(['t1', 't025', 't0'], setTime);
+function pickTime(id) { document.getElementById(id).click(); }
+function startReplay() {
+  if (history.length < 10) return;
+  replay = { frames: history.slice(), i: 0 };
+  document.getElementById('replayBadge').hidden = false;
+}
+function reset() {
+  replay = null; document.getElementById('replayBadge').hidden = true;
+  buildWorld();
+  log('info', 'Сброс', 'Манекен снова стоит.');
+}
+document.getElementById('replayBtn').onclick = startReplay;
+document.getElementById('resetBtn').onclick = reset;
+addEventListener('keydown', e => {
+  if (e.target.closest && e.target.closest('input, textarea')) return;
+  if (e.code === 'Space') { e.preventDefault(); pickTime(timeScale === 0 ? 't1' : 't0'); }
+  if (e.code === 'KeyR') reset();
+  if (e.code === 'KeyP') startReplay();
+});
+
+// click = shot, drag = orbit
+let down = null;
+canvas.addEventListener('pointerdown', e => { down = { x: e.clientX, y: e.clientY }; });
+canvas.addEventListener('pointerup', e => {
+  if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 6 && !replay) shoot(e.clientX, e.clientY);
+  down = null;
+});
+const aimChip = document.getElementById('aimChip');
+let hovered = null;
+canvas.addEventListener('pointermove', e => {
+  const r = canvas.getBoundingClientRect();
+  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  const h = raycaster.intersectObjects(parts.map(p => p.mesh), false)[0];
+  const part = h ? h.object.userData.part : null;
+  if (part !== hovered) {
+    if (hovered) byName[hovered].mesh.material = bodyMat;
+    if (part) byName[part].mesh.material = hotMat;
+    hovered = part;
+    aimChip.textContent = 'прицел: ' + (part ? ZONE_LABEL[part] : '—');
+  }
+});
+
+buildWorld();
+resize();
+document.getElementById('loading').remove();
+log('info', 'Готово', 'Манекен стоит в 6 м от камеры. Выстрел идёт из точки, где находится камера.');
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
