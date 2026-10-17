@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="description" content="Учебный симулятор: low-poly манекен на active ragdoll (three.js + Rapier) реагирует на попадания и пролёты пуль, с анатомией и моделью кровопотери.">
+<meta name="description" content="Учебный симулятор: манекен на active ragdoll (three.js + Rapier) реагирует на попадания и пролёты пуль, с анатомией и моделью кровопотери.">
 <style>body { margin: 0; } [hidden] { display: none !important; }</style>
 <title>Баллистический манекен</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -152,7 +152,7 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
     </div>
     <div id="replayBadge" class="overlay" hidden>ПОВТОР ×0.25</div>
     <div id="hint" class="overlay">Клик по манекену — выстрел из точки камеры. Клик рядом — пролёт пули или попадание в пол. Перетаскивание — вращение камеры, колесо — приближение. <kbd>Space</kbd> пауза, <kbd>R</kbd> сброс, <kbd>P</kbd> повтор, <kbd>X</kbd> рентген.</div>
-    <div id="loading" class="overlay">загрузка физики…</div>
+    <div id="loading" class="overlay">загрузка физики и сборка тела…</div>
   </div>
 
   <aside id="panel">
@@ -292,13 +292,13 @@ function partDefs() {
   const defs = [
     { n: 'pelvis', shape: 'capX', r: 0.12, h: 0.07, c: [0, 0.98, 0], g: 'torso' },
     { n: 'abdomen', p: 'pelvis', shape: 'capY', r: 0.12, h: 0.04, c: [0, 1.16, 0], j: [0, 1.07, 0], g: 'torso' },
-    { n: 'chest', p: 'abdomen', shape: 'capX', r: 0.13, h: 0.07, c: [0, 1.40, 0], j: [0, 1.27, 0], g: 'torso' },
+    { n: 'chest', p: 'abdomen', shape: 'capX', r: 0.13, h: 0.05, c: [0, 1.40, 0], j: [0, 1.27, 0], g: 'torso' },
     { n: 'head', p: 'chest', shape: 'ball', r: 0.105, c: [0, 1.68, 0], j: [0, 1.56, 0], g: 'torso' },
   ];
   for (const [S, s] of [['L', 1], ['R', -1]]) {
     defs.push(
-      { n: 'uArm' + S, p: 'chest', shape: 'capY', r: 0.045, h: 0.1, c: [0.26 * s, 1.33, 0], j: [0.26 * s, 1.47, 0], g: 'arm' + S },
-      { n: 'fArm' + S, p: 'uArm' + S, shape: 'capY', r: 0.04, h: 0.12, c: [0.26 * s, 1.04, 0], j: [0.26 * s, 1.19, 0], g: 'arm' + S, hinge: [-2.5, 0.05] },
+      { n: 'uArm' + S, p: 'chest', shape: 'capY', r: 0.042, h: 0.125, c: [0.225 * s, 1.30, 0], j: [0.225 * s, 1.47, 0], g: 'arm' + S },
+      { n: 'fArm' + S, p: 'uArm' + S, shape: 'capY', r: 0.04, h: 0.185, c: [0.225 * s, 0.905, 0], j: [0.225 * s, 1.13, 0], g: 'arm' + S, hinge: [-2.5, 0.05] },
       { n: 'thigh' + S, p: 'pelvis', shape: 'capY', r: 0.07, h: 0.13, c: [0.1 * s, 0.72, 0], j: [0.1 * s, 0.92, 0], g: 'leg' + S },
       { n: 'shin' + S, p: 'thigh' + S, shape: 'capY', r: 0.055, h: 0.155, c: [0.1 * s, 0.31, 0], j: [0.1 * s, 0.52, 0], g: 'leg' + S, hinge: [-0.05, 2.5] },
       { n: 'foot' + S, p: 'shin' + S, shape: 'box', hx: 0.05, hy: 0.035, hz: 0.12, c: [0.1 * s, 0.035, 0.045], j: [0.1 * s, 0.09, 0], g: 'leg' + S, hinge: [-0.8, 0.8] },
@@ -374,21 +374,210 @@ function meshFor(d) {
   else if (d.shape === 'ball') geo = new THREE.IcosahedronGeometry(d.r, 1);
   else { geo = new THREE.CapsuleGeometry(d.r, d.h * 2, 2, 7); if (d.shape === 'capX') geo.rotateZ(Math.PI / 2); }
   const mat = bodyMat.clone();
+  mat.visible = false; // the visible body is the skinned mesh; this capsule is the hitbox
   const m = new THREE.Mesh(geo, mat);
-  m.castShadow = true;
   if (d.n === 'head') { // nose and neck show which way the mannequin faces
     const nose = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.04, 0.05), mat);
     nose.position.set(0, -0.01, 0.1); nose.castShadow = true; m.add(nose);
     const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.05, 0.12, 6), mat);
     neck.position.set(0, -0.12, -0.01); m.add(neck);
   }
-  if (d.n.startsWith('fArm')) {
-    const hand = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.1, 0.03), mat);
-    hand.position.set(0, -0.19, 0); hand.castShadow = true; m.add(hand);
-  }
   m.userData.part = d.n;
   scene.add(m);
   return m;
+}
+
+// ---------- skin ----------
+// The visible body is one continuous surface: anatomical shapes in the rest pose are blended into a
+// signed distance field, meshed with surface nets and skinned to the physics bodies.
+const ell = (cx, cy, cz, rx, ry, rz) => ({ e: [cx, cy, cz, rx, ry, rz] });
+const cone = (ax, ay, az, bx, by, bz, r1, r2) => ({ c: [ax, ay, az, bx, by, bz, r1, r2] });
+function skinShapes() {
+  const core = [
+    ell(0, 1.695, 0.005, 0.078, 0.105, 0.097),        // cranium
+    ell(0, 1.625, 0.035, 0.058, 0.05, 0.065),          // jaw
+    cone(0, 1.705, 0.093, 0, 1.672, 0.112, 0.011, 0.016), // nose
+    ell(0.079, 1.69, 0, 0.012, 0.03, 0.02), ell(-0.079, 1.69, 0, 0.012, 0.03, 0.02), // ears
+    cone(0, 1.49, -0.012, 0, 1.63, -0.012, 0.058, 0.05), // neck
+    cone(0, 1.52, -0.03, 0.17, 1.465, -0.025, 0.05, 0.04), cone(0, 1.52, -0.03, -0.17, 1.465, -0.025, 0.05, 0.04), // trapezius
+    ell(0, 1.32, 0, 0.158, 0.175, 0.105),              // rib cage
+    ell(0.07, 1.375, 0.05, 0.085, 0.055, 0.04), ell(-0.07, 1.375, 0.05, 0.085, 0.055, 0.04), // pectorals
+    ell(0, 1.33, -0.03, 0.17, 0.14, 0.09),             // upper back
+    ell(0, 1.15, -0.005, 0.15, 0.15, 0.105),           // waist
+    ell(0, 1.1, 0.03, 0.125, 0.1, 0.075),              // belly
+    ell(0, 0.96, -0.005, 0.17, 0.11, 0.11),            // hips
+    ell(0.07, 0.92, -0.06, 0.085, 0.09, 0.07), ell(-0.07, 0.92, -0.06, 0.085, 0.09, 0.07), // glutes
+  ];
+  const arm = s => [
+    ell(0.212 * s, 1.448, 0, 0.06, 0.07, 0.062),       // deltoid
+    cone(0.225 * s, 1.43, 0, 0.225 * s, 1.15, 0, 0.045, 0.036),
+    ell(0.225 * s, 1.3, 0.016, 0.04, 0.08, 0.042),     // biceps
+    cone(0.225 * s, 1.125, 0, 0.225 * s, 0.875, 0.006, 0.041, 0.027), // forearm
+    ell(0.225 * s, 0.8, 0.01, 0.022, 0.06, 0.045),     // palm, facing the thigh
+    cone(0.225 * s, 0.77, 0.012, 0.225 * s, 0.695, 0.016, 0.02, 0.015), // fingers
+    cone(0.222 * s - 0.004 * s, 0.82, 0.042, 0.214 * s, 0.762, 0.056, 0.012, 0.01), // thumb
+  ];
+  const leg = s => [
+    cone(0.095 * s, 0.9, 0, 0.1 * s, 0.53, 0, 0.085, 0.052), // thigh
+    ell(0.1 * s, 0.72, 0.025, 0.06, 0.13, 0.05),       // quadriceps
+    ell(0.1 * s, 0.51, 0.01, 0.05, 0.05, 0.05),        // knee
+    ell(0.1 * s, 0.36, -0.02, 0.05, 0.11, 0.055),      // calf
+    cone(0.1 * s, 0.5, 0, 0.1 * s, 0.1, -0.005, 0.047, 0.032), // shin
+    cone(0.1 * s, 0.07, -0.03, 0.1 * s, 0.03, 0.15, 0.04, 0.03), // foot
+    ell(0.1 * s, 0.045, -0.045, 0.035, 0.045, 0.04),   // heel
+  ];
+  return { core, armL: arm(1), armR: arm(-1), legL: leg(1), legR: leg(-1) };
+}
+const SHAPES = skinShapes();
+function shapeDist(px, py, pz, sh) {
+  if (sh.e) {
+    const e = sh.e, x = px - e[0], y = py - e[1], z = pz - e[2];
+    const k0 = Math.hypot(x / e[3], y / e[4], z / e[5]);
+    const k1 = Math.hypot(x / (e[3] * e[3]), y / (e[4] * e[4]), z / (e[5] * e[5]));
+    return k1 > 1e-9 ? k0 * (k0 - 1) / k1 : -Math.min(e[3], e[4], e[5]);
+  }
+  const c = sh.c, bx = c[3] - c[0], by = c[4] - c[1], bz = c[5] - c[2], ax = px - c[0], ay = py - c[1], az = pz - c[2];
+  const t = Math.max(0, Math.min(1, (ax * bx + ay * by + az * bz) / (bx * bx + by * by + bz * bz)));
+  return Math.hypot(ax - bx * t, ay - by * t, az - bz * t) - (c[6] + (c[7] - c[6]) * t);
+}
+function smin(a, b, k) {
+  if (k < 1e-4) return Math.min(a, b);
+  const h = Math.max(k - Math.abs(a - b), 0) / k;
+  return Math.min(a, b) - h * h * k * 0.25;
+}
+function groupDist(px, py, pz, list, k) {
+  let d = Infinity;
+  for (const sh of list) d = smin(d, shapeDist(px, py, pz, sh), k);
+  return d;
+}
+const clamp01 = x => Math.max(0, Math.min(1, x));
+// Arms merge into the torso only at the shoulder and legs only at the hip, so a hanging hand
+// or the inner thighs never web together.
+function bodyField(px, py, pz, out) {
+  const core = groupDist(px, py, pz, SHAPES.core, 0.045);
+  const aL = groupDist(px, py, pz, SHAPES.armL, 0.025), aR = groupDist(px, py, pz, SHAPES.armR, 0.025);
+  const lL = Math.max(groupDist(px, py, pz, SHAPES.legL, 0.03), -py), lR = Math.max(groupDist(px, py, pz, SHAPES.legR, 0.03), -py);
+  const ka = 0.035 * clamp01((py - 1.3) / 0.1), kl = 0.045 * clamp01((py - 0.74) / 0.1);
+  // legs join the torso first, then the arms: otherwise a hand would be blended into the hip
+  let d = smin(smin(core, lL, kl), lR, kl);
+  d = smin(smin(d, aL, ka), aR, ka);
+  if (out) { // which group owns this point (for skin weights)
+    const g = [core, aL, aR, lL, lR];
+    out.group = g.indexOf(Math.min(...g));
+  }
+  return d;
+}
+
+function surfaceNets(field, x0, y0, z0, nx, ny, nz, h) {
+  const F = new Float32Array(nx * ny * nz), id = (i, j, k) => i + nx * (j + ny * k);
+  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++)
+    F[id(i, j, k)] = field(x0 + i * h, y0 + j * h, z0 + k * h);
+  const cell = new Int32Array(nx * ny * nz).fill(-1), verts = [];
+  const corners = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]];
+  const edges = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
+  const v = new Float32Array(8);
+  for (let k = 0; k < nz - 1; k++) for (let j = 0; j < ny - 1; j++) for (let i = 0; i < nx - 1; i++) {
+    let inside = 0;
+    for (let c = 0; c < 8; c++) { v[c] = F[id(i + corners[c][0], j + corners[c][1], k + corners[c][2])]; if (v[c] < 0) inside++; }
+    if (inside === 0 || inside === 8) continue;
+    let sx = 0, sy = 0, sz = 0, n = 0;
+    for (const [a, b] of edges) {
+      if ((v[a] < 0) === (v[b] < 0)) continue;
+      const t = v[a] / (v[a] - v[b]), ca = corners[a], cb = corners[b];
+      sx += ca[0] + (cb[0] - ca[0]) * t; sy += ca[1] + (cb[1] - ca[1]) * t; sz += ca[2] + (cb[2] - ca[2]) * t; n++;
+    }
+    cell[id(i, j, k)] = verts.length / 3;
+    verts.push(x0 + (i + sx / n) * h, y0 + (j + sy / n) * h, z0 + (k + sz / n) * h);
+  }
+  const index = [];
+  const quad = (a, b, c, d, flip) => flip ? index.push(a, c, b, a, d, c) : index.push(a, b, c, a, c, d);
+  for (let k = 1; k < nz - 1; k++) for (let j = 1; j < ny - 1; j++) for (let i = 1; i < nx - 1; i++) {
+    const f0 = F[id(i, j, k)] < 0;
+    if (f0 !== (F[id(i + 1, j, k)] < 0)) // edge along x: the four cells around it share a quad
+      quad(cell[id(i, j - 1, k - 1)], cell[id(i, j, k - 1)], cell[id(i, j, k)], cell[id(i, j - 1, k)], !f0);
+    if (f0 !== (F[id(i, j + 1, k)] < 0))
+      quad(cell[id(i - 1, j, k - 1)], cell[id(i - 1, j, k)], cell[id(i, j, k)], cell[id(i, j, k - 1)], !f0);
+    if (f0 !== (F[id(i, j, k + 1)] < 0))
+      quad(cell[id(i - 1, j - 1, k)], cell[id(i, j - 1, k)], cell[id(i, j, k)], cell[id(i - 1, j, k)], !f0);
+  }
+  return { verts, index };
+}
+
+// bone axes in the rest pose; skin weights blend between the nearest ones
+function boneAxis(p) {
+  const x = p.c[0], t = p.n.replace(/[LR]$/, '');
+  const A = {
+    pelvis: [[0, 0.86, 0], [0, 1.06, 0]], abdomen: [[0, 1.07, 0], [0, 1.26, 0]], chest: [[0, 1.27, 0], [0, 1.49, 0]],
+    head: [[0, 1.53, 0], [0, 1.8, 0]], uArm: [[x, 1.47, 0], [x, 1.13, 0]], fArm: [[x, 1.13, 0], [x, 0.66, 0]],
+    thigh: [[x, 0.92, 0], [x, 0.52, 0]], shin: [[x, 0.52, 0], [x, 0.09, 0]], foot: [[x, 0.04, -0.06], [x, 0.04, 0.17]],
+  }[t];
+  return A.map(a => new THREE.Vector3(...a));
+}
+const GROUP_BONES = [['pelvis', 'abdomen', 'chest', 'head'], ['uArmL', 'fArmL', 'chest'], ['uArmR', 'fArmR', 'chest'], ['thighL', 'shinL', 'footL', 'pelvis'], ['thighR', 'shinR', 'footR', 'pelvis']];
+const skinMat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.72 });
+let skin = null, skinBones = [], skinDom = null, skinPaintKey = '';
+
+function buildSkin() {
+  const h = 0.013, x0 = -0.36, y0 = -0.03, z0 = -0.2;
+  const nx = Math.ceil(0.72 / h) + 1, ny = Math.ceil(1.87 / h) + 1, nz = Math.ceil(0.42 / h) + 1;
+  const { verts, index } = surfaceNets((x, y, z) => bodyField(x, y, z), x0, y0, z0, nx, ny, nz, h);
+  const n = verts.length / 3;
+  // one Newton step pulls each vertex onto the surface
+  const e = 0.002;
+  for (let v = 0; v < n; v++) {
+    const x = verts[v * 3], y = verts[v * 3 + 1], z = verts[v * 3 + 2];
+    const d = bodyField(x, y, z);
+    const gx = (bodyField(x + e, y, z) - bodyField(x - e, y, z)) / (2 * e);
+    const gy = (bodyField(x, y + e, z) - bodyField(x, y - e, z)) / (2 * e);
+    const gz = (bodyField(x, y, z + e) - bodyField(x, y, z - e)) / (2 * e);
+    const g2 = gx * gx + gy * gy + gz * gz;
+    if (g2 > 1e-6) { verts[v * 3] -= d * gx / g2; verts[v * 3 + 1] -= d * gy / g2; verts[v * 3 + 2] -= d * gz / g2; }
+  }
+  const axes = parts.map(boneAxis), idxOf = Object.fromEntries(parts.map((p, i) => [p.n, i]));
+  const skinIndex = new Uint16Array(n * 4), skinWeight = new Float32Array(n * 4);
+  skinDom = new Uint8Array(n);
+  const P = new THREE.Vector3(), out = {};
+  for (let v = 0; v < n; v++) {
+    P.set(verts[v * 3], verts[v * 3 + 1], verts[v * 3 + 2]);
+    bodyField(P.x, P.y, P.z, out);
+    const cand = GROUP_BONES[out.group].map(name => {
+      const i = idxOf[name], [a, b] = axes[i];
+      return { i, d: segPointDist(a, b, P) };
+    }).sort((a, b) => a.d - b.d).slice(0, 3);
+    const dmin = cand[0].d;
+    let sum = 0;
+    for (const c of cand) { c.w = Math.exp(-(c.d - dmin) / 0.02); sum += c.w; }
+    cand.forEach((c, k) => { skinIndex[v * 4 + k] = c.i; skinWeight[v * 4 + k] = c.w / sum; });
+    skinDom[v] = cand[0].i;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  geo.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndex, 4));
+  geo.setAttribute('skinWeight', new THREE.Float32BufferAttribute(skinWeight, 4));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(n * 3), 3));
+  geo.setIndex(index);
+  geo.computeVertexNormals();
+  const rig = new THREE.Group();
+  skinBones = parts.map(p => { const b = new THREE.Bone(); b.position.set(...p.c); rig.add(b); return b; });
+  scene.add(rig);
+  rig.updateMatrixWorld(true);
+  skin = new THREE.SkinnedMesh(geo, skinMat);
+  skin.castShadow = true; skin.receiveShadow = true; skin.frustumCulled = false;
+  skin.bind(new THREE.Skeleton(skinBones));
+  scene.add(skin);
+}
+function poseSkin() {
+  parts.forEach((p, i) => { skinBones[i].position.copy(p.mesh.position); skinBones[i].quaternion.copy(p.mesh.quaternion); });
+}
+// vertex colours: base tone, the hovered segment, and blood soaking into each segment
+function paintSkin(soak) {
+  const key = bodyMat.color.getHexString() + hovered + parts.map(p => Math.round((soak[p.n] || 0) * 50)).join(',');
+  if (key === skinPaintKey) return;
+  skinPaintKey = key;
+  const col = parts.map(p => (p.n === hovered ? hotCol : baseCol).clone().lerp(bloodCol, soak[p.n] || 0));
+  const attr = skin.geometry.attributes.color;
+  for (let v = 0; v < skinDom.length; v++) { const c = col[skinDom[v]]; attr.setXYZ(v, c.r, c.g, c.b); }
+  attr.needsUpdate = true;
 }
 
 // ---------- physics world & mannequin ----------
@@ -675,7 +864,8 @@ function shoot(clientX, clientY) {
   ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
   const ray = raycaster.ray;
-  const hits = raycaster.intersectObjects([...parts.map(p => p.mesh), floor], true);
+  skin.computeBoundingSphere();
+  const hits = raycaster.intersectObjects([skin, floor], false);
   const hit = hits[0];
   let end = hit ? hit.point.clone() : ray.at(60, new THREE.Vector3());
   const muzzle = camera.position.clone()
@@ -686,8 +876,7 @@ function shoot(clientX, clientY) {
 
   let partHit = null;
   if (hit && hit.object !== floor) {
-    let o = hit.object; while (!o.userData.part) o = o.parent;
-    partHit = byName[o.userData.part];
+    partHit = parts[skinDom[hit.face.a]];
   }
   if (partHit) {
     const b = partHit.body;
@@ -822,12 +1011,13 @@ function organsFor(p) {
       E('кости стопы', 'bone', [0, 0, 0], [0.04, 0.025, 0.1], { bone: true, rate: [0.3, 0.8], ext: 0.9, clot: 120 }),
     ];
     case 'uArm': return [
-      C('плечевая кость', 'bone', [0, 0.12, 0], [0, -0.13, 0], 0.012, { bone: true, rate: [0.5, 1.5], ext: 0.9, clot: 200 }),
-      C('плечевая артерия', 'artery', [-0.025 * s, 0.12, 0.012], [-0.02 * s, -0.13, 0.02], 0.007, { rate: [6, 12], ext: 0.95 }),
+      C('плечевая кость', 'bone', [0, 0.15, 0], [0, -0.15, 0], 0.012, { bone: true, rate: [0.5, 1.5], ext: 0.9, clot: 200 }),
+      C('плечевая артерия', 'artery', [-0.025 * s, 0.14, 0.012], [-0.02 * s, -0.16, 0.02], 0.007, { rate: [6, 12], ext: 0.95 }),
     ];
     case 'fArm': return [
-      C('кости предплечья', 'bone', [0, 0.14, 0], [0, -0.14, 0], 0.012, { bone: true, rate: [0.3, 1], ext: 0.9, clot: 200 }),
-      C(side('артерии левого предплечья', 'артерии правого предплечья'), 'artery', [0, 0.13, 0.02], [0, -0.12, 0.025], 0.006, { rate: [3, 6], ext: 0.95 }),
+      C('кости предплечья', 'bone', [0, 0.21, 0], [0, -0.02, 0], 0.012, { bone: true, rate: [0.3, 1], ext: 0.9, clot: 200 }),
+      C(side('артерии левого предплечья', 'артерии правого предплечья'), 'artery', [0, 0.2, 0.02], [0, -0.02, 0.025], 0.006, { rate: [3, 6], ext: 0.95 }),
+      E('кости кисти', 'bone', [0, -0.12, 0.01], [0.018, 0.06, 0.04], { bone: true, rate: [0.3, 0.8], ext: 0.9, clot: 120 }),
     ];
   }
   return [];
@@ -1045,10 +1235,8 @@ function updateBodyColors() {
   baseCol.copy(bodyMat.color); bloodCol.copy(bloodMat.color).multiplyScalar(0.8); hotCol.copy(hotMat.color);
   const soak = {};
   if (showBlood) for (const w of character.wounds) soak[w.part.n] = (soak[w.part.n] || 0) + w.extLost;
-  for (const p of parts) {
-    const k = Math.min(0.85, (soak[p.n] || 0) / SOAK_ML[p.n.replace(/[LR]$/, '')]);
-    p.mesh.material.color.copy(p.n === hovered ? hotCol : baseCol).lerp(bloodCol, k);
-  }
+  for (const p of parts) soak[p.n] = Math.min(0.85, (soak[p.n] || 0) / SOAK_ML[p.n.replace(/[LR]$/, '')]);
+  paintSkin(soak);
 }
 function spawnDrop(pos, v, ml) {
   if (drops.length > 400) return deposit(pos.setY(0), ml);
@@ -1098,10 +1286,7 @@ function clearBlood() {
 function setXray(on) {
   xray = on;
   if (on) camera.layers.enable(1); else camera.layers.disable(1);
-  for (const p of parts) {
-    const m = p.mesh.material;
-    m.transparent = on; m.opacity = on ? 0.22 : 1; m.depthWrite = !on; m.needsUpdate = true;
-  }
+  skinMat.transparent = on; skinMat.opacity = on ? 0.22 : 1; skinMat.depthWrite = !on; skinMat.needsUpdate = true;
   document.getElementById('xrayBox').checked = on;
 }
 function setBloodVisible(v) {
@@ -1211,6 +1396,7 @@ function frame(now) {
     e.update(e, k, dtReal);
     if (k >= 1) { scene.remove(e.obj); effects.splice(i, 1); }
   }
+  poseSkin();
   controls.update();
   const dist = camera.position.distanceTo(vecOf(byName.chest.body.translation()));
   distText.textContent = `дистанция: ${dist.toFixed(1)} м`;
@@ -1319,6 +1505,7 @@ canvas.addEventListener('pointermove', e => {
 });
 
 buildWorld();
+buildSkin();
 resize();
 document.getElementById('loading').remove();
 log('info', 'Готово', 'Манекен стоит в 6 м от камеры. Выстрел идёт из точки, где находится камера.');
