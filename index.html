@@ -208,6 +208,7 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
         <button type="button" class="btn primary" id="replayBtn">Повтор 5 с ×0.25</button>
         <button type="button" class="btn" id="resetBtn">Сбросить манекен</button>
       </div>
+      <label class="check" for="followBox"><input type="checkbox" id="followBox" checked> Камера следит за телом</label>
     </section>
 
     <section aria-labelledby="h-blood">
@@ -360,7 +361,7 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 200);
-camera.position.set(1.2, 1.55, 6);
+camera.position.set(0.9, 1.45, 4.2);
 const controls = new OrbitControls(camera, canvas);
 controls.target.set(0, 1.0, 0);
 controls.enableDamping = true;
@@ -823,13 +824,15 @@ function updateLife() {
   c.breath += (0.23 + 0.35 * Math.min(1, f / 0.3) + 0.12 * hurt + 0.4 * c.breathBoost) * Math.PI * 2 * DT;
   const b = Math.sin(c.breath), amp = (1 + 1.5 * Math.min(1, f / 0.3) + 0.8 * hurt) * (1 + 1.5 * c.breathBoost);
   const tr = c.tremble;
-  const n = (i, f1, f2) => (Math.sin(t * f1 + c.ph[i]) * 0.6 + Math.sin(t * f2 + c.ph[i] * 1.7) * 0.4) * c.lifeDamp
-    + tr * 0.25 * Math.sin(t * (9 + i) + c.ph[i] * 3);
-  l.pose.chest = [-0.018 * b * amp + 0.02 * n(0, 0.31, 0.53), 0.03 * n(1, 0.17, 0.41), 0.015 * n(2, 0.23, 0.37)];
-  l.pose.abdomen = [0.012 * b * amp, 0.015 * n(3, 0.19, 0.44), 0];
-  l.pose.head = [0.04 * n(4, 0.21, 0.47) + 0.012 * b, 0.12 * n(5, 0.13, 0.29) * (1 + hurt), 0.03 * n(6, 0.19, 0.43)];
-  l.pose.uArmL = [0.05 * n(7, 0.27, 0.51), 0, 0.02 * n(8, 0.33, 0.61)];
-  l.pose.uArmR = [0.05 * n(9, 0.29, 0.49), 0, -0.02 * n(10, 0.31, 0.57)];
+  const n = (i, f1, f2) => (Math.sin(t * f1 + c.ph[i]) * 0.6 + Math.sin(t * f2 + c.ph[i] * 1.7) * 0.4) * c.lifeDamp;
+  // laboured breathing heaves the chest and lifts the shoulders; a tremor shakes the arms and head
+  const gasp = c.breathBoost, shake = k => tr * k * (Math.sin(t * 13.7 + k * 40) * 0.6 + Math.sin(t * 9.3 + k * 17) * 0.4);
+  l.pose.chest = [(-0.018 * amp - 0.07 * gasp) * b + 0.02 * n(0, 0.31, 0.53), 0.03 * n(1, 0.17, 0.41), 0.015 * n(2, 0.23, 0.37)];
+  l.pose.abdomen = [(0.012 * amp + 0.05 * gasp) * b, 0.015 * n(3, 0.19, 0.44), 0];
+  l.pose.head = [0.04 * n(4, 0.21, 0.47) + (0.012 + 0.06 * gasp) * b + shake(0.06), 0.12 * n(5, 0.13, 0.29) * (1 + hurt) + shake(0.05), 0.03 * n(6, 0.19, 0.43)];
+  l.pose.uArmL = [0.05 * n(7, 0.27, 0.51) + shake(0.08), 0, 0.02 * n(8, 0.33, 0.61) + 0.05 * gasp * b];
+  l.pose.uArmR = [0.05 * n(9, 0.29, 0.49) + shake(0.08), 0, -0.02 * n(10, 0.31, 0.57) - 0.05 * gasp * b];
+  l.pose.fArmL = [shake(0.12), 0, 0]; l.pose.fArmR = [shake(0.12), 0, 0];
   const shift = 0.025 * n(11, 0.11, 0.23) * (1 + hurt);
   l.pose.thighL = [0.015 * n(12, 0.2, 0.4), 0, shift]; l.pose.thighR = [0.015 * n(13, 0.21, 0.39), 0, shift];
 }
@@ -1016,10 +1019,20 @@ const ACTIONS = {
   },
 };
 
+// parts each action moves, for actions whose pose is written while they run
+const MOVES = { look: ['head', 'chest'], rock: ['chest', 'abdomen', 'head'], writhe: null, gasp: ['chest', 'abdomen', 'head', 'uArmL', 'uArmR'],
+  tremble: ['uArmL', 'uArmR', 'fArmL', 'fArmR', 'head'] };
 function beginBeat(b) {
   const fx = ACTIONS[b.action](b);
   if (!fx) { b.state = 'skip'; return; }
   Object.assign(b, { fx, state: 'run' });
+  // a conscious person tenses what they move: on the ground the resting tone is too low to perform anything
+  const c = character;
+  const used = new Set([...(fx.layer ? Object.keys(fx.layer.pose) : []), ...(MOVES[b.action] || [])]);
+  const need = c.state === 'down' || c.seated ? 0.6 : 0.85;
+  const weak = [...used].filter(n => byName[n] && byName[n].toneTarget < need);
+  if (weak.length && c.conscious) beatTone(b, weak, need, 4);
+  if (fx.layer) fx.layer.attack = Math.min(fx.layer.attack, Math.max(0.2, b.dur * 0.3));
 }
 function endBeat(b, quiet) {
   const fx = b.fx;
@@ -1057,7 +1070,8 @@ function runScript() {
 }
 function startScript(beats, meta) {
   stopScript();
-  script = { t0: simTime, beats: beats.map(b => ({ ...b, state: 'wait' })), ...meta };
+  // intensity 0..1 maps to 45..100 % of the pose: a beat is always visible
+  script = { t0: simTime, beats: beats.map(b => ({ ...b, intensity: 0.45 + 0.55 * b.intensity, state: 'wait' })), ...meta };
   renderScript(script);
 }
 
@@ -1972,6 +1986,11 @@ function frame(now) {
     if (k >= 1) { scene.remove(e.obj); effects.splice(i, 1); }
   }
   poseRig();
+  if (followCam) { // keep the body in frame as it goes down or moves
+    const pl = byName.pelvis.mesh.position, k = 1 - Math.exp(-dtReal * 2.5);
+    tv.set(pl.x, Math.max(0.35, Math.min(1.0, pl.y + 0.05)), pl.z);
+    controls.target.lerp(tv, k);
+  }
   controls.update();
   const dist = camera.position.distanceTo(vecOf(byName.chest.body.translation()));
   distText.textContent = `дистанция: ${dist.toFixed(1)} м`;
@@ -2067,6 +2086,8 @@ canvas.addEventListener('pointerup', e => {
 });
 const aimChip = document.getElementById('aimChip');
 let hovered = null;
+let followCam = true;
+document.getElementById('followBox').addEventListener('change', e => { followCam = e.target.checked; });
 canvas.addEventListener('pointermove', e => {
   const r = canvas.getBoundingClientRect();
   ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
@@ -2086,7 +2107,7 @@ applyTheme();
 buildWorld();
 resize();
 document.getElementById('loading').remove();
-log('info', 'Готово', 'Манекен стоит в 6 м от камеры. Выстрел идёт из точки, где находится камера.');
+log('info', 'Готово', 'Манекен стоит в 4 м от камеры. Выстрел идёт из точки, где находится камера.');
 requestAnimationFrame(frame);
 </script>
 </body>
