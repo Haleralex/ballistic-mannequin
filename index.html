@@ -210,7 +210,6 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
         <button type="button" class="btn primary" id="replayBtn">Повтор 5 с ×0.25</button>
         <button type="button" class="btn" id="resetBtn">Сбросить манекен</button>
       </div>
-      <label class="check" for="followBox"><input type="checkbox" id="followBox" checked> Камера следит за телом</label>
       <p class="subh">Качество графики</p>
       <div class="seg">
         <button type="button" id="qAuto" aria-pressed="true">Авто</button>
@@ -387,10 +386,13 @@ const GPU_NAME = (() => {
   } catch { return ''; }
 })();
 const SOFTWARE_GL = /swiftshader|llvmpipe|softpipe|software|basic render/i.test(GPU_NAME);
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: !SOFTWARE_GL });
-renderer.setPixelRatio(SOFTWARE_GL ? 0.75 : Math.min(devicePixelRatio, 2));
+// Integrated Intel graphics: multisampling is slow there (Chromium itself says so), so no MSAA, plain PCF shadows and
+// a smaller shadow map. Laptops often run the browser on these even when a discrete GPU sits next to them.
+const INTEGRATED_GL = /intel/i.test(GPU_NAME) && !/arc/i.test(GPU_NAME);
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: !SOFTWARE_GL && !INTEGRATED_GL, powerPreference: 'high-performance' });
+renderer.setPixelRatio(SOFTWARE_GL ? 0.75 : Math.min(devicePixelRatio, INTEGRATED_GL ? 1.25 : 2));
 renderer.shadowMap.enabled = !SOFTWARE_GL;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.type = INTEGRATED_GL ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 200);
 camera.position.set(0.9, 1.45, 4.2);
@@ -398,10 +400,6 @@ const controls = new OrbitControls(camera, canvas);
 controls.target.set(0, 1.0, 0);
 controls.enableDamping = true;
 controls.dampingFactor = 0.15; // the default 0.05 drifts on long after the hand stops
-// the distance the viewer picked; the auto-zoom only makes up for the body going farther than that
-let userDist = camera.position.distanceTo(controls.target), interacting = false, lastInteract = 0;
-controls.addEventListener('start', () => { interacting = true; });
-controls.addEventListener('end', () => { interacting = false; lastInteract = performance.now(); });
 controls.maxPolarAngle = Math.PI * 0.495;
 controls.minDistance = 1.5; controls.maxDistance = 60;
 controls.update();
@@ -410,7 +408,7 @@ scene.add(new THREE.HemisphereLight(0xffffff, 0x777777, 1.1));
 const sun = new THREE.DirectionalLight(0xffffff, 1.6);
 sun.position.set(3, 6, 4);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.mapSize.set(INTEGRATED_GL ? 1024 : 2048, INTEGRATED_GL ? 1024 : 2048);
 Object.assign(sun.shadow.camera, { left: -4, right: 4, top: 4, bottom: -4, near: 0.5, far: 20 });
 scene.add(sun, sun.target);
 
@@ -430,7 +428,7 @@ const tracerMat = new THREE.LineBasicMaterial({ transparent: true });
 function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
 function applyTheme() {
   scene.background = new THREE.Color(cssVar('--scene-bg'));
-  scene.fog = new THREE.Fog(scene.background, 14, 40);
+  scene.fog = new THREE.Fog(scene.background, 20, 70);
   floorMat.color.set(cssVar('--scene-floor'));
   bodyMat.color.set(cssVar('--mannequin'));
   hotMat.color.set(cssVar('--mannequin-hot'));
@@ -2450,7 +2448,7 @@ function syncMeshes() {
 let timeScale = 1, acc = 0, last = performance.now();
 // Quality follows the device: a GPU that cannot hold the frame rate gets fewer pixels, then no shadows; once it runs
 // smoothly for a while, pixels come back. 'high' and 'low' fix the setting by hand.
-const PR_MAX = Math.min(devicePixelRatio, 2), PR_MIN = 0.6;
+const PR_MAX = Math.min(devicePixelRatio, INTEGRATED_GL ? 1.25 : 2), PR_MIN = 0.6;
 let quality = 'auto', pixelRatio = renderer.getPixelRatio(), slowT = 0, smoothT = 0, fpsN = 0, fpsT = 0;
 function setShadows(on) {
   if (renderer.shadowMap.enabled === on) return;
@@ -2484,7 +2482,8 @@ function showGfx(fps) {
   const gpu = GPU_NAME.replace(/^ANGLE \((.*)\)$/, '$1').replace(/,? ?(Direct3D|OpenGL|Vulkan|D3D)[^,]*$/i, '') || 'неизвестно';
   const gpuShort = gpu.length > 60 ? gpu.slice(0, 58) + '…' : gpu;
   gfxNote.textContent = `Графика: ${Math.round(fps)} к/с · масштаб ${pixelRatio.toFixed(2)} · тени ${renderer.shadowMap.enabled ? 'вкл' : 'выкл'} · ${gpuShort}` +
-    (SOFTWARE_GL ? '. Браузер рисует без видеокарты (программный рендер), поэтому всё медленно: включите аппаратное ускорение в настройках браузера и перезапустите его (проверить: vivaldi://gpu или chrome://gpu).' : '');
+    (SOFTWARE_GL ? '. Браузер рисует без видеокарты (программный рендер), поэтому всё медленно: включите аппаратное ускорение в настройках браузера и перезапустите его (проверить: vivaldi://gpu или chrome://gpu).'
+      : INTEGRATED_GL ? '. Это встроенная видеокарта. Если в ноутбуке есть дискретная (NVIDIA, AMD), назначьте её браузеру: Параметры Windows → Система → Дисплей → Графика → браузер → «Высокая производительность», затем перезапустите браузер.' : '');
 }
 function frame(now) {
   const dtRaw = (now - last) / 1000, dtReal = Math.min(0.05, dtRaw);
@@ -2512,29 +2511,10 @@ function frame(now) {
   }
   poseRig();
   const pl = byName.pelvis.mesh.position;
-  if (followCam) { // keep the body in frame as it goes down or moves; breathing and sway do not move the view
-    tv.set(pl.x, Math.max(0.35, Math.min(1.0, pl.y + 0.05)), pl.z);
-    if (Number.isFinite(tv.x + tv.y + tv.z)) {
-      tv.sub(controls.target);
-      const d = tv.length(), slack = 0.15;
-      if (d > slack) controls.target.addScaledVector(tv, (d - slack) / d * (1 - Math.exp(-dtReal * 3)));
-    }
-  }
   // the shadow box travels with the body, so a runner keeps a shadow
   if (Number.isFinite(pl.x + pl.z)) { // in half-metre steps: a box sliding with every sway would make shadow edges shimmer
     const gx = Math.round(pl.x * 2) / 2, gz = Math.round(pl.z * 2) / 2;
     sun.target.position.set(gx, 0, gz); sun.position.set(gx + 3, 6, gz + 4);
-  }
-  // a body that has gone farther than the viewer's chosen distance is brought back by zooming, like a long lens:
-  // the shooter, and so the camera, stay where they are; moving the camera yourself never fights the zoom
-  const far = camera.position.distanceTo(controls.target);
-  if (interacting || performance.now() - lastInteract < 400) userDist = far / Math.tan(camera.fov * Math.PI / 360) * Math.tan(21 * Math.PI / 180);
-  const fov = followCam ? Math.max(6, Math.min(42, 2 * Math.atan(Math.tan(21 * Math.PI / 180) * userDist / far) * 180 / Math.PI)) : 42;
-  if (Math.abs(fov - camera.fov) > 0.01) {
-    camera.fov += (fov - camera.fov) * (1 - Math.exp(-dtReal * 3)); camera.updateProjectionMatrix();
-    // the haze recedes with the zoom, or a distant body would fade into it
-    const z = 42 / camera.fov;
-    scene.fog.near = 14 * z; scene.fog.far = 40 * z;
   }
   controls.update();
   const dist = camera.position.distanceTo(vecOf(byName.chest.body.translation()));
@@ -2633,8 +2613,6 @@ canvas.addEventListener('pointerup', e => {
 });
 const aimChip = document.getElementById('aimChip');
 let hovered = null;
-let followCam = true;
-document.getElementById('followBox').addEventListener('change', e => { followCam = e.target.checked; });
 canvas.addEventListener('pointermove', e => {
   const r = canvas.getBoundingClientRect();
   ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
