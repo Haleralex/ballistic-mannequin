@@ -211,6 +211,13 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
         <button type="button" class="btn" id="resetBtn">Сбросить манекен</button>
       </div>
       <label class="check" for="followBox"><input type="checkbox" id="followBox" checked> Камера следит за телом</label>
+      <p class="subh">Качество графики</p>
+      <div class="seg">
+        <button type="button" id="qAuto" aria-pressed="true">Авто</button>
+        <button type="button" id="qHigh" aria-pressed="false">Высокое</button>
+        <button type="button" id="qLow" aria-pressed="false">Низкое</button>
+      </div>
+      <p class="note" id="gfxNote">Графика: измеряю…</p>
     </section>
 
     <section aria-labelledby="h-blood">
@@ -368,9 +375,21 @@ const volume = d => d.shape === 'box' ? 8 * d.hx * d.hy * d.hz
 // ---------- rendering ----------
 const canvas = document.getElementById('c');
 const stage = document.getElementById('stage');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.shadowMap.enabled = true;
+// Which GPU the browser draws with. Without hardware acceleration WebGL runs on the CPU (SwiftShader, llvmpipe):
+// then everything starts light, or even turning the camera stutters.
+const GPU_NAME = (() => {
+  try {
+    const gl = document.createElement('canvas').getContext('webgl2') || document.createElement('canvas').getContext('webgl');
+    const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+    const name = gl ? String(gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER)) : '';
+    gl?.getExtension('WEBGL_lose_context')?.loseContext();
+    return name;
+  } catch { return ''; }
+})();
+const SOFTWARE_GL = /swiftshader|llvmpipe|softpipe|software|basic render/i.test(GPU_NAME);
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: !SOFTWARE_GL });
+renderer.setPixelRatio(SOFTWARE_GL ? 0.75 : Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = !SOFTWARE_GL;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 200);
@@ -2429,25 +2448,48 @@ function syncMeshes() {
 }
 
 let timeScale = 1, acc = 0, last = performance.now();
-// Quality follows the device: a GPU that cannot hold the frame rate gets fewer pixels, then a smaller shadow map;
-// once it runs smoothly for a while, pixels come back.
-const PR_MAX = Math.min(devicePixelRatio, 2);
-let pixelRatio = PR_MAX, slowT = 0, smoothT = 0;
-function adaptQuality(dt) {
+// Quality follows the device: a GPU that cannot hold the frame rate gets fewer pixels, then no shadows; once it runs
+// smoothly for a while, pixels come back. 'high' and 'low' fix the setting by hand.
+const PR_MAX = Math.min(devicePixelRatio, 2), PR_MIN = 0.6;
+let quality = 'auto', pixelRatio = renderer.getPixelRatio(), slowT = 0, smoothT = 0, fpsN = 0, fpsT = 0;
+function setShadows(on) {
+  if (renderer.shadowMap.enabled === on) return;
+  renderer.shadowMap.enabled = on;
+  scene.traverse(o => { if (o.material) for (const m of [].concat(o.material)) m.needsUpdate = true; });
+}
+function setPixelRatio(pr) { pixelRatio = pr; renderer.setPixelRatio(pr); resize(); }
+function setQuality(q) {
+  quality = q; slowT = 0; smoothT = 0;
+  if (q === 'high') { setPixelRatio(PR_MAX); setShadows(true); }
+  if (q === 'low') { setPixelRatio(Math.min(PR_MAX, 0.75)); setShadows(false); }
+}
+function adaptQuality(dt) { // dt: real time since the last frame, not clamped
+  fpsN++; fpsT += dt;
+  if (fpsT >= 1) { showGfx(fpsN / fpsT); fpsN = 0; fpsT = 0; }
+  if (quality !== 'auto') return;
   slowT = dt > 1 / 45 ? slowT + dt : Math.max(0, slowT - dt * 0.5);
   smoothT = dt < 1 / 55 ? smoothT + dt : 0;
-  if (slowT > 2) {
+  if (slowT > 1.5) {
     slowT = 0; smoothT = 0;
-    if (pixelRatio > 0.75) { pixelRatio = Math.max(0.75, pixelRatio - 0.25); renderer.setPixelRatio(pixelRatio); resize(); }
-    else if (sun.shadow.mapSize.x > 1024) { sun.shadow.mapSize.set(1024, 1024); sun.shadow.map?.dispose(); sun.shadow.map = null; }
-  } else if (smoothT > 10 && pixelRatio < PR_MAX) {
-    smoothT = 0; pixelRatio = Math.min(PR_MAX, pixelRatio + 0.25); renderer.setPixelRatio(pixelRatio); resize();
+    if (pixelRatio > PR_MIN + 0.01) setPixelRatio(Math.max(PR_MIN, pixelRatio - 0.25));
+    else setShadows(false);
+  } else if (smoothT > 10) {
+    smoothT = 0;
+    if (pixelRatio < PR_MAX - 0.01) setPixelRatio(Math.min(PR_MAX, pixelRatio + 0.25));
+    else if (!SOFTWARE_GL) setShadows(true);
   }
 }
+const gfxNote = document.getElementById('gfxNote');
+function showGfx(fps) {
+  const gpu = GPU_NAME.replace(/^ANGLE \((.*)\)$/, '$1').replace(/,? ?(Direct3D|OpenGL|Vulkan|D3D)[^,]*$/i, '') || 'неизвестно';
+  const gpuShort = gpu.length > 60 ? gpu.slice(0, 58) + '…' : gpu;
+  gfxNote.textContent = `Графика: ${Math.round(fps)} к/с · масштаб ${pixelRatio.toFixed(2)} · тени ${renderer.shadowMap.enabled ? 'вкл' : 'выкл'} · ${gpuShort}` +
+    (SOFTWARE_GL ? '. Браузер рисует без видеокарты (программный рендер), поэтому всё медленно: включите аппаратное ускорение в настройках браузера и перезапустите его (проверить: vivaldi://gpu или chrome://gpu).' : '');
+}
 function frame(now) {
-  const dtReal = Math.min(0.05, (now - last) / 1000);
+  const dtRaw = (now - last) / 1000, dtReal = Math.min(0.05, dtRaw);
   last = now;
-  if (!document.hidden) adaptQuality(dtReal);
+  if (!document.hidden && dtRaw < 1) adaptQuality(dtRaw);
   if (replay) {
     replay.i += dtReal * 60 * 0.25;
     if (replay.i >= replay.frames.length - 1) { replay = null; document.getElementById('replayBadge').hidden = true; syncMeshes(); }
@@ -2554,6 +2596,7 @@ segment(['impReal', 'impMovie'], id => {
 });
 const setTime = id => { timeScale = { t1: 1, t025: 0.25, t0: 0 }[id]; };
 segment(['t1', 't025', 't0'], setTime);
+segment(['qAuto', 'qHigh', 'qLow'], id => setQuality({ qAuto: 'auto', qHigh: 'high', qLow: 'low' }[id]));
 segment(['rAuto', 'rFlee', 'rStay'], id => { reactMode = { rAuto: 'auto', rFlee: 'flee', rStay: 'stay' }[id]; });
 segment(['ph1', 'ph10'], id => { physMult = id === 'ph10' ? 10 : 1; });
 document.getElementById('showBlood').addEventListener('change', e => setBloodVisible(e.target.checked));
