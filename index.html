@@ -27,7 +27,8 @@
   --scene-floor: #cdd4d7;
   --scene-grid: #a3adb2;
   --scene-grid2: #bac3c7;
-  --mannequin: #c7a57a;
+  --mannequin: #c9b8a6;
+  --mannequin-joint: #4a4f55;
   --mannequin-hot: #e0bb87;
   --font-display: "Barlow Condensed", "Arial Narrow", "Roboto Condensed", sans-serif;
   --font-body: "Barlow", "Segoe UI", Roboto, sans-serif;
@@ -38,7 +39,7 @@
     --bg: #13171a; --panel: #1a2024; --ink: #e2e7e9; --muted: #95a2a8; --line: #2d363b;
     --accent: #6c9cff; --accent-ink: #0d1420; --hit: #ff6b5e; --warn: #e6a640; --ok: #5cc28a; --blood: #9b241c;
     --scene-bg: #181d20; --scene-floor: #20272b; --scene-grid: #3b464c; --scene-grid2: #2b3439;
-    --mannequin: #ad8d66; --mannequin-hot: #d1ab7c;
+    --mannequin: #b3a493; --mannequin-joint: #3a3f45; --mannequin-hot: #d1ab7c;
     color-scheme: dark;
   }
 }
@@ -46,7 +47,7 @@
   --bg: #13171a; --panel: #1a2024; --ink: #e2e7e9; --muted: #95a2a8; --line: #2d363b;
   --accent: #6c9cff; --accent-ink: #0d1420; --hit: #ff6b5e; --warn: #e6a640; --ok: #5cc28a; --blood: #9b241c;
   --scene-bg: #181d20; --scene-floor: #20272b; --scene-grid: #3b464c; --scene-grid2: #2b3439;
-  --mannequin: #ad8d66; --mannequin-hot: #d1ab7c;
+  --mannequin: #b3a493; --mannequin-joint: #3a3f45; --mannequin-hot: #d1ab7c;
   color-scheme: dark;
 }
 html, body { height: 100%; }
@@ -152,7 +153,7 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
     </div>
     <div id="replayBadge" class="overlay" hidden>ПОВТОР ×0.25</div>
     <div id="hint" class="overlay">Клик по манекену — выстрел из точки камеры. Клик рядом — пролёт пули или попадание в пол. Перетаскивание — вращение камеры, колесо — приближение. <kbd>Space</kbd> пауза, <kbd>R</kbd> сброс, <kbd>P</kbd> повтор, <kbd>X</kbd> рентген.</div>
-    <div id="loading" class="overlay">загрузка физики и сборка тела…</div>
+    <div id="loading" class="overlay">загрузка физики и модели…</div>
   </div>
 
   <aside id="panel">
@@ -252,6 +253,7 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import RAPIER from '@dimforge/rapier3d-compat';
 
 await RAPIER.init();
@@ -273,9 +275,9 @@ const WEAPONS = [
 const G_GROUND = 0x1, G_TORSO = 0x2, G_ARML = 0x4, G_ARMR = 0x8, G_LEGL = 0x10, G_LEGR = 0x20;
 const groups = (member, filter) => (member << 16) | filter;
 const FILTER = {
-  torso: groups(G_TORSO, G_GROUND | G_ARML | G_ARMR),
-  armL: groups(G_ARML, G_GROUND | G_TORSO | G_ARMR | G_LEGL | G_LEGR),
-  armR: groups(G_ARMR, G_GROUND | G_TORSO | G_ARML | G_LEGL | G_LEGR),
+  torso: groups(G_TORSO, G_GROUND),
+  armL: groups(G_ARML, G_GROUND | G_ARMR | G_LEGL | G_LEGR),
+  armR: groups(G_ARMR, G_GROUND | G_ARML | G_LEGL | G_LEGR),
   legL: groups(G_LEGL, G_GROUND | G_ARML | G_ARMR | G_LEGR),
   legR: groups(G_LEGR, G_GROUND | G_ARML | G_ARMR | G_LEGL),
   ground: groups(G_GROUND, 0xffff),
@@ -288,23 +290,37 @@ const ZONE_LABEL = {
 };
 
 // Character faces +Z. Its left side is +X. Rest pose has every body at identity rotation.
+// Joint positions come from the model's skeleton (Mixamo X Bot, 1.78 m) posed with the arms down.
+const RIG = {
+  spine: [0, 1.142, 0.022], chest: [0, 1.334, -0.002], neck: [0, 1.5, -0.027],
+  shoulder: [0.152, 1.438, -0.05], elbow: [0.185, 1.161, -0.05], fingertip: [0.241, 0.691, -0.05],
+  hip: [0.082, 0.972, 0.005], knee: [0.082, 0.529, 0.008], ankle: [0.082, 0.084, -0.022],
+};
+// S scales the organ layout (drawn for a generic torso) to this body's segment sizes
 function partDefs() {
+  const m = (v, s) => [v[0] * s, v[1], v[2]];
   const defs = [
-    { n: 'pelvis', shape: 'capX', r: 0.12, h: 0.07, c: [0, 0.98, 0], g: 'torso' },
-    { n: 'abdomen', p: 'pelvis', shape: 'capY', r: 0.12, h: 0.04, c: [0, 1.16, 0], j: [0, 1.07, 0], g: 'torso' },
-    { n: 'chest', p: 'abdomen', shape: 'capX', r: 0.13, h: 0.05, c: [0, 1.40, 0], j: [0, 1.27, 0], g: 'torso' },
-    { n: 'head', p: 'chest', shape: 'ball', r: 0.105, c: [0, 1.68, 0], j: [0, 1.56, 0], g: 'torso' },
+    { n: 'pelvis', shape: 'capX', r: 0.115, h: 0.02, c: [0, 1.0, -0.005], g: 'torso', S: [0.71, 0.96, 0.96] },
+    { n: 'abdomen', p: 'pelvis', shape: 'capY', r: 0.1, h: 0.04, c: [0, 1.21, 0.015], j: RIG.spine, g: 'torso', S: [0.83, 0.875, 0.83] },
+    { n: 'chest', p: 'abdomen', shape: 'capX', r: 0.12, h: 0.04, c: [0, 1.4, 0], j: RIG.chest, g: 'torso', S: [0.8, 0.92, 0.92] },
+    { n: 'head', p: 'chest', shape: 'ball', r: 0.1, c: [0, 1.69, 0.005], j: RIG.neck, g: 'torso', S: [0.95, 0.95, 0.95] },
   ];
-  for (const [S, s] of [['L', 1], ['R', -1]]) {
-    defs.push(
-      { n: 'uArm' + S, p: 'chest', shape: 'capY', r: 0.042, h: 0.125, c: [0.225 * s, 1.30, 0], j: [0.225 * s, 1.47, 0], g: 'arm' + S },
-      { n: 'fArm' + S, p: 'uArm' + S, shape: 'capY', r: 0.04, h: 0.185, c: [0.225 * s, 0.905, 0], j: [0.225 * s, 1.13, 0], g: 'arm' + S, hinge: [-2.5, 0.05] },
-      { n: 'thigh' + S, p: 'pelvis', shape: 'capY', r: 0.07, h: 0.13, c: [0.1 * s, 0.72, 0], j: [0.1 * s, 0.92, 0], g: 'leg' + S },
-      { n: 'shin' + S, p: 'thigh' + S, shape: 'capY', r: 0.055, h: 0.155, c: [0.1 * s, 0.31, 0], j: [0.1 * s, 0.52, 0], g: 'leg' + S, hinge: [-0.05, 2.5] },
-      { n: 'foot' + S, p: 'shin' + S, shape: 'box', hx: 0.05, hy: 0.035, hz: 0.12, c: [0.1 * s, 0.035, 0.045], j: [0.1 * s, 0.09, 0], g: 'leg' + S, hinge: [-0.8, 0.8] },
-    );
-  }
+  for (const [S, s] of [['L', 1], ['R', -1]]) defs.push(
+    limb('uArm' + S, 'chest', m(RIG.shoulder, s), m(RIG.elbow, s), 0.045, 'arm' + S, [1, 0.82, 1], 0.6),
+    limb('fArm' + S, 'uArm' + S, m(RIG.elbow, s), m(RIG.fingertip, s), 0.04, 'arm' + S, [1, 1.05, 1], 1, [-2.5, 0.05]),
+    limb('thigh' + S, 'pelvis', m(RIG.hip, s), m(RIG.knee, s), 0.075, 'leg' + S, [1.07, 1.11, 1.07], 0.6),
+    limb('shin' + S, 'thigh' + S, m(RIG.knee, s), m(RIG.ankle, s), 0.055, 'leg' + S, [1, 1.03, 1], 0.6, [-0.05, 2.5]),
+    { n: 'foot' + S, p: 'shin' + S, shape: 'box', hx: 0.04, hy: 0.045, hz: 0.125, c: [0.08 * s, 0.045, 0.055], j: m(RIG.ankle, s), g: 'leg' + S, hinge: [-0.8, 0.8], S: [1, 1, 1] },
+  );
   return defs;
+}
+// a limb capsule runs from joint a down to joint b; `inset` pulls its caps back toward the joints
+function limb(n, p, a, b, r, g, S, inset, hinge) {
+  const A = new THREE.Vector3(...a), B = new THREE.Vector3(...b), axis = A.clone().sub(B), len = axis.length();
+  return {
+    n, p, shape: 'capY', r, h: Math.max(0.01, len / 2 - r * inset), c: A.clone().add(B).multiplyScalar(0.5).toArray(), j: a, g, S, hinge,
+    axisQ: new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), axis.normalize()),
+  };
 }
 const volume = d => d.shape === 'box' ? 8 * d.hx * d.hy * d.hz
   : d.shape === 'ball' ? 4 / 3 * Math.PI * d.r ** 3
@@ -355,6 +371,7 @@ function applyTheme() {
   floorMat.color.set(cssVar('--scene-floor'));
   bodyMat.color.set(cssVar('--mannequin'));
   hotMat.color.set(cssVar('--mannequin-hot'));
+  if (typeof surfaceMat !== 'undefined') { surfaceMat.color.set(cssVar('--mannequin')); jointMat.color.set(cssVar('--mannequin-joint')); woundU.uBlood.value.set(cssVar('--blood')); }
   hitMat.color.set(cssVar('--hit'));
   bloodMat.color.set(cssVar('--blood'));
   poolMat.color.set(cssVar('--blood')).multiplyScalar(0.75);
@@ -364,7 +381,6 @@ function applyTheme() {
   grid.position.y = 0.002;
   scene.add(grid);
 }
-applyTheme();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
 new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
@@ -373,211 +389,170 @@ function meshFor(d) {
   if (d.shape === 'box') geo = new THREE.BoxGeometry(d.hx * 2, d.hy * 2, d.hz * 2);
   else if (d.shape === 'ball') geo = new THREE.IcosahedronGeometry(d.r, 1);
   else { geo = new THREE.CapsuleGeometry(d.r, d.h * 2, 2, 7); if (d.shape === 'capX') geo.rotateZ(Math.PI / 2); }
+  if (d.axisQ) geo.applyQuaternion(d.axisQ);
   const mat = bodyMat.clone();
-  mat.visible = false; // the visible body is the skinned mesh; this capsule is the hitbox
+  mat.visible = false; // the visible body is the skinned model; this capsule is the hitbox
   const m = new THREE.Mesh(geo, mat);
-  if (d.n === 'head') { // nose and neck show which way the mannequin faces
-    const nose = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.04, 0.05), mat);
-    nose.position.set(0, -0.01, 0.1); nose.castShadow = true; m.add(nose);
-    const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.05, 0.12, 6), mat);
-    neck.position.set(0, -0.12, -0.01); m.add(neck);
-  }
   m.userData.part = d.n;
   scene.add(m);
   return m;
 }
 
-// ---------- skin ----------
-// The visible body is one continuous surface: anatomical shapes in the rest pose are blended into a
-// signed distance field, meshed with surface nets and skinned to the physics bodies.
-const ell = (cx, cy, cz, rx, ry, rz) => ({ e: [cx, cy, cz, rx, ry, rz] });
-const cone = (ax, ay, az, bx, by, bz, r1, r2) => ({ c: [ax, ay, az, bx, by, bz, r1, r2] });
-function skinShapes() {
-  const core = [
-    ell(0, 1.695, 0.005, 0.078, 0.105, 0.097),        // cranium
-    ell(0, 1.625, 0.035, 0.058, 0.05, 0.065),          // jaw
-    cone(0, 1.705, 0.093, 0, 1.672, 0.112, 0.011, 0.016), // nose
-    ell(0.079, 1.69, 0, 0.012, 0.03, 0.02), ell(-0.079, 1.69, 0, 0.012, 0.03, 0.02), // ears
-    cone(0, 1.49, -0.012, 0, 1.63, -0.012, 0.058, 0.05), // neck
-    cone(0, 1.52, -0.03, 0.17, 1.465, -0.025, 0.05, 0.04), cone(0, 1.52, -0.03, -0.17, 1.465, -0.025, 0.05, 0.04), // trapezius
-    ell(0, 1.32, 0, 0.158, 0.175, 0.105),              // rib cage
-    ell(0.07, 1.375, 0.05, 0.085, 0.055, 0.04), ell(-0.07, 1.375, 0.05, 0.085, 0.055, 0.04), // pectorals
-    ell(0, 1.33, -0.03, 0.17, 0.14, 0.09),             // upper back
-    ell(0, 1.15, -0.005, 0.15, 0.15, 0.105),           // waist
-    ell(0, 1.1, 0.03, 0.125, 0.1, 0.075),              // belly
-    ell(0, 0.96, -0.005, 0.17, 0.11, 0.11),            // hips
-    ell(0.07, 0.92, -0.06, 0.085, 0.09, 0.07), ell(-0.07, 0.92, -0.06, 0.085, 0.09, 0.07), // glutes
-  ];
-  const arm = s => [
-    ell(0.212 * s, 1.448, 0, 0.06, 0.07, 0.062),       // deltoid
-    cone(0.225 * s, 1.43, 0, 0.225 * s, 1.15, 0, 0.045, 0.036),
-    ell(0.225 * s, 1.3, 0.016, 0.04, 0.08, 0.042),     // biceps
-    cone(0.225 * s, 1.125, 0, 0.225 * s, 0.875, 0.006, 0.041, 0.027), // forearm
-    ell(0.225 * s, 0.8, 0.01, 0.022, 0.06, 0.045),     // palm, facing the thigh
-    cone(0.225 * s, 0.77, 0.012, 0.225 * s, 0.695, 0.016, 0.02, 0.015), // fingers
-    cone(0.222 * s - 0.004 * s, 0.82, 0.042, 0.214 * s, 0.762, 0.056, 0.012, 0.01), // thumb
-  ];
-  const leg = s => [
-    cone(0.095 * s, 0.9, 0, 0.1 * s, 0.53, 0, 0.085, 0.052), // thigh
-    ell(0.1 * s, 0.72, 0.025, 0.06, 0.13, 0.05),       // quadriceps
-    ell(0.1 * s, 0.51, 0.01, 0.05, 0.05, 0.05),        // knee
-    ell(0.1 * s, 0.36, -0.02, 0.05, 0.11, 0.055),      // calf
-    cone(0.1 * s, 0.5, 0, 0.1 * s, 0.1, -0.005, 0.047, 0.032), // shin
-    cone(0.1 * s, 0.07, -0.03, 0.1 * s, 0.03, 0.15, 0.04, 0.03), // foot
-    ell(0.1 * s, 0.045, -0.045, 0.035, 0.045, 0.04),   // heel
-  ];
-  return { core, armL: arm(1), armR: arm(-1), legL: leg(1), legR: leg(-1) };
+// ---------- model ----------
+// Visible body: the Mixamo X Bot from the three.js examples. Its skeleton is driven by the physics bodies.
+const gltf = await new GLTFLoader().loadAsync('xbot.glb');
+const model = gltf.scene;
+scene.add(model);
+const rigBones = {}, modelMeshes = [];
+model.traverse(o => {
+  if (o.isBone) rigBones[o.name.replace('mixamorig', '')] = o;
+  if (o.isSkinnedMesh) { modelMeshes.push(o); o.castShadow = true; o.receiveShadow = true; o.frustumCulled = false; }
+});
+const surfaceMat = modelMeshes.find(m => !/Joints/.test(m.name)).material, jointMat = modelMeshes.find(m => /Joints/.test(m.name)).material;
+for (const m of [surfaceMat, jointMat]) { m.roughness = 0.62; m.metalness = 0; }
+// the model ships in a T-pose; the physics rest pose has the arms down with a slight outward tilt
+model.updateMatrixWorld(true);
+for (const S of ['Left', 'Right']) {
+  const arm = rigBones[S + 'Arm'];
+  const a = arm.getWorldPosition(new THREE.Vector3()), f = rigBones[S + 'ForeArm'].getWorldPosition(new THREE.Vector3());
+  const q = new THREE.Quaternion().setFromUnitVectors(f.sub(a).normalize(), new THREE.Vector3(0.12 * Math.sign(a.x), -1, 0).normalize());
+  const wq = arm.getWorldQuaternion(new THREE.Quaternion()), pq = arm.parent.getWorldQuaternion(new THREE.Quaternion());
+  arm.quaternion.copy(pq.invert().multiply(q.multiply(wq)));
+  model.updateMatrixWorld(true);
 }
-const SHAPES = skinShapes();
-function shapeDist(px, py, pz, sh) {
-  if (sh.e) {
-    const e = sh.e, x = px - e[0], y = py - e[1], z = pz - e[2];
-    const k0 = Math.hypot(x / e[3], y / e[4], z / e[5]);
-    const k1 = Math.hypot(x / (e[3] * e[3]), y / (e[4] * e[4]), z / (e[5] * e[5]));
-    return k1 > 1e-9 ? k0 * (k0 - 1) / k1 : -Math.min(e[3], e[4], e[5]);
+// relaxed hands: fingers curl a little toward the palm (the palms face the thighs)
+for (const S of ['Left', 'Right']) {
+  const axis = new THREE.Vector3(0, 0, S === 'Left' ? -1 : 1);
+  for (const f of ['Index', 'Middle', 'Ring', 'Pinky']) for (const [k, ang] of [[1, 0.25], [2, 0.45], [3, 0.35]]) {
+    const b = rigBones[S + 'Hand' + f + k];
+    if (!b) continue;
+    const wq = b.getWorldQuaternion(new THREE.Quaternion()), pq = b.parent.getWorldQuaternion(new THREE.Quaternion());
+    b.quaternion.copy(pq.invert().multiply(new THREE.Quaternion().setFromAxisAngle(axis, ang).multiply(wq)));
+    b.updateMatrixWorld(true);
   }
-  const c = sh.c, bx = c[3] - c[0], by = c[4] - c[1], bz = c[5] - c[2], ax = px - c[0], ay = py - c[1], az = pz - c[2];
-  const t = Math.max(0, Math.min(1, (ax * bx + ay * by + az * bz) / (bx * bx + by * by + bz * bz)));
-  return Math.hypot(ax - bx * t, ay - by * t, az - bz * t) - (c[6] + (c[7] - c[6]) * t);
 }
-function smin(a, b, k) {
-  if (k < 1e-4) return Math.min(a, b);
-  const h = Math.max(k - Math.abs(a - b), 0) / k;
-  return Math.min(a, b) - h * h * k * 0.25;
+model.updateMatrixWorld(true);
+// which physics body drives each bone; the neck takes the average of chest and head
+const DRIVE = [['Hips', 'pelvis'], ['Spine', 'abdomen'], ['Spine1', 'abdomen'], ['Spine2', 'chest'], ['LeftShoulder', 'chest'], ['RightShoulder', 'chest'],
+  ['Neck', 'head', 'chest'], ['Head', 'head'], ['LeftArm', 'uArmL'], ['LeftForeArm', 'fArmL'], ['LeftHand', 'fArmL'], ['RightArm', 'uArmR'], ['RightForeArm', 'fArmR'],
+  ['RightHand', 'fArmR'], ['LeftUpLeg', 'thighL'], ['LeftLeg', 'shinL'], ['LeftFoot', 'footL'], ['RightUpLeg', 'thighR'], ['RightLeg', 'shinR'], ['RightFoot', 'footR']]
+  .map(([bone, part, blend]) => ({ bone: rigBones[bone], part, blend, rest: rigBones[bone].getWorldQuaternion(new THREE.Quaternion()) }));
+const hipsRest = rigBones.Hips.getWorldPosition(new THREE.Vector3());
+function boneToPart(name) {
+  const n = name.replace('mixamorig', ''), S = n.startsWith('Left') ? 'L' : 'R';
+  if (/^(Left|Right)(ForeArm|Hand)/.test(n)) return 'fArm' + S;
+  if (/^(Left|Right)Arm/.test(n)) return 'uArm' + S;
+  if (/^(Left|Right)UpLeg/.test(n)) return 'thigh' + S;
+  if (/^(Left|Right)Leg/.test(n)) return 'shin' + S;
+  if (/^(Left|Right)(Foot|Toe)/.test(n)) return 'foot' + S;
+  if (/Shoulder|Spine2/.test(n)) return 'chest';
+  if (/Spine/.test(n)) return 'abdomen';
+  if (/Hips/.test(n)) return 'pelvis';
+  return 'head';
 }
-function groupDist(px, py, pz, list, k) {
-  let d = Infinity;
-  for (const sh of list) d = smin(d, shapeDist(px, py, pz, sh), k);
-  return d;
-}
-const clamp01 = x => Math.max(0, Math.min(1, x));
-// Arms merge into the torso only at the shoulder and legs only at the hip, so a hanging hand
-// or the inner thighs never web together.
-function bodyField(px, py, pz, out) {
-  const core = groupDist(px, py, pz, SHAPES.core, 0.045);
-  const aL = groupDist(px, py, pz, SHAPES.armL, 0.025), aR = groupDist(px, py, pz, SHAPES.armR, 0.025);
-  const lL = Math.max(groupDist(px, py, pz, SHAPES.legL, 0.03), -py), lR = Math.max(groupDist(px, py, pz, SHAPES.legR, 0.03), -py);
-  const ka = 0.035 * clamp01((py - 1.3) / 0.1), kl = 0.045 * clamp01((py - 0.74) / 0.1);
-  // legs join the torso first, then the arms: otherwise a hand would be blended into the hip
-  let d = smin(smin(core, lL, kl), lR, kl);
-  d = smin(smin(d, aL, ka), aR, ka);
-  if (out) { // which group owns this point (for skin weights)
-    const g = [core, aL, aR, lL, lR];
-    out.group = g.indexOf(Math.min(...g));
+// dominant bone of every vertex, to name the segment a bullet hits
+for (const m of modelMeshes) {
+  const si = m.geometry.attributes.skinIndex, sw = m.geometry.attributes.skinWeight;
+  m.userData.dom = new Uint8Array(si.count);
+  for (let i = 0; i < si.count; i++) {
+    let best = 0, bw = -1;
+    for (let k = 0; k < 4; k++) { const w = sw.getComponent(i, k); if (w > bw) { bw = w; best = si.getComponent(i, k); } }
+    m.userData.dom[i] = best;
   }
-  return d;
 }
-
-function surfaceNets(field, x0, y0, z0, nx, ny, nz, h) {
-  const F = new Float32Array(nx * ny * nz), id = (i, j, k) => i + nx * (j + ny * k);
-  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++)
-    F[id(i, j, k)] = field(x0 + i * h, y0 + j * h, z0 + k * h);
-  const cell = new Int32Array(nx * ny * nz).fill(-1), verts = [];
-  const corners = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]];
-  const edges = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
-  const v = new Float32Array(8);
-  for (let k = 0; k < nz - 1; k++) for (let j = 0; j < ny - 1; j++) for (let i = 0; i < nx - 1; i++) {
-    let inside = 0;
-    for (let c = 0; c < 8; c++) { v[c] = F[id(i + corners[c][0], j + corners[c][1], k + corners[c][2])]; if (v[c] < 0) inside++; }
-    if (inside === 0 || inside === 8) continue;
-    let sx = 0, sy = 0, sz = 0, n = 0;
-    for (const [a, b] of edges) {
-      if ((v[a] < 0) === (v[b] < 0)) continue;
-      const t = v[a] / (v[a] - v[b]), ca = corners[a], cb = corners[b];
-      sx += ca[0] + (cb[0] - ca[0]) * t; sy += ca[1] + (cb[1] - ca[1]) * t; sz += ca[2] + (cb[2] - ca[2]) * t; n++;
+const tq = new THREE.Quaternion(), pq = new THREE.Quaternion(), tv = new THREE.Vector3();
+function poseRig() {
+  for (const d of DRIVE) {
+    const m = byName[d.part].mesh;
+    if (d.blend) tq.slerpQuaternions(byName[d.blend].mesh.quaternion, m.quaternion, 0.5); else tq.copy(m.quaternion);
+    tq.multiply(d.rest);
+    d.bone.parent.getWorldQuaternion(pq);
+    d.bone.quaternion.copy(pq.invert().multiply(tq));
+    if (d.part === 'pelvis' && !d.blend && d.bone === rigBones.Hips) {
+      tv.copy(hipsRest).sub(vecOf3(byName.pelvis.c)).applyQuaternion(m.quaternion).add(m.position);
+      d.bone.position.copy(d.bone.parent.worldToLocal(tv));
     }
-    cell[id(i, j, k)] = verts.length / 3;
-    verts.push(x0 + (i + sx / n) * h, y0 + (j + sy / n) * h, z0 + (k + sz / n) * h);
   }
-  const index = [];
-  const quad = (a, b, c, d, flip) => flip ? index.push(a, c, b, a, d, c) : index.push(a, b, c, a, c, d);
-  for (let k = 1; k < nz - 1; k++) for (let j = 1; j < ny - 1; j++) for (let i = 1; i < nx - 1; i++) {
-    const f0 = F[id(i, j, k)] < 0;
-    if (f0 !== (F[id(i + 1, j, k)] < 0)) // edge along x: the four cells around it share a quad
-      quad(cell[id(i, j - 1, k - 1)], cell[id(i, j, k - 1)], cell[id(i, j, k)], cell[id(i, j - 1, k)], !f0);
-    if (f0 !== (F[id(i, j + 1, k)] < 0))
-      quad(cell[id(i - 1, j, k - 1)], cell[id(i - 1, j, k)], cell[id(i, j, k)], cell[id(i, j, k - 1)], !f0);
-    if (f0 !== (F[id(i, j, k + 1)] < 0))
-      quad(cell[id(i - 1, j - 1, k)], cell[id(i, j - 1, k)], cell[id(i, j, k)], cell[id(i - 1, j, k)], !f0);
-  }
-  return { verts, index };
 }
+const vecOf3 = a => new THREE.Vector3(a[0], a[1], a[2]);
 
-// bone axes in the rest pose; skin weights blend between the nearest ones
-function boneAxis(p) {
-  const x = p.c[0], t = p.n.replace(/[LR]$/, '');
-  const A = {
-    pelvis: [[0, 0.86, 0], [0, 1.06, 0]], abdomen: [[0, 1.07, 0], [0, 1.26, 0]], chest: [[0, 1.27, 0], [0, 1.49, 0]],
-    head: [[0, 1.53, 0], [0, 1.8, 0]], uArm: [[x, 1.47, 0], [x, 1.13, 0]], fArm: [[x, 1.13, 0], [x, 0.66, 0]],
-    thigh: [[x, 0.92, 0], [x, 0.52, 0]], shin: [[x, 0.52, 0], [x, 0.09, 0]], foot: [[x, 0.04, -0.06], [x, 0.04, 0.17]],
-  }[t];
-  return A.map(a => new THREE.Vector3(...a));
+// Wounds are painted on the skin in the shader, in the model's bind space, so they stay put as the body moves.
+const MAXW = 32;
+const woundU = {
+  uW: { value: Array.from({ length: MAXW }, () => new THREE.Vector4()) },
+  uW2: { value: Array.from({ length: MAXW }, () => new THREE.Vector4()) },
+  uW3: { value: Array.from({ length: MAXW }, () => new THREE.Vector4()) },
+  uWN: { value: 0 }, uBlood: { value: new THREE.Color() }, uUnit: { value: 1 }, uBloodOn: { value: 1 },
+};
+for (const m of modelMeshes) m.material.onBeforeCompile = sh => {
+  Object.assign(sh.uniforms, woundU);
+  sh.vertexShader = sh.vertexShader
+    .replace('#include <common>', '#include <common>\nvarying vec3 vRest;')
+    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvRest = position;');
+  sh.fragmentShader = sh.fragmentShader
+    .replace('#include <common>', `#include <common>
+varying vec3 vRest;
+uniform vec4 uW[${MAXW}]; uniform vec4 uW2[${MAXW}]; uniform vec4 uW3[${MAXW}];
+uniform int uWN; uniform vec3 uBlood; uniform float uUnit; uniform float uBloodOn;
+float wHash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float wNoise(vec3 x) {
+  vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(wHash(i), wHash(i + vec3(1, 0, 0)), f.x), mix(wHash(i + vec3(0, 1, 0)), wHash(i + vec3(1, 1, 0)), f.x), f.y),
+             mix(mix(wHash(i + vec3(0, 0, 1)), wHash(i + vec3(1, 0, 1)), f.x), mix(wHash(i + vec3(0, 1, 1)), wHash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
 }
-const GROUP_BONES = [['pelvis', 'abdomen', 'chest', 'head'], ['uArmL', 'fArmL', 'chest'], ['uArmR', 'fArmR', 'chest'], ['thighL', 'shinL', 'footL', 'pelvis'], ['thighR', 'shinR', 'footR', 'pelvis']];
-const skinMat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, roughness: 0.72 });
-let skin = null, skinBones = [], skinDom = null, skinPaintKey = '';
-
-function buildSkin() {
-  const h = 0.013, x0 = -0.36, y0 = -0.03, z0 = -0.2;
-  const nx = Math.ceil(0.72 / h) + 1, ny = Math.ceil(1.87 / h) + 1, nz = Math.ceil(0.42 / h) + 1;
-  const { verts, index } = surfaceNets((x, y, z) => bodyField(x, y, z), x0, y0, z0, nx, ny, nz, h);
-  const n = verts.length / 3;
-  // one Newton step pulls each vertex onto the surface
-  const e = 0.002;
-  for (let v = 0; v < n; v++) {
-    const x = verts[v * 3], y = verts[v * 3 + 1], z = verts[v * 3 + 2];
-    const d = bodyField(x, y, z);
-    const gx = (bodyField(x + e, y, z) - bodyField(x - e, y, z)) / (2 * e);
-    const gy = (bodyField(x, y + e, z) - bodyField(x, y - e, z)) / (2 * e);
-    const gz = (bodyField(x, y, z + e) - bodyField(x, y, z - e)) / (2 * e);
-    const g2 = gx * gx + gy * gy + gz * gz;
-    if (g2 > 1e-6) { verts[v * 3] -= d * gx / g2; verts[v * 3 + 1] -= d * gy / g2; verts[v * 3 + 2] -= d * gz / g2; }
+float wWet = 0.0;`)
+    .replace('#include <color_fragment>', `#include <color_fragment>
+{
+  float hole = 0.0, ring = 0.0;
+  vec3 q = vRest / uUnit; // metres in the bind pose
+  for (int i = 0; i < ${MAXW}; i++) {
+    if (i >= uWN) break;
+    vec3 d = q - uW[i].xyz; float dist = length(d);
+    float n = wNoise(q * 400.0 + float(i) * 3.1);
+    float rh = uW[i].w * (0.7 + 0.6 * n);
+    hole = max(hole, 1.0 - smoothstep(rh * 0.55, rh, dist));
+    ring = max(ring, 1.0 - smoothstep(rh, rh * 2.2, dist));
+    // wet blood: a spot around the wound and a run in the direction of gravity at the time of wounding
+    float spread = uW2[i].x * (0.65 + 0.7 * wNoise(q * 70.0 + float(i)));
+    float spot = 1.0 - smoothstep(spread * 0.6, spread, dist);
+    vec3 down = uW3[i].xyz; float along = dot(d, down); float lat = length(d - down * along);
+    float len = uW2[i].y;
+    float w = uW2[i].z * (1.0 - 0.6 * clamp(along / max(len, 1e-4), 0.0, 1.0)) * (0.5 + wNoise(q * 120.0 + vec3(float(i))));
+    float run = (along > 0.0 && along < len) ? 1.0 - smoothstep(w * 0.5, w, lat) : 0.0;
+    wWet = max(wWet, max(spot, run) * uW2[i].w);
   }
-  const axes = parts.map(boneAxis), idxOf = Object.fromEntries(parts.map((p, i) => [p.n, i]));
-  const skinIndex = new Uint16Array(n * 4), skinWeight = new Float32Array(n * 4);
-  skinDom = new Uint8Array(n);
-  const P = new THREE.Vector3(), out = {};
-  for (let v = 0; v < n; v++) {
-    P.set(verts[v * 3], verts[v * 3 + 1], verts[v * 3 + 2]);
-    bodyField(P.x, P.y, P.z, out);
-    const cand = GROUP_BONES[out.group].map(name => {
-      const i = idxOf[name], [a, b] = axes[i];
-      return { i, d: segPointDist(a, b, P) };
-    }).sort((a, b) => a.d - b.d).slice(0, 3);
-    const dmin = cand[0].d;
-    let sum = 0;
-    for (const c of cand) { c.w = Math.exp(-(c.d - dmin) / 0.02); sum += c.w; }
-    cand.forEach((c, k) => { skinIndex[v * 4 + k] = c.i; skinWeight[v * 4 + k] = c.w / sum; });
-    skinDom[v] = cand[0].i;
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
-  geo.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndex, 4));
-  geo.setAttribute('skinWeight', new THREE.Float32BufferAttribute(skinWeight, 4));
-  geo.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(n * 3), 3));
-  geo.setIndex(index);
-  geo.computeVertexNormals();
-  const rig = new THREE.Group();
-  skinBones = parts.map(p => { const b = new THREE.Bone(); b.position.set(...p.c); rig.add(b); return b; });
-  scene.add(rig);
-  rig.updateMatrixWorld(true);
-  skin = new THREE.SkinnedMesh(geo, skinMat);
-  skin.castShadow = true; skin.receiveShadow = true; skin.frustumCulled = false;
-  skin.bind(new THREE.Skeleton(skinBones));
-  scene.add(skin);
+  wWet *= uBloodOn;
+  diffuseColor.rgb = mix(diffuseColor.rgb, uBlood * 0.5, ring * 0.65);
+  diffuseColor.rgb = mix(diffuseColor.rgb, uBlood * (0.75 + 0.25 * wWet), wWet * 0.92);
+  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.05, 0.008, 0.008), hole);
+}`)
+    .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix(roughnessFactor, 0.2, wWet);');
+};
+// bind-space position of a world point on the skin, through its dominant bone
+function toBind(mesh, boneIndex, world) {
+  const sk = mesh.skeleton;
+  const M = new THREE.Matrix4().multiplyMatrices(mesh.matrixWorld, mesh.bindMatrixInverse)
+    .multiply(sk.bones[boneIndex].matrixWorld).multiply(sk.boneInverses[boneIndex]).multiply(mesh.bindMatrix);
+  return M.invert();
 }
-function poseSkin() {
-  parts.forEach((p, i) => { skinBones[i].position.copy(p.mesh.position); skinBones[i].quaternion.copy(p.mesh.quaternion); });
+const woundSlots = [];
+function addWoundSlot(w, mesh, boneIndex, point, holeR) {
+  if (woundSlots.length >= MAXW) return;
+  const inv = toBind(mesh, boneIndex, point);
+  const unit = new THREE.Vector3(1, 0, 0).transformDirection(inv).length() ? new THREE.Vector3(0.01, 0, 0).applyMatrix4(inv).sub(new THREE.Vector3(0, 0, 0).applyMatrix4(inv)).length() / 0.01 : 1;
+  woundU.uUnit.value = unit;
+  const pos = point.clone().applyMatrix4(inv).divideScalar(unit);
+  const down = new THREE.Vector3(0, -1, 0).transformDirection(inv);
+  woundSlots.push({ w, pos, holeR, down });
 }
-// vertex colours: base tone, the hovered segment, and blood soaking into each segment
-function paintSkin(soak) {
-  const key = bodyMat.color.getHexString() + hovered + parts.map(p => Math.round((soak[p.n] || 0) * 50)).join(',');
-  if (key === skinPaintKey) return;
-  skinPaintKey = key;
-  const col = parts.map(p => (p.n === hovered ? hotCol : baseCol).clone().lerp(bloodCol, soak[p.n] || 0));
-  const attr = skin.geometry.attributes.color;
-  for (let v = 0; v < skinDom.length; v++) { const c = col[skinDom[v]]; attr.setXYZ(v, c.r, c.g, c.b); }
-  attr.needsUpdate = true;
+function updateWoundUniforms() {
+  woundU.uWN.value = woundSlots.length;
+  woundSlots.forEach((sl, i) => {
+    const ml = sl.w.extLost;
+    woundU.uW.value[i].set(sl.pos.x, sl.pos.y, sl.pos.z, sl.holeR);
+    woundU.uW2.value[i].set(Math.min(0.07, 0.01 + 0.025 * Math.sqrt(ml / 40)), Math.min(0.5, 0.01 + ml / 500), Math.min(0.03, 0.007 + 0.008 * Math.sqrt(ml / 50)), Math.min(1, 0.35 + ml / 25));
+    woundU.uW3.value[i].set(sl.down.x, sl.down.y, sl.down.z, 0);
+  });
 }
 
 // ---------- physics world & mannequin ----------
@@ -596,20 +571,24 @@ function buildWorld() {
     parts = defs.map(d => ({ ...d, mesh: meshFor(d) }));
     for (const p of parts) {
       p.organs = organsFor(p);
-      for (const o of p.organs) { o.mesh = organMesh(o); p.mesh.add(o.mesh); }
+      p.organRoot = new THREE.Group();
+      if (p.axisQ) p.organRoot.quaternion.copy(p.axisQ);
+      p.mesh.add(p.organRoot);
+      for (const o of p.organs) { o.mesh = organMesh(o); p.organRoot.add(o.mesh); }
     }
   }
   for (const p of parts) for (const o of p.organs) o.mesh.material.emissive.set(0x000000);
   byName = {};
   for (const p of parts) {
     byName[p.n] = p;
-    for (const ch of [...p.mesh.children]) if (ch.userData.marker) p.mesh.remove(ch);
+    for (const holder of [p.mesh, p.organRoot]) for (const ch of [...holder.children]) if (ch.userData.marker) holder.remove(ch);
     p.body = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(...p.c)
       .setLinearDamping(0.05).setAngularDamping(0.4).setCanSleep(false));
     let cd = p.shape === 'box' ? RAPIER.ColliderDesc.cuboid(p.hx, p.hy, p.hz)
       : p.shape === 'ball' ? RAPIER.ColliderDesc.ball(p.r)
       : RAPIER.ColliderDesc.capsule(p.h, p.r);
     if (p.shape === 'capX') cd.setRotation(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2));
+    if (p.axisQ) cd.setRotation(p.axisQ);
     cd.setDensity(density).setFriction(p.n.startsWith('foot') ? 1.2 : 0.6).setCollisionGroups(FILTER[p.g]);
     world.createCollider(cd, p.body);
     p.tone = 1; p.toneTarget = 1; p.toneRate = 3;
@@ -639,6 +618,9 @@ function buildWorld() {
   character = { balance: 1, balanceTarget: 1, balanceRate: 3, conscious: true, state: 'ok', torsoHits: 0, collapseAt: null, kneel: null,
     vigor: 1, lost: 0, bleedRate: 0, physT: 0, wounds: [], stage: 0, arrestAt: null, sway: null };
   clearBlood();
+  woundSlots.length = 0;
+  character.breath = 0; character.ph = Array.from({ length: 14 }, () => Math.random() * 6.28);
+  character.life = addLayer({}, { attack: 1, hold: Infinity, release: 0.5, tag: 'life' });
   setState('ok');
   syncMeshes();
 }
@@ -648,9 +630,16 @@ function buildWorld() {
 const layers = [];
 const BASE = { thighL: [-0.05, 0, 0], thighR: [-0.05, 0, 0], shinL: [0.1, 0, 0], shinR: [0.1, 0, 0], uArmL: [0, 0, 0.06], uArmR: [0, 0, -0.06], fArmL: [-0.15, 0, 0], fArmR: [-0.15, 0, 0] };
 function addLayer(pose, { peak = 1, attack = 0.08, hold = 0.3, release = 0.8, tag } = {}) {
+  // a new pose of the same kind takes over from the old one instead of adding to it
+  if (tag) for (const o of layers) if (o.tag === tag) fadeOut(o, Math.min(o.release, 0.4));
   const l = { pose, peak, attack, hold, release, age: 0, tag };
   layers.push(l);
   return l;
+}
+function fadeOut(l, release) {
+  const w = layerWeight(l);
+  // restart the envelope at the current weight so the fade has no jump
+  l.peak = w; l.attack = 1e-6; l.age = 1e-6; l.hold = 0; l.release = release;
 }
 function layerWeight(l) {
   if (l.age < l.attack) return l.peak * l.age / l.attack;
@@ -745,22 +734,72 @@ function setState(s) {
   document.getElementById('stateText').textContent = { ok: 'стоит', wounded: 'ранен, на ногах', kneel: 'на колене', down: 'упал' }[s];
 }
 
+const jitter = (x, k = 0.3) => x * (1 + (Math.random() * 2 - 1) * k);
+// every reaction is drawn fresh: each joint's offset and the timing vary, so no two look the same
+function addVaried(pose, env, k = 0.3) {
+  const out = {};
+  for (const [j, v] of Object.entries(pose)) out[j] = v.map(x => jitter(x, k));
+  return addLayer(out, { ...env, attack: jitter(env.attack ?? 0.08, 0.35), hold: env.hold === Infinity ? Infinity : jitter(env.hold ?? 0.3, 0.4), release: jitter(env.release ?? 0.8, 0.35) });
+}
 function startle(intensity, side) {
-  if (!character.conscious) return;
-  const k = Math.min(1, intensity);
-  addLayer({
-    head: [0.35, -side * 0.6, 0], chest: [0.3, -side * 0.2, side * 0.12], abdomen: [0.15, 0, 0],
-    uArmL: [-1.25, 0, -0.25], uArmR: [-1.25, 0, 0.25], fArmL: [-1.9, 0, 0], fArmR: [-1.9, 0, 0],
-    thighL: [-0.5, 0, 0], thighR: [-0.5, 0, 0], shinL: [0.85, 0, 0], shinR: [0.85, 0, 0],
-  }, { peak: 0.35 + 0.65 * k, attack: 0.09, hold: 0.25 + 0.4 * k, release: 0.9 });
+  const c = character;
+  if (!c.conscious) return;
+  // repeated shots nearby: the startle fades, but the person crouches and stays low
+  c.startles = (c.startles || []).filter(t => simTime - t < 10);
+  const k = Math.min(1, intensity) * Math.pow(0.6, c.startles.length);
+  c.startles.push(simTime);
+  if (c.startles.length >= 3 && !c.crouch) {
+    c.crouch = addVaried({ thighL: [-0.9, 0, 0], thighR: [-0.9, 0, 0], shinL: [1.5, 0, 0], shinR: [1.5, 0, 0], chest: [0.35, 0, 0], head: [0.2, 0, 0],
+      uArmL: [-0.8, 0, -0.2], uArmR: [-0.8, 0, 0.2], fArmL: [-1.6, 0, 0], fArmR: [-1.6, 0, 0] }, { attack: 0.5, hold: 4, release: 1.5, tag: 'crouch' }, 0.15);
+    at(6, () => { c.crouch = null; });
+  }
+  if (k < 0.08) return;
+  const away = -side;
+  const variant = Math.random();
+  const legs = { thighL: [-0.45, 0, 0], thighR: [-0.45, 0, 0], shinL: [0.8, 0, 0], shinR: [0.8, 0, 0] };
+  let pose;
+  if (variant < 0.4) pose = { // arms come up over the head
+    head: [0.35, away * 0.6, 0], chest: [0.3, away * 0.2, -side * 0.12], abdomen: [0.15, 0, 0],
+    uArmL: [-1.25, 0, -0.25], uArmR: [-1.25, 0, 0.25], fArmL: [-1.9, 0, 0], fArmR: [-1.9, 0, 0], ...legs };
+  else if (variant < 0.75) pose = { // ducks and hunches, hands in front of the chest
+    head: [0.5, away * 0.3, 0], chest: [0.4, 0, 0], abdomen: [0.2, 0, 0],
+    uArmL: [-0.6, 0, 0.15], uArmR: [-0.6, 0, -0.15], fArmL: [-1.7, 0, 0], fArmR: [-1.7, 0, 0],
+    thighL: [-0.6, 0, 0], thighR: [-0.6, 0, 0], shinL: [1.05, 0, 0], shinR: [1.05, 0, 0] };
+  else { // turns away and lifts the arm on the bullet's side
+    const near = side > 0 ? 'L' : 'R', far = near === 'L' ? 'R' : 'L', sn = near === 'L' ? 1 : -1;
+    pose = { head: [0.25, away * 0.9, 0], chest: [0.2, away * 0.45, -side * 0.15], abdomen: [0.1, away * 0.2, 0],
+      ['uArm' + near]: [-1.4, 0, -0.2 * sn], ['fArm' + near]: [-1.8, 0, 0], ['uArm' + far]: [-0.3, 0, 0.1 * sn], ['fArm' + far]: [-1.0, 0, 0], ...legs };
+  }
+  addVaried(pose, { peak: 0.35 + 0.65 * k, attack: 0.09, hold: 0.25 + 0.4 * k, release: 0.9, tag: 'startle' });
 }
 
-function flinch(strength, side) {
+// fromFront: the bullet came from in front of the chest
+function flinch(strength, side, fromFront = true) {
   if (!character.conscious) return;
-  addLayer({
-    chest: [0.45, side * 0.15, 0], abdomen: [0.3, 0, 0], head: [0.3, 0, 0],
+  if (!fromFront) // shot in the back: a brief arch before the body folds
+    addVaried({ chest: [-0.3, side * 0.1, 0], abdomen: [-0.15, 0, 0], head: [-0.25, 0, 0] }, { peak: strength, attack: 0.05, hold: 0.08, release: 0.35, tag: 'arch' });
+  const fold = () => addVaried({
+    chest: [0.45, side * 0.25, -side * 0.08], abdomen: [0.3, side * 0.1, 0], head: [0.3, side * 0.2, 0],
     thighL: [-0.25, 0, 0], thighR: [-0.25, 0, 0], shinL: [0.45, 0, 0], shinR: [0.45, 0, 0],
-  }, { peak: strength, attack: 0.06, hold: 0.15, release: 0.6 });
+  }, { peak: strength, attack: 0.07, hold: 0.15, release: 0.7, tag: 'flinch' });
+  if (fromFront) fold(); else at(0.12, () => character.conscious && fold());
+}
+
+// breathing, small shifts of weight and glances; faster and bigger once hurt or losing blood
+function updateLife() {
+  const c = character, l = c.life;
+  if (!l || !c.conscious) return;
+  const f = c.lost / BLOOD_VOLUME, hurt = c.state === 'ok' ? 0 : 1, t = simTime;
+  c.breath += (0.23 + 0.35 * Math.min(1, f / 0.3) + 0.12 * hurt) * Math.PI * 2 * DT;
+  const b = Math.sin(c.breath), amp = 1 + 1.5 * Math.min(1, f / 0.3) + 0.8 * hurt;
+  const n = (i, f1, f2) => Math.sin(t * f1 + c.ph[i]) * 0.6 + Math.sin(t * f2 + c.ph[i] * 1.7) * 0.4;
+  l.pose.chest = [-0.018 * b * amp + 0.02 * n(0, 0.31, 0.53), 0.03 * n(1, 0.17, 0.41), 0.015 * n(2, 0.23, 0.37)];
+  l.pose.abdomen = [0.012 * b * amp, 0.015 * n(3, 0.19, 0.44), 0];
+  l.pose.head = [0.04 * n(4, 0.21, 0.47) + 0.012 * b, 0.12 * n(5, 0.13, 0.29) * (1 + hurt), 0.03 * n(6, 0.19, 0.43)];
+  l.pose.uArmL = [0.05 * n(7, 0.27, 0.51), 0, 0.02 * n(8, 0.33, 0.61)];
+  l.pose.uArmR = [0.05 * n(9, 0.29, 0.49), 0, -0.02 * n(10, 0.31, 0.57)];
+  const shift = 0.025 * n(11, 0.11, 0.23) * (1 + hurt);
+  l.pose.thighL = [0.015 * n(12, 0.2, 0.4), 0, shift]; l.pose.thighR = [0.015 * n(13, 0.21, 0.39), 0, shift];
 }
 
 function collapse(fast) {
@@ -777,6 +816,8 @@ function collapse(fast) {
 
 function react(zone, side, hitDir, w) {
   const c = character;
+  const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(toQ(byName.chest.body.rotation(), new THREE.Quaternion()));
+  const fromFront = hitDir.dot(fwd) < 0;
   if (!c.conscious) return { text: 'Тело уже без мышечного контроля: только пассивное движение от импульса.' };
   if (c.state === 'ok') setState('wounded');
   if (zone === 'head') {
@@ -786,37 +827,37 @@ function react(zone, side, hitDir, w) {
         ? 'Поражён мозг: мгновенная потеря мышечного контроля. Тело оседает под собственным весом; куда оно упадёт, решает поза, а не пуля.'
         : 'Перебит спинной мозг в шее: мгновенный паралич всего тела, тело оседает.' };
     }
-    flinch(0.8, side); startle(0.8, side);
+    flinch(jitter(0.8, 0.2), side, fromFront); startle(0.8, side);
     if (w.organs.length) return { text: 'Ранение шеи без повреждения спинного мозга: человек в сознании, главная угроза — кровотечение.' };
     return { text: 'Касательное ранение: пуля прошла по черепу, не задев мозг. Человек оглушён, но в сознании.' };
   }
   if ((zone === 'chest' || zone === 'abdomen') && w.spine) {
     tone([...LEG('L'), ...LEG('R')], 0, 40);
     c.balanceTarget = 0; c.balanceRate = 40;
-    flinch(0.6, side);
+    flinch(jitter(0.6, 0.25), side, fromFront);
     return { text: 'Задет позвоночник: ноги парализованы мгновенно, тело падает. Сознание сохраняется, руки работают.' };
   }
   if (zone === 'chest' || zone === 'abdomen') {
     c.torsoHits++;
-    flinch(0.9, side);
+    flinch(jitter(0.9, 0.2), side, fromFront);
     // hands go to the wound: shoulder flexion, inward rotation and adduction bring the forearms across the belly
     const arm = (S, k) => { const s = S === 'L' ? 1 : -1; return [-0.65 * k, -0.85 * s * k, -0.3 * s * k]; };
     const near = side >= 0 ? 'L' : 'R', far = near === 'L' ? 'R' : 'L';
-    at(0.25, () => c.conscious && addLayer({
+    at(jitter(0.25, 0.4), () => c.conscious && addVaried({
       ['uArm' + near]: arm(near, 1), ['fArm' + near]: [-2.0, 0, 0],
       ['uArm' + far]: arm(far, 0.75), ['fArm' + far]: [-1.8, 0, 0],
       chest: [0.2, 0, 0], head: [0.25, 0, 0],
-    }, { peak: 1, attack: 0.35, hold: Infinity, release: 0.6, tag: 'clutch' }));
+    }, { peak: 1, attack: 0.35, hold: Infinity, release: 0.6, tag: 'clutch' }, 0.2));
     return { text: w.arrest
       ? 'Рефлекторное сгибание, рука тянется к ране. Несколько секунд человек ещё стоит и двигается: мозгу хватает кислорода.'
       : 'Рефлекторное сгибание, рука тянется к ране. Устоит ли человек, решает кровопотеря, а не удар.' };
   }
   if (zone === 'pelvis' && !w.bone) {
-    flinch(0.6, side);
+    flinch(jitter(0.6, 0.25), side, fromFront);
     return { text: 'Кости таза целы: человек может стоять, хотя ходить больно.' };
   }
   if (zone === 'pelvis') {
-    flinch(0.6, side);
+    flinch(jitter(0.6, 0.25), side, fromFront);
     tone([...LEG('L'), ...LEG('R')], 0.1, 8);
     c.balanceTarget = 0.12; c.balanceRate = 4;
     addLayer({ thighL: [-0.7, 0, 0], thighR: [-0.7, 0, 0], shinL: [1.3, 0, 0], shinR: [1.3, 0, 0] }, { attack: 0.3, hold: Infinity, tag: 'sag' });
@@ -825,7 +866,7 @@ function react(zone, side, hitDir, w) {
   }
   if (zone.startsWith('thigh') || zone.startsWith('shin') || zone.startsWith('foot')) {
     const S = zone.slice(-1), H = S === 'L' ? 'R' : 'L';
-    flinch(0.4, side);
+    flinch(jitter(0.4, 0.3), side, fromFront);
     tone(LEG(S), 0.12, 10);
     c.balanceTarget = Math.min(c.balanceTarget, 0.6); c.balanceRate = 3;
     if (c.kneel) return { text: 'Ещё одно попадание в ногу: тело остаётся на колене.' };
@@ -846,7 +887,7 @@ function react(zone, side, hitDir, w) {
   if (zone.startsWith('uArm') || zone.startsWith('fArm')) {
     const S = zone.slice(-1);
     tone(ARM(S), w.bone ? 0.03 : 0.35, 12);
-    flinch(0.35, side);
+    flinch(jitter(0.35, 0.3), side, fromFront);
     addLayer({ chest: [0.1, S === 'L' ? 0.3 : -0.3, 0], head: [0, S === 'L' ? 0.5 : -0.5, 0] }, { attack: 0.1, hold: 0.4, release: 1 });
     return { text: w.bone ? 'Перелом: рука повисает, корпус вздрагивает и поворачивается к ране.' : 'Кость цела: рука работает, но слабо. Корпус вздрагивает и поворачивается к ране.' };
   }
@@ -864,8 +905,8 @@ function shoot(clientX, clientY) {
   ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
   const ray = raycaster.ray;
-  skin.computeBoundingSphere();
-  const hits = raycaster.intersectObjects([skin, floor], false);
+  for (const m of modelMeshes) m.computeBoundingSphere();
+  const hits = raycaster.intersectObjects([...modelMeshes, floor], false);
   const hit = hits[0];
   let end = hit ? hit.point.clone() : ray.at(60, new THREE.Vector3());
   const muzzle = camera.position.clone()
@@ -876,7 +917,7 @@ function shoot(clientX, clientY) {
 
   let partHit = null;
   if (hit && hit.object !== floor) {
-    partHit = parts[skinDom[hit.face.a]];
+    partHit = partAt(hit.point);
   }
   if (partHit) {
     const b = partHit.body;
@@ -959,6 +1000,14 @@ function dust(pt) {
 const ORGAN_COLOR = { heart: '#a3122a', lung: '#e3a0a8', liver: '#7a3b1e', spleen: '#6b2d5c', kidney: '#a14c3c', artery: '#d32030', vein: '#3b4fa3', bone: '#e6dcc2', nerve: '#f0cf62', brain: '#e8b7ae', bowel: '#d9a37b', bladder: '#d8bf5c' };
 const TISSUE = { head: ['кожа и кость черепа', [1, 3]], chest: ['грудная стенка', [0.5, 1.5]], abdomen: ['брюшная стенка', [0.5, 2]], pelvis: ['мягкие ткани таза', [0.5, 2]], thigh: ['мышцы бедра', [0.8, 2.5]], shin: ['мягкие ткани голени', [0.4, 1.2]], foot: ['мягкие ткани стопы', [0.3, 0.8]], uArm: ['мышцы плеча', [0.5, 1.5]], fArm: ['мягкие ткани предплечья', [0.3, 1]] };
 function organsFor(p) {
+  const S = p.S || [1, 1, 1];
+  return organLayout(p).map(o => {
+    if (o.c) { o.c.multiply(new THREE.Vector3(...S)); o.r = o.r.map((r, i) => r * S[i]); }
+    else { o.a.multiply(new THREE.Vector3(...S)); o.b.multiply(new THREE.Vector3(...S)); o.r *= Math.min(S[0], S[2]); }
+    return o;
+  });
+}
+function organLayout(p) {
   const s = p.n.endsWith('L') ? 1 : -1; // +1 on the mannequin's left
   const v = a => new THREE.Vector3(...a);
   const E = (name, type, c, r, x) => ({ name, type, c: v(c), r, ...x });
@@ -1076,8 +1125,10 @@ function woundTrack(part, entry, dir) {
   const depth = Math.min(through, weapon.pen);
   const exit = entry.clone().addScaledVector(dir, depth);
   part.mesh.updateMatrixWorld();
-  const A = part.mesh.worldToLocal(entry.clone()), B = part.mesh.worldToLocal(exit.clone());
-  return { A, B, exit, perforating: through <= weapon.pen, organs: part.organs.filter(o => trackHits(o, A, B, weapon.reach)) };
+  const entryLocal = part.mesh.worldToLocal(entry.clone()), exitLocal = part.mesh.worldToLocal(exit.clone());
+  const toAxis = part.axisQ ? part.axisQ.clone().invert() : new THREE.Quaternion();
+  const A = entryLocal.clone().applyQuaternion(toAxis), B = exitLocal.clone().applyQuaternion(toAxis);
+  return { A, B, entryLocal, exit, perforating: through <= weapon.pen, organs: part.organs.filter(o => trackHits(o, A, B, weapon.reach)) };
 }
 const BLOOD_VOLUME = 70 * BODY_MASS; // ~70 ml of blood per kg
 const fmtRate = r => r >= 1 ? `${r.toFixed(r < 10 ? 1 : 0)} мл/с` : `${Math.round(r * 60)} мл/мин`;
@@ -1086,9 +1137,11 @@ let physMult = 1, showBlood = true, xray = false;
 const bloodGroup = new THREE.Group();
 scene.add(bloodGroup);
 const drops = [], pools = [];
-const dropGeo = new THREE.IcosahedronGeometry(1, 0), poolGeo = new THREE.CircleGeometry(1, 12).rotateX(-Math.PI / 2);
+const UP_Y = new THREE.Vector3(0, 1, 0);
+const dropGeo = new THREE.IcosahedronGeometry(1, 1), poolGeo = new THREE.CircleGeometry(1, 12).rotateX(-Math.PI / 2);
 const channelMat = new THREE.LineBasicMaterial({ color: 0xffd23f, depthTest: false });
 
+const HOLE = { pistol: [0.0045, 0.008], rifle: [0.0035, 0.018], slug: [0.009, 0.015] }; // entry and exit radius, m
 function addWound(part, hit, dir) {
   const c = character;
   const type = part.n.replace(/[LR]$/, '');
@@ -1100,36 +1153,54 @@ function addWound(part, hit, dir) {
     if (o.mesh) o.mesh.material.emissive.set(0x5a0000);
   }
   const has = f => track.organs.some(f);
-  const local = track.A;
+  const local = track.entryLocal;
   const n = hit.face ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld) : dir.clone().negate();
   const nLocal = n.applyQuaternion(part.mesh.getWorldQuaternion(new THREE.Quaternion()).invert());
   const w = {
     part, local, nLocal, comps, organs: track.organs, perforating: track.perforating,
     name: track.organs.length ? track.organs.map(o => o.name).join(', ') : tissueName,
-    zone: type === 'head' && local.y < -0.07 ? 'шея' : ZONE_LABEL[part.n],
+    zone: type === 'head' && local.y < -0.085 ? 'шея' : ZONE_LABEL[part.n],
     arrest: has(o => o.arrest), brain: has(o => o.cns === 'brain'), cervical: has(o => o.cns === 'cervical'),
     spine: has(o => o.cns === 'spine'), bone: has(o => o.bone),
     rate: comps.reduce((a, k) => a + k.rate, 0), now: 0, ext: 0.9, t0: c.physT, lost: 0, extLost: 0, pending: 0,
-    maxStain: Math.min(0.06, (part.r || 0.05) * 0.8),
   };
-  // entry mark, the wound track (seen in x-ray) and a stain that spreads with the external blood loss
-  const m = new THREE.Mesh(new THREE.IcosahedronGeometry(0.018, 0), hitMat);
-  m.userData.marker = true; m.position.copy(local); part.mesh.add(m);
+  // the wound track is seen in x-ray; entry and exit are painted on the skin
   const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([track.A, track.B]), channelMat);
-  line.userData.marker = true; line.layers.set(1); line.renderOrder = 10; part.mesh.add(line);
-  w.stain = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 1), bloodMat);
-  w.stain.userData.marker = true;
-  w.stain.position.copy(local);
-  w.stain.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), nLocal);
-  w.stain.scale.set(0.02, 0.02, 0.006);
-  w.stain.visible = showBlood;
-  part.mesh.add(w.stain);
+  line.userData.marker = true; line.layers.set(1); line.renderOrder = 10; part.organRoot.add(line);
+  const [rIn, rOut] = HOLE[weapon.id];
+  addWoundSlot(w, hit.object, hit.object.skeleton ? domBone(hit) : 0, hit.point, rIn);
+  if (track.perforating) {
+    // find where the track leaves the skin of the same segment
+    const from = track.exit.clone().addScaledVector(dir, 0.3);
+    const outHit = new THREE.Raycaster(from, dir.clone().negate(), 0, 0.6).intersectObjects(modelMeshes, false)
+      .find(h => partOfHit(h) === part.n && h.point.distanceTo(track.exit) < 0.12);
+    if (outHit) addWoundSlot(w, outHit.object, domBone(outHit), outHit.point, rOut);
+  }
   c.wounds.push(w);
   if (w.arrest && c.arrestAt === null) c.arrestAt = c.physT + 8 + Math.random() * 7;
   spatter(hit.point, dir);
   if (track.perforating) spatter(track.exit, dir);
   return w;
 }
+
+function domBone(hit) { return hit.object.userData.dom[hit.face.a]; }
+// the segment is the hitbox nearest to the hit point; skin weights alone put the lower ribs in the abdomen
+function partAt(point) {
+  let best = null, bd = Infinity;
+  const v = new THREE.Vector3();
+  for (const p of parts) {
+    p.mesh.worldToLocal(v.copy(point));
+    if (p.axisQ) v.applyQuaternion(p.axisQ.clone().invert());
+    let d;
+    if (p.shape === 'ball') d = v.length() - p.r;
+    else if (p.shape === 'box') d = Math.max(Math.abs(v.x) - p.hx, Math.abs(v.y) - p.hy, Math.abs(v.z) - p.hz);
+    else if (p.shape === 'capX') d = Math.hypot(v.x - Math.max(-p.h, Math.min(p.h, v.x)), v.y, v.z) - p.r;
+    else d = Math.hypot(v.x, v.y - Math.max(-p.h, Math.min(p.h, v.y)), v.z) - p.r;
+    if (d < bd) { bd = d; best = p; }
+  }
+  return best;
+}
+function partOfHit(hit) { return partAt(hit.point).n; }
 
 function physiology(dt) {
   const c = character;
@@ -1151,7 +1222,7 @@ function physiology(dt) {
   c.bleedRate = total;
   c.vigor = f < 0.15 ? 1 : Math.max(0.55, 1 - (f - 0.15) / 0.15 * 0.45);
   if (c.sway) {
-    const a = Math.min(1, (f - 0.15) / 0.2), t = c.physT;
+    const a = Math.min(1, (f - 0.15) / 0.2), t = simTime;
     c.sway.pose.chest = [0.06 * a * Math.sin(t * 1.1), 0, 0.07 * a * Math.sin(t * 0.7)];
     c.sway.pose.abdomen = [0.04 * a * Math.sin(t * 1.1 + 0.6), 0, 0.05 * a * Math.sin(t * 0.7 + 0.4)];
     c.sway.pose.head = [0.08 * a * Math.sin(t * 0.9), 0, 0];
@@ -1201,8 +1272,6 @@ function updateBloodVisuals(dt) {
   const hr = heartRate(), beat = hr ? Math.sin(c.physT * Math.PI * 2 * hr / 60) : -1;
   const q = new THREE.Quaternion();
   for (const w of c.wounds) {
-    const r = Math.min(0.02 + Math.sqrt(w.extLost / 1000) * 0.1, w.maxStain);
-    w.stain.scale.set(r, r, 0.008);
     if (!dt) continue;
     // one drop carries 0.3–5 ml so a heavy bleed stays at a few dozen drops per second
     const dropMl = Math.min(5, Math.max(0.3, w.now * w.ext / 20));
@@ -1226,23 +1295,17 @@ function updateBloodVisuals(dt) {
     const d = drops[i];
     d.v.y -= 9.81 * dt;
     d.mesh.position.addScaledVector(d.v, dt);
+    const sp = d.v.length(), r = d.mesh.userData.r;
+    d.mesh.scale.set(r, r * (1 + Math.min(3, sp * 1.5)), r);
+    if (sp > 1e-3) d.mesh.quaternion.setFromUnitVectors(UP_Y, tv.copy(d.v).divideScalar(sp));
     if (d.mesh.position.y <= 0.004) { deposit(d.mesh.position, d.ml); bloodGroup.remove(d.mesh); drops.splice(i, 1); }
   }
-}
-const SOAK_ML = { pelvis: 350, abdomen: 300, chest: 450, head: 120, uArm: 120, fArm: 100, thigh: 250, shin: 150, foot: 60 };
-const baseCol = new THREE.Color(), bloodCol = new THREE.Color(), hotCol = new THREE.Color();
-function updateBodyColors() {
-  baseCol.copy(bodyMat.color); bloodCol.copy(bloodMat.color).multiplyScalar(0.8); hotCol.copy(hotMat.color);
-  const soak = {};
-  if (showBlood) for (const w of character.wounds) soak[w.part.n] = (soak[w.part.n] || 0) + w.extLost;
-  for (const p of parts) soak[p.n] = Math.min(0.85, (soak[p.n] || 0) / SOAK_ML[p.n.replace(/[LR]$/, '')]);
-  paintSkin(soak);
 }
 function spawnDrop(pos, v, ml) {
   if (drops.length > 400) return deposit(pos.setY(0), ml);
   const mesh = new THREE.Mesh(dropGeo, bloodMat);
-  const r = Math.cbrt(ml * 1e-6 * 3 / (4 * Math.PI)) * 1.3;
-  mesh.scale.setScalar(Math.max(0.004, r));
+  mesh.userData.r = Math.min(0.006, Math.max(0.0025, Math.cbrt(ml * 1e-6 * 3 / (4 * Math.PI)) * 0.6));
+  mesh.scale.setScalar(mesh.userData.r);
   mesh.position.copy(pos);
   bloodGroup.add(mesh);
   drops.push({ mesh, v, ml });
@@ -1271,11 +1334,11 @@ function deposit(pt, ml) {
 }
 function spatter(point, dir) {
   // fine droplets thrown along the bullet path (exit side) and a few back toward the shooter
-  for (let i = 0; i < 14; i++) {
-    const back = i < 4;
-    const v = dir.clone().multiplyScalar(back ? -(0.6 + Math.random()) : 1.5 + Math.random() * 2.5);
-    v.x += (Math.random() - 0.5) * 1.2; v.y += Math.random() * 0.8; v.z += (Math.random() - 0.5) * 1.2;
-    spawnDrop(point.clone().addScaledVector(dir, back ? -0.01 : 0.12), v, 0.15 + Math.random() * 0.25);
+  for (let i = 0; i < 8; i++) {
+    const back = i < 2;
+    const v = dir.clone().multiplyScalar(back ? -(0.3 + Math.random() * 0.5) : 0.8 + Math.random() * 1.6);
+    v.x += (Math.random() - 0.5) * 0.6; v.y += Math.random() * 0.4; v.z += (Math.random() - 0.5) * 0.6;
+    spawnDrop(point.clone().addScaledVector(dir, back ? -0.01 : 0.03), v, 0.08 + Math.random() * 0.15);
   }
 }
 function clearBlood() {
@@ -1286,13 +1349,13 @@ function clearBlood() {
 function setXray(on) {
   xray = on;
   if (on) camera.layers.enable(1); else camera.layers.disable(1);
-  skinMat.transparent = on; skinMat.opacity = on ? 0.22 : 1; skinMat.depthWrite = !on; skinMat.needsUpdate = true;
+  for (const m of [surfaceMat, jointMat]) { m.transparent = on; m.opacity = on ? 0.2 : 1; m.depthWrite = !on; m.needsUpdate = true; }
   document.getElementById('xrayBox').checked = on;
 }
 function setBloodVisible(v) {
   showBlood = v;
   bloodGroup.visible = v;
-  for (const w of character.wounds) w.stain.visible = v;
+  woundU.uBloodOn.value = v ? 1 : 0;
 }
 
 const vEl = id => document.getElementById(id);
@@ -1354,12 +1417,13 @@ function step() {
   for (let i = layers.length - 1; i >= 0; i--) if (layers[i].age > layers[i].attack + layers[i].hold + layers[i].release) layers.splice(i, 1);
   for (let i = events.length - 1; i >= 0; i--) if (events[i].t <= simTime) { const e = events.splice(i, 1)[0]; e.fn(); }
   physiology(DT * physMult);
+  updateLife();
   if (character.state !== 'down' && byName.pelvis.body.translation().y < (character.kneel && character.conscious ? 0.3 : 0.45)) {
     setState('down');
     character.balanceTarget = 0;
     if (character.conscious) { // conscious but on the ground: muscles relax instead of holding the standing pose
       for (const p of parts) { p.toneTarget = Math.min(p.toneTarget, 0.06); p.toneRate = 4; }
-      for (const l of layers) if (l.hold === Infinity) l.hold = 0;
+      for (const l of layers) if (l.hold === Infinity && l.tag !== 'life') l.hold = 0;
     }
   }
   if (++stepCount % 2 === 0) record();
@@ -1388,7 +1452,7 @@ function frame(now) {
     syncMeshes();
   }
   updateBloodVisuals(replay ? 0 : dtReal * timeScale);
-  updateBodyColors();
+  updateWoundUniforms();
   bloodReadout();
   for (let i = effects.length - 1; i >= 0; i--) {
     const e = effects[i]; e.age += dtReal;
@@ -1396,7 +1460,7 @@ function frame(now) {
     e.update(e, k, dtReal);
     if (k >= 1) { scene.remove(e.obj); effects.splice(i, 1); }
   }
-  poseSkin();
+  poseRig();
   controls.update();
   const dist = camera.position.distanceTo(vecOf(byName.chest.body.translation()));
   distText.textContent = `дистанция: ${dist.toFixed(1)} м`;
@@ -1504,8 +1568,8 @@ canvas.addEventListener('pointermove', e => {
   aimChip.textContent = 'прицел: ' + text;
 });
 
+applyTheme();
 buildWorld();
-buildSkin();
 resize();
 document.getElementById('loading').remove();
 log('info', 'Готово', 'Манекен стоит в 6 м от камеры. Выстрел идёт из точки, где находится камера.');
