@@ -400,7 +400,8 @@ function meshFor(d) {
 
 // ---------- model ----------
 // Visible body: the Mixamo X Bot from the three.js examples. Its skeleton is driven by the physics bodies.
-const gltf = await new GLTFLoader().loadAsync('xbot.glb');
+const { default: XBOT } = await import('./xbot.js'); // the glb as base64: artifact hosting serves .js but not .glb
+const gltf = await new GLTFLoader().parseAsync(Uint8Array.from(atob(XBOT), ch => ch.charCodeAt(0)).buffer, '');
 const model = gltf.scene;
 scene.add(model);
 const rigBones = {}, modelMeshes = [];
