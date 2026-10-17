@@ -270,6 +270,8 @@ const WEAPONS = [
   // pen: how deep the bullet goes in tissue, m; reach: extra radius of damage around the track (temporary cavity), m
   { id: 'pistol', name: 'Пистолет 9×19', m: 0.008, v: 360, pen: 0.4, reach: 0.004 },
   { id: 'rifle', name: 'Винтовка 5,56×45', m: 0.004, v: 940, pen: 0.7, reach: 0.015 },
+  // 00 buckshot: nine 8.4 mm pellets; the pattern opens about 4 cm per metre (spread is the half-angle, rad)
+  { id: 'buck', name: 'Дробовик, картечь 00', m: 0.0035, v: 400, pellets: 9, spread: 0.02, pen: 0.3, reach: 0.004 },
   { id: 'slug', name: 'Дробовик, пуля 12 к.', m: 0.028, v: 450, pen: 0.45, reach: 0.012 },
 ];
 const G_GROUND = 0x1, G_TORSO = 0x2, G_ARML = 0x4, G_ARMR = 0x8, G_LEGL = 0x10, G_LEGR = 0x20;
@@ -478,7 +480,7 @@ function poseRig() {
 const vecOf3 = a => new THREE.Vector3(a[0], a[1], a[2]);
 
 // Wounds are painted on the skin in the shader, in the model's bind space, so they stay put as the body moves.
-const MAXW = 32;
+const MAXW = 48; // entry and exit each take a slot; a buckshot hit uses up to 18
 const woundU = {
   uW: { value: Array.from({ length: MAXW }, () => new THREE.Vector4()) },
   uW2: { value: Array.from({ length: MAXW }, () => new THREE.Vector4()) },
@@ -901,45 +903,77 @@ const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
 const effects = [];
 
+// pellet direction: uniform over a cone around the aim
+function spreadDir(base, half) {
+  const u = new THREE.Vector3().crossVectors(base, Math.abs(base.y) < 0.9 ? UP_Y : new THREE.Vector3(1, 0, 0)).normalize();
+  const v = new THREE.Vector3().crossVectors(base, u);
+  const a = Math.random() * Math.PI * 2, r = half * Math.sqrt(Math.random());
+  return base.clone().addScaledVector(u, Math.cos(a) * r).addScaledVector(v, Math.sin(a) * r).normalize();
+}
+// how bad a wound is, to pick the reaction that leads when several land at once
+function severity(w) {
+  const t = w.part.n.replace(/[LR]$/, '');
+  if (w.brain || w.cervical) return 100;
+  if (w.spine) return 90;
+  if (w.arrest) return 80;
+  if (t === 'pelvis' && w.bone) return 70;
+  if ((t === 'thigh' || t === 'shin') && w.bone) return 60;
+  if (t === 'chest' || t === 'abdomen') return 50 + Math.min(9, w.rate / 5);
+  if (t === 'head') return 45;
+  return 10 + Math.min(9, w.rate);
+}
 function shoot(clientX, clientY) {
   const r = canvas.getBoundingClientRect();
   ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
-  const ray = raycaster.ray;
+  const ray = raycaster.ray.clone();
   for (const m of modelMeshes) m.computeBoundingSphere();
-  const hits = raycaster.intersectObjects([...modelMeshes, floor], false);
-  const hit = hits[0];
-  let end = hit ? hit.point.clone() : ray.at(60, new THREE.Vector3());
-  const muzzle = camera.position.clone()
-    .add(new THREE.Vector3(0.12, -0.12, 0).applyQuaternion(camera.quaternion));
-  const p = weapon.m * weapon.v * impulseMult;
-  const dir = end.clone().sub(muzzle).normalize();
-  tracer(muzzle, end);
-
-  let partHit = null;
-  if (hit && hit.object !== floor) {
-    partHit = partAt(hit.point);
-  }
-  if (partHit) {
-    const b = partHit.body;
-    b.applyImpulseAtPoint({ x: dir.x * p, y: dir.y * p, z: dir.z * p }, hit.point, true);
-    const wound = addWound(partHit, hit, dir);
+  const muzzle = camera.position.clone().add(new THREE.Vector3(0.12, -0.12, 0).applyQuaternion(camera.quaternion));
+  const n = weapon.pellets || 1;
+  const p = weapon.m * weapon.v * impulseMult; // per projectile
+  const wounds = [];
+  let hit = null, partHit = null, delivered = 0;
+  for (let i = 0; i < n; i++) {
+    const d = n > 1 ? spreadDir(ray.direction, weapon.spread) : ray.direction.clone();
+    raycaster.set(ray.origin, d);
+    const h = raycaster.intersectObjects([...modelMeshes, floor], false)[0];
+    if (i === 0) hit = h;
+    const end = h ? h.point.clone() : ray.origin.clone().addScaledVector(d, 60);
+    const dir = end.clone().sub(muzzle).normalize();
+    tracer(muzzle, end, n > 1 ? 0.45 : 0.9);
+    if (!h) continue;
+    if (h.object === floor) { if (n > 1) dust(h.point, 3); continue; }
+    const part = partAt(h.point);
+    part.body.applyImpulseAtPoint({ x: dir.x * p, y: dir.y * p, z: dir.z * p }, h.point, true);
+    delivered += p;
+    const w = addWound(part, h, dir);
     // which side of the body was hit, in the mannequin's own frame (+1 = its left)
-    const local = hit.point.clone().sub(vecOf(byName.chest.body.translation()))
+    const local = h.point.clone().sub(vecOf(byName.chest.body.translation()))
       .applyQuaternion(toQ(byName.chest.body.rotation(), new THREE.Quaternion()).invert());
-    const side = Math.abs(local.x) < 0.04 ? 0 : Math.sign(local.x);
-    const zone = partHit.n;
-    const res = react(zone, side, dir, wound);
-    readout(wound.zone, p, p / b.mass(), p / totalMass);
-    log('hit', wound.zone, res.text, `Канал${wound.perforating ? ' сквозной' : ', пуля осталась в теле'}: ${wound.name}. Кровотечение ~${fmtRate(wound.rate)}. Δv тела ${(p / totalMass * 100).toFixed(1)} см/с`);
-    if (wound.arrest && character.conscious) log('info', 'Кровообращение', `Сердце или аорта: давление падает сразу, сознание уйдёт примерно через ${(character.arrestAt - character.physT).toFixed(0)} с.`);
-    if (p / totalMass > 0.4 && character.balanceTarget > 0) { // only a movie-sized push can knock the body off balance
+    wounds.push({ w, dir, side: Math.abs(local.x) < 0.04 ? 0 : Math.sign(local.x), part });
+  }
+  raycaster.set(ray.origin, ray.direction);
+  if (wounds.length) {
+    // the worst wound leads the reaction; the others still apply their own effects
+    wounds.sort((a, b) => severity(b.w) - severity(a.w));
+    const lead = wounds[0];
+    let text = '';
+    for (const x of wounds) { const res = react(x.part.n, x.side, x.dir, x.w); if (x === lead) text = res.text; }
+    const totalRate = wounds.reduce((a, x) => a + x.w.rate, 0);
+    const zones = [...new Set(wounds.map(x => x.w.zone))].join(', ');
+    readout(n > 1 ? `${wounds.length} из ${n}: ${zones}` : lead.w.zone, delivered, p / lead.part.body.mass(), delivered / totalMass);
+    if (n > 1) log('hit', `Картечь ${wounds.length}/${n}`, text,
+      `Попали в: ${wounds.map(x => `${x.w.zone} (${x.w.name})`).join('; ')}. Кровотечение ~${fmtRate(totalRate)}. Δv тела ${(delivered / totalMass * 100).toFixed(1)} см/с`);
+    else log('hit', lead.w.zone, text, `Канал${lead.w.perforating ? ' сквозной' : ', пуля осталась в теле'}: ${lead.w.name}. Кровотечение ~${fmtRate(lead.w.rate)}. Δv тела ${(delivered / totalMass * 100).toFixed(1)} см/с`);
+    if (wounds.some(x => x.w.arrest) && character.conscious) log('info', 'Кровообращение', `Сердце или аорта: давление падает сразу, сознание уйдёт примерно через ${(character.arrestAt - character.physT).toFixed(0)} с.`);
+    if (delivered / totalMass > 0.4 && character.balanceTarget > 0) { // only a movie-sized push can knock the body off balance
       character.balanceTarget = 0; character.balanceRate = 30;
       tone([...LEG('L'), ...LEG('R')], 0.3, 10);
       log('info', 'Сбит с ног', 'Такой толчок выбивает из равновесия. Настоящая пуля этого не делает.');
     }
     return;
   }
+  const pAll = p * n;
 
   // near miss: closest approach of the bullet path to head / chest / pelvis
   const travel = hit ? hit.distance : 60;
@@ -954,7 +988,7 @@ function shoot(clientX, clientY) {
   if (hit && hit.object === floor) dust(hit.point);
   const pelvisPos = vecOf(byName.pelvis.body.translation());
   const floorDist = hit && hit.object === floor ? Math.hypot(hit.point.x - pelvisPos.x, hit.point.z - pelvisPos.z) : Infinity;
-  readout('промах', p, 0, 0);
+  readout('промах', pAll, 0, 0);
   const side = sideOfShot(ray);
   if (best < 0.9) {
     startle(1 - best / 0.9, side);
@@ -974,17 +1008,17 @@ function sideOfShot(ray) {
 }
 const vecOf = v => new THREE.Vector3(v.x, v.y, v.z);
 
-function tracer(a, b) {
+function tracer(a, b, alpha = 0.9) {
   const g = new THREE.BufferGeometry().setFromPoints([a, b]);
-  const mat = tracerMat.clone(); mat.opacity = 0.9;
+  const mat = tracerMat.clone(); mat.opacity = alpha;
   const line = new THREE.Line(g, mat);
   scene.add(line);
-  effects.push({ obj: line, life: 0.35, age: 0, update(e, k) { e.obj.material.opacity = 0.9 * (1 - k); } });
+  effects.push({ obj: line, life: 0.35, age: 0, update(e, k) { e.obj.material.opacity = alpha * (1 - k); } });
 }
-function dust(pt) {
+function dust(pt, count = 10) {
   const geo = new THREE.IcosahedronGeometry(0.02, 0);
   const mat = new THREE.MeshBasicMaterial({ color: cssVar('--scene-grid'), transparent: true });
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < count; i++) {
     const m = new THREE.Mesh(geo, mat);
     m.position.copy(pt);
     const v = new THREE.Vector3((Math.random() - 0.5) * 1.2, 0.6 + Math.random() * 1.2, (Math.random() - 0.5) * 1.2);
@@ -1142,7 +1176,7 @@ const UP_Y = new THREE.Vector3(0, 1, 0);
 const dropGeo = new THREE.IcosahedronGeometry(1, 1), poolGeo = new THREE.CircleGeometry(1, 12).rotateX(-Math.PI / 2);
 const channelMat = new THREE.LineBasicMaterial({ color: 0xffd23f, depthTest: false });
 
-const HOLE = { pistol: [0.0045, 0.008], rifle: [0.0035, 0.018], slug: [0.009, 0.015] }; // entry and exit radius, m
+const HOLE = { pistol: [0.0045, 0.008], rifle: [0.0035, 0.018], buck: [0.0045, 0.006], slug: [0.009, 0.015] }; // entry and exit radius, m
 function addWound(part, hit, dir) {
   const c = character;
   const type = part.n.replace(/[LR]$/, '');
@@ -1503,7 +1537,8 @@ WEAPONS.forEach((w, i) => {
   const b = document.createElement('button');
   b.type = 'button'; b.className = 'weapon'; b.id = 'w-' + w.id;
   b.setAttribute('aria-pressed', i === 0);
-  b.innerHTML = `<b>${w.name}</b><span class="p">${(w.m * w.v).toFixed(1)} Н·с</span><span class="spec">${w.m * 1000} г × ${w.v} м/с</span>`;
+  const n = w.pellets || 1;
+  b.innerHTML = `<b>${w.name}</b><span class="p">${(w.m * w.v * n).toFixed(1)} Н·с</span><span class="spec">${n > 1 ? n + ' × ' : ''}${(w.m * 1000).toLocaleString('ru')} г × ${w.v} м/с</span>`;
   b.onclick = () => { weapon = w; wEl.querySelectorAll('.weapon').forEach(x => x.setAttribute('aria-pressed', x === b)); };
   wEl.append(b);
 });
