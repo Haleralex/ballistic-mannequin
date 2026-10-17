@@ -169,7 +169,7 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
     </div>
     <div id="replayBadge" class="overlay" hidden>ПОВТОР ×0.25</div>
     <div id="caption" class="overlay" hidden><span id="captionText"></span></div>
-    <div id="hint" class="overlay">Клик по манекену — выстрел из точки камеры. Клик рядом — пролёт пули или попадание в пол. Перетаскивание — вращение камеры, колесо — приближение. <kbd>Space</kbd> пауза, <kbd>R</kbd> сброс, <kbd>P</kbd> повтор, <kbd>X</kbd> рентген.</div>
+    <div id="hint" class="overlay">Клик по манекену — выстрел из точки камеры. Клик рядом — пролёт пули или попадание в пол. Перетаскивание — вращение камеры, <kbd>Shift</kbd> + перетаскивание — сдвиг, колесо — приближение. <kbd>Space</kbd> пауза, <kbd>R</kbd> сброс, <kbd>P</kbd> повтор, <kbd>X</kbd> рентген.</div>
     <div id="loading" class="overlay">загрузка физики и модели…</div>
   </div>
 
@@ -401,6 +401,9 @@ controls.target.set(0, 1.0, 0);
 // no inertia: with damping the camera only catches up over the following frames, so on a slow GPU it lags behind
 // the hand and keeps sliding after the button is released
 controls.enableDamping = false;
+// the right button stays free: browsers with mouse gestures (Vivaldi, Opera) turn a right-button drag into "back".
+// Panning is Shift + drag or the middle button.
+controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: null };
 controls.maxPolarAngle = Math.PI * 0.495;
 controls.minDistance = 1.5; controls.maxDistance = 60;
 controls.update();
@@ -2613,7 +2616,7 @@ addEventListener('keydown', e => {
 
 // click = shot, drag = orbit
 let down = null;
-canvas.addEventListener('pointerdown', e => { down = { x: e.clientX, y: e.clientY }; });
+canvas.addEventListener('pointerdown', e => { down = e.button === 0 && !e.shiftKey ? { x: e.clientX, y: e.clientY } : null; }); // only a plain left click shoots
 canvas.addEventListener('pointerup', e => {
   if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 6 && !replay) shoot(e.clientX, e.clientY);
   down = null;
