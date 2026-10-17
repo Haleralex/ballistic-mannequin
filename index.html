@@ -521,11 +521,90 @@ function resetRig() {
   model.position.set(0, 0, 0); model.quaternion.identity(); model.updateMatrixWorld(true);
 }
 const rq = new THREE.Quaternion(), rq2 = new THREE.Quaternion(), rv = new THREE.Vector3();
-// turn a bone about the world vertical, for looking back over the shoulder
-function turnBone(b, yaw) {
+// turn a bone about a world axis (the vertical by default), on top of what the clip gave it
+function turnBone(b, angle, axis = UP) {
   b.parent.getWorldQuaternion(pq);
-  rq.setFromAxisAngle(UP, yaw);
+  rq.setFromAxisAngle(axis, angle);
   b.quaternion.premultiply(rq2.copy(pq).invert().multiply(rq).multiply(pq));
+  b.updateMatrixWorld(true);
+}
+// set a bone's world rotation part of the way toward a target
+function aimBone(b, target, wgt) {
+  b.getWorldQuaternion(rq).slerp(target, wgt);
+  b.parent.getWorldQuaternion(pq);
+  b.quaternion.copy(pq.invert().multiply(rq));
+  b.updateMatrixWorld(true);
+}
+const restOf = name => DRIVE.find(d => d.bone === rigBones[name]).rest;
+const ax1 = new THREE.Vector3(), ax2 = new THREE.Vector3(), cq = new THREE.Quaternion(), uq = new THREE.Quaternion(), fq = new THREE.Quaternion(), eq = new THREE.Euler();
+// A hit taken at a run, on top of the clip: the jolt (an arch when shot in the back, a fold from the front, the arms
+// thrown out, the trunk twisting to the hit side), a sideways lurch, then a hand pressed to the wound for the rest of the run.
+function runHitPose(r) {
+  const h = r.hit;
+  if (!h) return;
+  const t = r.t - h.t0;
+  const e = h.k * (t < 0.06 ? t / 0.06 : Math.exp(-(t - 0.06) / 0.35));
+  ax1.set(Math.cos(r.heading), 0, -Math.sin(r.heading)); // the runner's left-right axis: + bends forward
+  ax2.set(Math.sin(r.heading), 0, Math.cos(r.heading));  // the runner's forward axis: + raises the left arm outward
+  if (e > 0.01) {
+    const bend = h.front ? 0.7 : -0.8;
+    turnBone(rigBones.Spine, bend * 0.3 * e, ax1); turnBone(rigBones.Spine1, bend * 0.3 * e, ax1); turnBone(rigBones.Spine2, bend * 0.4 * e, ax1);
+    turnBone(rigBones.Spine2, h.side * 0.35 * e);
+    turnBone(rigBones.Head, (h.front ? 0.4 : -0.55) * e, ax1);
+    turnBone(rigBones.LeftArm, 1.0 * e, ax2); turnBone(rigBones.RightArm, -1.0 * e, ax2);
+    turnBone(rigBones.LeftShoulder, 0.25 * e, ax2); turnBone(rigBones.RightShoulder, -0.25 * e, ax2);
+  }
+  // the hand goes to the wound once the jolt has passed
+  const c = h.clutch, wc = c ? Math.max(0, Math.min(0.85, (t - 0.3) / 0.4 * 0.85)) : 0;
+  if (wc > 0) {
+    const S = c.S, B = S === 'L' ? 'Left' : 'Right', pose = armPose(c.kind, S, 0.9);
+    rigBones.Spine2.getWorldQuaternion(cq).multiply(PART_REST.chest.qInv);
+    const bu = BASE['uArm' + S], bf = BASE['fArm' + S], pu = pose['uArm' + S], pf = pose['fArm' + S];
+    uq.copy(cq).multiply(rq.setFromEuler(eq.set(bu[0] + pu[0], bu[1] + pu[1], bu[2] + pu[2], 'XYZ')));
+    fq.copy(uq).multiply(rq.setFromEuler(eq.set(bf[0] + pf[0], bf[1] + pf[1], bf[2] + pf[2], 'XYZ')));
+    aimBone(rigBones[B + 'Arm'], rq2.copy(uq).multiply(restOf(B + 'Arm')), wc);
+    aimBone(rigBones[B + 'ForeArm'], rq2.copy(fq).multiply(restOf(B + 'ForeArm')), wc);
+    aimBone(rigBones[B + 'Hand'], rq2.copy(fq).multiply(restOf(B + 'Hand')), wc);
+  }
+}
+// pace from the wounds: a healthy person sprints; a wound in the leg leaves a fast walk, blood loss and a torso wound slow it
+function runPace(k) {
+  const c = character, zones = c.wounds.map(w => ZONE_KIND(w.zone));
+  let v = 3.4 + 0.8 * k;
+  if (zones.includes('leg')) v *= 0.45;
+  if (zones.includes('abdomen') || zones.includes('chest') || zones.includes('pelvis')) v *= 0.75;
+  return v * c.vigor;
+}
+function setRunClip(r, clip) {
+  if (r.clip === clip) return;
+  const next = mixer.clipAction(CLIPS[clip]);
+  next.reset().setEffectiveWeight(1).play();
+  r.action.crossFadeTo(next, 0.4, false);
+  r.action = next; r.clip = clip;
+}
+// A shot that lands while running. Something that takes the legs (a leg, the pelvis, the spine) has already
+// ended the run. A wound in the back or the belly drops some people on the spot, and buckshot drops most;
+// everyone else jolts, staggers, loses speed and keeps running with a hand on the wound.
+// Returns whether the run goes on.
+function runHit(wounds) {
+  const c = character, r = c.run;
+  if (!r || r.mode !== 'go') return false;
+  if (!canRun()) { releaseRun(true); c.fellRunning = true; return false; } // the wound took the legs (the spine, say): down at once
+  if (!wounds.length) { r.hit = { t0: r.t, k: 0.45, front: false, side: 0 }; return true; } // a bullet past the ear: a duck, then faster
+  const kind = incidentKind(wounds), lead = wounds[0];
+  const drops = kind === 'multi' ? 0.75 : ['chest', 'abdomen', 'pelvis-soft', 'neck'].includes(kind) ? 0.35 : 0;
+  if (Math.random() < drops) {
+    releaseRun(true);
+    c.balanceTarget = 0; c.balanceRate = 2.5; c.noLift = true; c.fellRunning = true;
+    return false;
+  }
+  const zk = ZONE_KIND(lead.w.zone), near = lead.side > 0 ? 'L' : lead.side < 0 ? 'R' : (Math.random() < 0.5 ? 'L' : 'R');
+  const S = zk === 'arm' ? (near === 'L' ? 'R' : 'L') : near;
+  r.hit = { t0: r.t, k: 1, front: lead.fromFront, side: lead.side || 0, clutch: zk === 'head' && !lead.w.brain ? { kind: 'head', S } : { kind: zk, S } };
+  r.v = Math.max(0.6, r.v * 0.35);
+  r.vmax = Math.min(r.vmax, runPace(0.6));
+  if (r.vmax < 2.4) setRunClip(r, 'walk');
+  return true;
 }
 function startRun(vmax, dirH) {
   const c = character, pel = byName.pelvis.body, pt = pel.translation();
@@ -566,6 +645,9 @@ function runAnim(dt) {
   if (!r) return;
   if (!canRun()) { releaseRun(true); return; }
   r.t += dt;
+  // a run no script holds any more winds down on its own
+  r.orphan = r.owner ? 0 : (r.orphan || 0) + dt;
+  if (r.mode === 'go' && r.orphan > 1.5) r.mode = 'stop';
   const turnLeft = wrapAngle(r.dirH - r.heading);
   if (r.mode === 'go') {
     r.heading = wrapAngle(r.heading + Math.sign(turnLeft) * Math.min(Math.abs(turnLeft), 6 * dt));
@@ -585,6 +667,14 @@ function runAnim(dt) {
   if (r.idle && r.t - r.idleT > 0.5) { releaseRun(false); return; }
   mixer.update(dt);
   model.position.set(r.root.x, 0, r.root.z);
+  if (r.hit) { // the hit throws the stride off: the legs give for a moment and the body lurches to one side
+    const lt = (r.t - r.hit.t0) / 0.55;
+    if (lt < 1) {
+      const bump = Math.sin(lt * Math.PI) * r.hit.k, d = -0.24 * (r.hit.side || 0) * bump;
+      model.position.x += Math.cos(r.heading) * d; model.position.z -= Math.sin(r.heading) * d;
+      model.position.y -= 0.09 * bump;
+    }
+  }
   model.quaternion.setFromAxisAngle(UP, r.heading);
   // halfway, a glance back at the shooter over the nearer shoulder
   const lt = (r.t - r.lookAt) / 1.1;
@@ -597,6 +687,7 @@ function runAnim(dt) {
     turnBone(rigBones.Head, yaw * 0.4);
   }
   model.updateMatrixWorld(true);
+  runHitPose(r);
   // the bodies follow the skeleton; at the start they blend in from where the ragdoll was
   r.w = Math.min(1, r.t / 0.3);
   for (const p of parts) {
@@ -905,8 +996,8 @@ const wrapAngle = a => Math.atan2(Math.sin(a), Math.cos(a));
 // at that pose. Anything that takes the legs or consciousness away hands the body back at once with the
 // velocity it had: the ragdoll stumbles on and falls.
 function brakeRun() { if (character.run) releaseRun(true); }
-// while the clip runs the body, scripted poses cannot act: only breathing and fainting go through
-const RUN_ALLOWED = ['gasp', 'faint'];
+// while the clip runs the body, scripted poses cannot act: only breathing, fainting and the run itself go through
+const RUN_ALLOWED = ['gasp', 'faint', 'flee'];
 
 // ---------- reactions ----------
 // caps hold what an injury makes impossible (a paralysed or broken limb cannot be tensed again)
@@ -1206,21 +1297,18 @@ const ACTIONS = {
   freeze(b) { return { update() { character.lifeDamp = 0.15; }, end() { character.lifeDamp = 1; } }; },
   flee(b) {
     const c = character;
+    const stop = () => { if (c.run && c.run.owner === b && c.run.mode === 'go') c.run.mode = 'stop'; };
+    if (c.run && c.run.mode === 'go') { c.run.owner = b; return { update(t) { if (t > b.dur - 0.6) stop(); }, end: stop }; } // hit on the way: keep going
     if (c.run || !canRun()) return null;
     const p = byName.pelvis.body.translation();
     // away from the shooter, angled off to one side the way people run for cover
     const away = Math.atan2(p.x - camera.position.x, p.z - camera.position.z);
     const off = b.dir === 'left' ? 0.55 : b.dir === 'right' ? -0.55 : (Math.random() - 0.5) * 0.9;
-    // pace: a healthy person sprints; a wound in the leg makes a limping jog, blood loss and a torso wound slow it
-    const zones = c.wounds.map(w => ZONE_KIND(w.zone));
-    let vmax = 3.4 + 0.8 * b.intensity;
-    if (zones.includes('leg')) vmax *= 0.45;
-    if (zones.includes('abdomen') || zones.includes('chest') || zones.includes('pelvis')) vmax *= 0.75;
-    vmax *= c.vigor;
+    const vmax = runPace(b.intensity);
     // poses held from before would pull the body back into them once the run hands it back
     for (const l of layers) if (l.tag !== 'life') fadeOut(l, 0.3);
     startRun(vmax, wrapAngle(away + off));
-    const stop = () => { if (c.run && c.run.mode === 'go') c.run.mode = 'stop'; };
+    c.run.owner = b;
     return { update(t) { if (t > b.dur - 0.6) stop(); }, end: stop };
   },
   faint(b) {
@@ -1456,7 +1544,8 @@ function incidentKind(hits) {
 }
 function libraryScript(rep, hits) {
   const c = character, R = Math.random, pick = a => a[Math.floor(R() * a.length)];
-  const kind = incidentKind(hits), low = c.state === 'down' || c.seated;
+  const kind = incidentKind(hits), low = c.state === 'down' || c.seated || c.fellRunning;
+  c.fellRunning = false;
   let pool = SCENARIOS.filter(s => s.kinds.includes(kind));
   if (low && hits.length && ['chest', 'abdomen'].includes(kind)) pool = pool.concat(SCENARIOS.filter(s => s.kinds.includes('down')));
   const fits = pool.filter(s => s.posture === 'any' || s.posture === (low ? 'down' : 'standing'));
@@ -1520,6 +1609,7 @@ function updateAiNote() {
 let reactMode = 'auto';
 const FLEE_CHANCE = { near: 0.6, arm: 0.55, 'head-graze': 0.4, heart: 0.35, chest: 0.35, abdomen: 0.3, leg: 0.3, 'pelvis-soft': 0.25, neck: 0.15, multi: 0.15 };
 function wantsFlee(hits) {
+  if (character.run && character.run.mode === 'go') return true; // already running: the new script carries on with it
   if (reactMode === 'stay' || character.run || !canRun()) return false;
   return reactMode === 'flee' || Math.random() < (FLEE_CHANCE[incidentKind(hits)] ?? 0);
 }
@@ -1527,10 +1617,15 @@ function wantsFlee(hits) {
 function fleeScript(lib, hits) {
   const R = Math.random, pick = a => a[Math.floor(R() * a.length)];
   const lead = hits[0], side = lead ? (lead.side || 1) : (R() < 0.5 ? 1 : -1);
-  const zk = lead ? ZONE_KIND(lead.w.zone) : null, near = side > 0 ? 'L' : 'R', far = near === 'L' ? 'R' : 'L';
-  const go = 0.25 + R() * 0.35, run = 3.5 + R() * 4;
+  const zk = lead ? ZONE_KIND(lead.w.zone) : null;
   const meta = { zoneKind: zk, sideSign: side };
-  const beats = [
+  const onTheRun = character.run && character.run.mode === 'go';
+  const go = onTheRun ? 0 : 0.25 + R() * 0.35, run = onTheRun ? 2 + R() * 3 : 3.5 + R() * 4;
+  const beats = onTheRun ? [
+    { ...meta, t: 0, dur: run, action: 'flee', intensity: 0.8, note: lead
+      ? 'Попадание на бегу: тело дёргается, шаг сбивается, но он бежит дальше, зажимая рану'
+      : 'Пуля проходит рядом: пригибается на бегу и ускоряется' },
+  ] : [
     { ...meta, t: 0, dur: 0.6, action: 'look', at: 'shooter', intensity: 0.9, note: 'Засекает, откуда стреляют' },
     { ...meta, t: go, dur: run, action: 'flee', dir: pick(['left', 'right', 'back']), intensity: 0.6 + R() * 0.4,
       note: lead ? 'Бежит прочь, несмотря на рану, на бегу оглядывается: адреналин глушит боль' : 'Бросается прочь от стрелка, на бегу оглядывается' },
@@ -1544,6 +1639,7 @@ function composeAfterShot(hits, nearMiss) {
   if (!rep.conscious) { stopScript(); renderScript(null, 'Без сознания: поведения нет.'); return; }
   const flee = wantsFlee(hits);
   rep.runs_away = flee;
+  if (character.run) character.run.owner = null; // the old script lets go of the run without stopping it
   const lib = libraryScript(rep, hits);
   if (flee) startScript(fleeScript(lib, hits), { source: lib ? 'lib' : 'proc', title: 'Убегает' + (lib ? ' · ' + lib.title : ''), temperament: lib?.temperament || 'испуганный', id: lib ? lib.id : '' });
   else if (lib) startScript(lib.beats, { source: 'lib', title: lib.title, temperament: lib.temperament, id: lib.id });
@@ -1775,6 +1871,7 @@ function shoot(clientX, clientY) {
       `Попали в: ${wounds.map(x => `${x.w.zone} (${x.w.name})`).join('; ')}. Кровотечение ~${fmtRate(totalRate)}. Δv тела ${(delivered / totalMass * 100).toFixed(1)} см/с`);
     else log('hit', lead.w.zone, text, `Канал${lead.w.perforating ? ' сквозной' : ', пуля осталась в теле'}: ${lead.w.name}. Кровотечение ~${fmtRate(lead.w.rate)}. Δv тела ${(delivered / totalMass * 100).toFixed(1)} см/с`);
     if (wounds.some(x => x.w.arrest) && character.conscious) log('info', 'Кровообращение', `Сердце или аорта: давление падает сразу, сознание уйдёт примерно через ${(character.arrestAt - character.physT).toFixed(0)} с.`);
+    runHit(wounds);
     if (delivered / totalMass > 0.4 && character.balanceTarget > 0) { // only a movie-sized push can knock the body off balance
       character.balanceTarget = 0; character.balanceRate = 30;
       tone([...LEG('L'), ...LEG('R')], 0.3, 10);
@@ -1800,6 +1897,7 @@ function shoot(clientX, clientY) {
   const floorDist = hit && hit.object === floor ? Math.hypot(hit.point.x - pelvisPos.x, hit.point.z - pelvisPos.z) : Infinity;
   readout('промах', pAll, 0, 0);
   const side = sideOfShot(ray);
+  if (best < 0.9) runHit([]);
   if (best < 0.9 || floorDist < 1.5) composeAfterShot([], best < 0.9 ? Math.round(best * 100) : Math.round(floorDist * 100));
   if (best < 0.9) {
     startle(1 - best / 0.9, side);
