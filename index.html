@@ -113,6 +113,7 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
 .scr-badge { font-family: var(--font-data); font-size: 11px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
 .scr-badge[data-src="ai"] { color: var(--accent); border-color: var(--accent); }
 .scr-badge[data-src="wait"] { color: var(--warn); border-color: var(--warn); }
+.scr-badge[data-src="lib"] { color: var(--ok); border-color: var(--ok); }
 #scrTitle { font-weight: 600; }
 #scrList { position: relative; list-style: none; margin: 8px 0 0; padding: 0; max-height: 280px; overflow-y: auto; display: grid; gap: 2px; font-size: 13px; }
 #scrList li { display: grid; grid-template-columns: 42px 1fr; gap: 8px; padding: 4px 6px; border-radius: 4px; color: var(--muted); }
@@ -247,8 +248,8 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
       <h2 id="h-scr">Сценарий поведения</h2>
       <div class="scr-head"><span class="scr-badge" id="scrBadge" data-src="none">нет</span><span id="scrTitle">Выстрелите: после каждого выстрела поведение сочиняется заново.</span></div>
       <ol id="scrList"></ol>
-      <label class="check" for="aiBox"><input type="checkbox" id="aiBox" checked> Сочинять сценарий через Claude</label>
-      <p class="note" id="aiNote">Claude получает, что задето и в каком состоянии тело, и пишет поведение на минуту вперёд. Запросы идут через ваш аккаунт Claude. Без него работает процедурный генератор.</p>
+      <label class="check" for="aiBox"><input type="checkbox" id="aiBox"> Сочинять сценарий через Claude (тратит лимит)</label>
+      <p class="note" id="aiNote">Сценарии берутся из встроенной библиотеки: 100 сценариев, бесплатно.</p>
     </section>
 
     <section aria-labelledby="h-log">
@@ -426,6 +427,7 @@ function meshFor(d) {
 
 // ---------- model ----------
 // Visible body: the Mixamo X Bot from the three.js examples. Its skeleton is driven by the physics bodies.
+const { default: SCENARIOS } = await import('./scenarios.js'); // 100 hand-written behaviour scenarios
 const { default: XBOT } = await import('./xbot.js'); // the glb as base64: artifact hosting serves .js but not .glb
 const gltf = await new GLTFLoader().parseAsync(Uint8Array.from(atob(XBOT), ch => ch.charCodeAt(0)).buffer, '');
 const model = gltf.scene;
@@ -1218,8 +1220,74 @@ function proceduralBeats(rep, hits) {
   return beats;
 }
 
-let sampleFn = null, sampleState = window.claude?.use ? 'pending' : 'none', aiWanted = true, aiOff = false;
-const AI_NOTE = 'Claude получает, что задето и в каком состоянии тело, и пишет поведение на минуту вперёд. Запросы идут через ваш аккаунт Claude. Без него работает процедурный генератор.';
+// ---------- scenario library ----------
+// The incident picks a scenario kind; one of the matching scenarios is drawn (recent ones are avoided)
+// and varied: hands and knees follow the wound side, the tempo follows the bleeding, intensities and
+// minor beats change, and a late phase is added so the behaviour runs for a minute or more.
+const recentScenarios = [];
+function incidentKind(hits) {
+  if (!hits.length) return 'near';
+  const ws = hits.map(x => x.w);
+  if (ws.some(w => w.arrest)) return 'heart';
+  if (ws.some(w => w.spine)) return 'spine';
+  if (hits.length >= 3) return 'multi';
+  const w = hits[0].w, t = w.part.n.replace(/[LR]$/, '');
+  if (t === 'head') return w.zone === 'шея' ? 'neck' : 'head-graze';
+  if (t === 'pelvis') return w.bone ? 'pelvis' : 'pelvis-soft';
+  if (t === 'thigh' || t === 'shin' || t === 'foot') return w.bone ? 'leg-bone' : 'leg';
+  if (t === 'uArm' || t === 'fArm') return 'arm';
+  return t; // chest | abdomen
+}
+function libraryScript(rep, hits) {
+  const c = character, R = Math.random, pick = a => a[Math.floor(R() * a.length)];
+  const kind = incidentKind(hits), low = c.state === 'down' || c.seated;
+  let pool = SCENARIOS.filter(s => s.kinds.includes(kind));
+  if (low && hits.length && ['chest', 'abdomen'].includes(kind)) pool = pool.concat(SCENARIOS.filter(s => s.kinds.includes('down')));
+  const fits = pool.filter(s => s.posture === 'any' || s.posture === (low ? 'down' : 'standing'));
+  if (fits.length) pool = fits;
+  const fresh = pool.filter(s => !recentScenarios.includes(s.id));
+  const sc = pick(fresh.length ? fresh : pool);
+  if (!sc) return null;
+  recentScenarios.push(sc.id); if (recentScenarios.length > 6) recentScenarios.shift();
+  const lead = hits[0], side = lead ? (lead.side || (R() < 0.5 ? 1 : -1)) : (R() < 0.5 ? 1 : -1);
+  const near = side > 0 ? 'L' : 'R', far = near === 'L' ? 'R' : 'L';
+  const lr = v => v === 'near' ? near : v === 'far' ? far : v;
+  // tempo: a heart wound runs to its own clock; fast bleeding hurries the rest, slow bleeding stretches it
+  const eta = rep.estimated_seconds_until_unconscious;
+  let scale = 0.85 + R() * 0.35;
+  if (kind === 'heart' && eta !== null) { const faint = sc.beats.find(b => b[2] === 'faint'); scale = faint ? Math.max(0.6, eta / faint[0]) : 1; }
+  else if (eta !== null && eta < 60) scale *= 0.8;
+  else if (eta === null || eta > 200) scale *= 1.2;
+  const beats = [];
+  for (const [t, dur, action, arg, k, note] of sc.beats) {
+    if (!['faint', 'sit', 'lie_down', 'kneel', 'clutch'].includes(action) && R() < 0.1) continue; // a minor beat drops out
+    const b = { t: t * scale, dur: Math.max(0.5, dur * scale), action, intensity: Math.max(0.2, Math.min(1, k + (R() - 0.5) * 0.3)), note, zoneKind: lead ? ZONE_KIND(lead.w.zone) : null, sideSign: side };
+    if (action === 'look') b.at = arg === 'shooter' && R() < 0.15 ? 'around' : arg;
+    else if (action === 'clutch') b.hand = arg === 'both' ? 'both' : lr(arg);
+    else if (action === 'reach') { const [h, d] = arg.split(':'); b.hand = lr(h); b.dir = d; }
+    else if (action === 'stagger') b.dir = arg;
+    else if (action === 'kneel') b.knee = lr(arg);
+    beats.push(b);
+  }
+  // late phase until well past a minute, unless the heart has already set the end
+  if (kind !== 'heart') {
+    let t = Math.max(...beats.map(b => b.t + b.dur), 0) + 1;
+    const end = 70 + R() * 30;
+    const late = [
+      () => ({ action: 'look', at: pick(['wound', 'shooter', 'up', 'around', 'down']), dur: 2 + R() * 4, intensity: 0.3 + R() * 0.4, note: pick(['Медленно поднимает взгляд', 'Снова смотрит на рану', 'Озирается, ищет помощь']) }),
+      () => ({ action: 'clutch', hand: pick(['both', near]), dur: 6 + R() * 10, intensity: 0.4 + R() * 0.4, note: 'Держит руку на ране' }),
+      () => ({ action: 'gasp', dur: 8 + R() * 10, intensity: 0.4 + R() * 0.5, note: 'Дышит часто и неглубоко' }),
+      () => ({ action: 'tremble', dur: 4 + R() * 8, intensity: 0.3 + R() * 0.4, note: 'Мелкая дрожь' }),
+      () => ({ action: 'freeze', dur: 3 + R() * 6, intensity: 0.5, note: 'Почти не двигается' }),
+      () => ({ action: low || kind === 'spine' ? pick(['curl', 'try_rise']) : pick(['rock', 'double_over']), dur: 3 + R() * 5, intensity: 0.3 + R() * 0.4, note: 'Боль накатывает снова' }),
+    ];
+    while (t < end) { beats.push({ t, zoneKind: lead ? ZONE_KIND(lead.w.zone) : null, sideSign: side, ...pick(late)() }); t += 2 + R() * 4; }
+  }
+  return { beats: beats.sort((a, b) => a.t - b.t), title: sc.title, temperament: sc.temp, id: sc.id };
+}
+
+let sampleFn = null, sampleState = window.claude?.use ? 'pending' : 'none', aiWanted = false, aiOff = false;
+const AI_NOTE = 'По умолчанию сценарий берётся из встроенной библиотеки: 100 сценариев, бесплатно. С галочкой Claude пишет новый сценарий под каждый выстрел и тратит лимит вашего аккаунта.';
 if (sampleState === 'pending') window.claude.use('sample').then(fn => { sampleFn = fn; sampleState = fn ? 'ready' : 'none'; updateAiNote(); }, () => { sampleState = 'none'; updateAiNote(); });
 function updateAiNote() {
   const box = document.getElementById('aiBox'), note = document.getElementById('aiNote');
@@ -1228,13 +1296,15 @@ function updateAiNote() {
   box.checked = ready && aiWanted;
   note.textContent = ready ? AI_NOTE
     : sampleState === 'pending' ? 'Подключение к Claude…'
-    : aiOff ? 'Claude недоступен в этом просмотре: сценарии пишет процедурный генератор.'
-    : 'Claude доступен, только когда страница открыта на claude.ai. Здесь сценарии пишет процедурный генератор.';
+    : aiOff ? 'Claude недоступен в этом просмотре: сценарии берутся из библиотеки.'
+    : 'Сценарии берутся из встроенной библиотеки. Claude доступен, только когда страница открыта на claude.ai.';
 }
 function composeAfterShot(hits, nearMiss) {
   const rep = incidentReport(hits, nearMiss);
   if (!rep.conscious) { stopScript(); renderScript(null, 'Без сознания: поведения нет.'); return; }
-  startScript(proceduralBeats(rep, hits), { source: 'proc', title: hits.length ? 'Процедурный сценарий' : 'Испуг', temperament: '' });
+  const lib = libraryScript(rep, hits);
+  if (lib) startScript(lib.beats, { source: 'lib', title: lib.title, temperament: lib.temperament, id: lib.id });
+  else startScript(proceduralBeats(rep, hits), { source: 'proc', title: hits.length ? 'Процедурный сценарий' : 'Испуг', temperament: '' });
   if (!sampleFn || !aiWanted || aiOff) return;
   const ctl = new AbortController();
   script.ctl = ctl; script.pending = true;
@@ -1249,7 +1319,7 @@ function composeAfterShot(hits, nearMiss) {
     if (e?.code === 'cancelled') return;
     if (['not_granted', 'sampling_disabled', 'not_declared', 'capability_disabled', 'capability_removed'].includes(e?.code)) { aiOff = true; updateAiNote(); }
     if (script && script.ctl === ctl) { script.pending = false; renderScript(script); }
-    log('info', 'Сценарий', e?.code === 'rate_limited' ? 'Claude просит паузу: этот выстрел идёт по процедурному сценарию.' : 'Claude не ответил: работает процедурный сценарий.');
+    log('info', 'Сценарий', e?.code === 'rate_limited' ? 'Claude просит паузу: этот выстрел идёт по сценарию из библиотеки.' : 'Claude не ответил: работает сценарий из библиотеки.');
   });
 }
 
@@ -1264,7 +1334,7 @@ function renderScript(sc, message, badge) {
   }
   const src = badge || (sc.pending ? 'wait' : sc.source);
   b.dataset.src = src === 'wait' ? 'wait' : src;
-  b.textContent = src === 'ai' ? 'Claude' : src === 'wait' ? 'Claude думает…' : 'процедурный';
+  b.textContent = src === 'ai' ? 'Claude' : src === 'wait' ? 'Claude думает…' : src === 'lib' ? 'библиотека · ' + sc.id : 'процедурный';
   title.textContent = sc.title + (sc.temperament ? ` · ${sc.temperament}` : '');
   list.replaceChildren(...sc.beats.map(x => {
     const li = document.createElement('li');
