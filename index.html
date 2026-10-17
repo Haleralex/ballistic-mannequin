@@ -528,44 +528,14 @@ function turnBone(b, angle, axis = UP) {
   b.quaternion.premultiply(rq2.copy(pq).invert().multiply(rq).multiply(pq));
   b.updateMatrixWorld(true);
 }
-// set a bone's world rotation part of the way toward a target
-function aimBone(b, target, wgt) {
-  b.getWorldQuaternion(rq).slerp(target, wgt);
-  b.parent.getWorldQuaternion(pq);
-  b.quaternion.copy(pq.invert().multiply(rq));
-  b.updateMatrixWorld(true);
-}
-const restOf = name => DRIVE.find(d => d.bone === rigBones[name]).rest;
-const ax1 = new THREE.Vector3(), ax2 = new THREE.Vector3(), cq = new THREE.Quaternion(), uq = new THREE.Quaternion(), fq = new THREE.Quaternion(), eq = new THREE.Euler();
-// A hit taken at a run, on top of the clip: the jolt (an arch when shot in the back, a fold from the front, the arms
-// thrown out, the trunk twisting to the hit side), a sideways lurch, then a hand pressed to the wound for the rest of the run.
-function runHitPose(r) {
-  const h = r.hit;
-  if (!h) return;
-  const t = r.t - h.t0;
-  const e = h.k * (t < 0.06 ? t / 0.06 : Math.exp(-(t - 0.06) / 0.35));
-  ax1.set(Math.cos(r.heading), 0, -Math.sin(r.heading)); // the runner's left-right axis: + bends forward
-  ax2.set(Math.sin(r.heading), 0, Math.cos(r.heading));  // the runner's forward axis: + raises the left arm outward
-  if (e > 0.01) {
-    const bend = h.front ? 0.7 : -0.8;
-    turnBone(rigBones.Spine, bend * 0.3 * e, ax1); turnBone(rigBones.Spine1, bend * 0.3 * e, ax1); turnBone(rigBones.Spine2, bend * 0.4 * e, ax1);
-    turnBone(rigBones.Spine2, h.side * 0.35 * e);
-    turnBone(rigBones.Head, (h.front ? 0.4 : -0.55) * e, ax1);
-    turnBone(rigBones.LeftArm, 1.0 * e, ax2); turnBone(rigBones.RightArm, -1.0 * e, ax2);
-    turnBone(rigBones.LeftShoulder, 0.25 * e, ax2); turnBone(rigBones.RightShoulder, -0.25 * e, ax2);
-  }
-  // the hand goes to the wound once the jolt has passed
-  const c = h.clutch, wc = c ? Math.max(0, Math.min(0.85, (t - 0.3) / 0.4 * 0.85)) : 0;
-  if (wc > 0) {
-    const S = c.S, B = S === 'L' ? 'Left' : 'Right', pose = armPose(c.kind, S, 0.9);
-    rigBones.Spine2.getWorldQuaternion(cq).multiply(PART_REST.chest.qInv);
-    const bu = BASE['uArm' + S], bf = BASE['fArm' + S], pu = pose['uArm' + S], pf = pose['fArm' + S];
-    uq.copy(cq).multiply(rq.setFromEuler(eq.set(bu[0] + pu[0], bu[1] + pu[1], bu[2] + pu[2], 'XYZ')));
-    fq.copy(uq).multiply(rq.setFromEuler(eq.set(bf[0] + pf[0], bf[1] + pf[1], bf[2] + pf[2], 'XYZ')));
-    aimBone(rigBones[B + 'Arm'], rq2.copy(uq).multiply(restOf(B + 'Arm')), wc);
-    aimBone(rigBones[B + 'ForeArm'], rq2.copy(fq).multiply(restOf(B + 'ForeArm')), wc);
-    aimBone(rigBones[B + 'Hand'], rq2.copy(fq).multiply(restOf(B + 'Hand')), wc);
-  }
+// A hit taken at a run is physical: the body turns back into the ragdoll, its muscles keep tracking the run clip,
+// but for a moment they lose most of their strength (the shock of the hit) while the bullet's push and the run's
+// momentum act on it. The stumble that comes out of that is different every time. If the body sinks too far it
+// falls; otherwise the muscles catch it and the clip takes over again.
+function runDip(r) {
+  const t = r.t - r.phys.t0;
+  const d = r.phys.depth; // how much strength the shock takes away
+  return t < 0.08 ? 1 - d * t / 0.08 : 1 - d + d * Math.min(1, (t - 0.08) / 0.45);
 }
 // pace from the wounds: a healthy person sprints; a wound in the leg leaves a fast walk, blood loss and a torso wound slow it
 function runPace(k) {
@@ -590,7 +560,7 @@ function runHit(wounds) {
   const c = character, r = c.run;
   if (!r || r.mode !== 'go') return false;
   if (!canRun()) { releaseRun(true); c.fellRunning = true; return false; } // the wound took the legs (the spine, say): down at once
-  if (!wounds.length) { r.hit = { t0: r.t, k: 0.45, front: false, side: 0 }; return true; } // a bullet past the ear: a duck, then faster
+  if (!wounds.length) return true; // a bullet past the ear: the run goes on
   const kind = incidentKind(wounds), lead = wounds[0];
   const drops = kind === 'multi' ? 0.75 : ['chest', 'abdomen', 'pelvis-soft', 'neck'].includes(kind) ? 0.35 : 0;
   if (Math.random() < drops) {
@@ -598,10 +568,17 @@ function runHit(wounds) {
     c.balanceTarget = 0; c.balanceRate = 2.5; c.noLift = true; c.fellRunning = true;
     return false;
   }
-  const zk = ZONE_KIND(lead.w.zone), near = lead.side > 0 ? 'L' : lead.side < 0 ? 'R' : (Math.random() < 0.5 ? 'L' : 'R');
-  const S = zk === 'arm' ? (near === 'L' ? 'R' : 'L') : near;
-  r.hit = { t0: r.t, k: 1, front: lead.fromFront, side: lead.side || 0, clutch: zk === 'head' && !lead.w.brain ? { kind: 'head', S } : { kind: zk, S } };
-  r.v = Math.max(0.6, r.v * 0.35);
+  // the ragdoll takes the hit: dynamic again with the run's velocities, then the bullet's push on the struck part
+  const torso = ['chest', 'abdomen', 'pelvis', 'neck'].includes(ZONE_KIND(lead.w.zone));
+  r.phys = { t0: r.t, dur: 0.8 + Math.random() * 0.3, depth: torso ? 0.35 + Math.random() * 0.45 : 0.25 + Math.random() * 0.25 };
+  for (const p of parts) {
+    const k = r.kin[p.n];
+    p.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+    p.body.setLinvel(k.v, true); p.body.setAngvel(k.w, true);
+  }
+  const push = 14 + Math.random() * 10;
+  for (const x of wounds) x.part.body.applyImpulse({ x: x.dir.x * push, y: 0, z: x.dir.z * push }, true);
+  r.v *= 0.6;
   r.vmax = Math.min(r.vmax, runPace(0.6));
   if (r.vmax < 2.4) setRunClip(r, 'walk');
   return true;
@@ -611,11 +588,12 @@ function startRun(vmax, dirH) {
   const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(toQ(pel.rotation(), rq));
   const clip = vmax < 2.4 ? 'walk' : 'run';
   const r = { mode: 'go', t: 0, v: 0, vmax, dirH, heading: Math.atan2(fwd.x, fwd.z), root: { x: pt.x, z: pt.z }, clip, w: 0, idle: null,
-    lookAt: 1.2 + Math.random() * 1.5, snap: {}, kin: {} };
+    lookAt: 1.2 + Math.random() * 1.5, snap: {}, kin: {}, animQ: {}, animP: {}, phys: null, blend0: 0 };
   for (const p of parts) {
     const t = p.body.translation(), q = p.body.rotation();
     r.snap[p.n] = { p: new THREE.Vector3(t.x, t.y, t.z), q: new THREE.Quaternion(q.x, q.y, q.z, q.w) };
     r.kin[p.n] = { p: r.snap[p.n].p.clone(), q: r.snap[p.n].q.clone(), v: new THREE.Vector3(), w: new THREE.Vector3() };
+    r.animQ[p.n] = r.snap[p.n].q.clone(); r.animP[p.n] = r.snap[p.n].p.clone();
     p.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
   }
   mixer.stopAllAction();
@@ -629,7 +607,7 @@ function releaseRun(stumble) {
   const c = character, r = c.run;
   if (!r) return;
   c.run = null;
-  for (const p of parts) {
+  if (!r.phys) for (const p of parts) {
     const k = r.kin[p.n];
     p.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
     p.body.setLinvel(k.v, true); p.body.setAngvel(k.w, true);
@@ -667,14 +645,6 @@ function runAnim(dt) {
   if (r.idle && r.t - r.idleT > 0.5) { releaseRun(false); return; }
   mixer.update(dt);
   model.position.set(r.root.x, 0, r.root.z);
-  if (r.hit) { // the hit throws the stride off: the legs give for a moment and the body lurches to one side
-    const lt = (r.t - r.hit.t0) / 0.55;
-    if (lt < 1) {
-      const bump = Math.sin(lt * Math.PI) * r.hit.k, d = -0.24 * (r.hit.side || 0) * bump;
-      model.position.x += Math.cos(r.heading) * d; model.position.z -= Math.sin(r.heading) * d;
-      model.position.y -= 0.09 * bump;
-    }
-  }
   model.quaternion.setFromAxisAngle(UP, r.heading);
   // halfway, a glance back at the shooter over the nearer shoulder
   const lt = (r.t - r.lookAt) / 1.1;
@@ -687,13 +657,31 @@ function runAnim(dt) {
     turnBone(rigBones.Head, yaw * 0.4);
   }
   model.updateMatrixWorld(true);
-  runHitPose(r);
-  // the bodies follow the skeleton; at the start they blend in from where the ragdoll was
-  r.w = Math.min(1, r.t / 0.3);
+  // the bodies follow the skeleton; at the start, and after a stumble, they blend in from where the ragdoll was
+  r.w = Math.min(1, (r.t - (r.blend0 || 0)) / 0.3);
+  if (r.phys) {
+    const pt = byName.pelvis.body.translation(), ht = byName.head.body.translation();
+    if (pt.y < 0.62 || ht.y < 1.05) { releaseRun(true); c.balanceTarget = 0; c.balanceRate = 2.5; c.fellRunning = true; return; } // stumbled too far: down
+    if (r.t - r.phys.t0 > r.phys.dur) { // caught: the clip takes over again from this pose
+      r.phys = null; r.blend0 = r.t; r.w = 0;
+      for (const p of parts) {
+        const t = p.body.translation(), q = p.body.rotation();
+        r.snap[p.n].p.set(t.x, t.y, t.z); r.snap[p.n].q.set(q.x, q.y, q.z, q.w);
+        r.kin[p.n].p.copy(r.snap[p.n].p); r.kin[p.n].q.copy(r.snap[p.n].q);
+        p.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
+      }
+    }
+  }
   for (const p of parts) {
     const pr = PART_REST[p.n], k = r.kin[p.n];
     pr.bone.getWorldQuaternion(rq).multiply(pr.qInv);
     pr.bone.getWorldPosition(rv).add(tv.set(p.c[0], p.c[1], p.c[2]).sub(pr.pos).applyQuaternion(rq));
+    if (r.phys) { // the clip pose becomes what the muscles aim for
+      r.animQ[p.n].copy(rq); r.animP[p.n].copy(rv);
+      const t = p.body.translation(), q = p.body.rotation();
+      k.p.set(t.x, t.y, t.z); k.q.set(q.x, q.y, q.z, q.w);
+      continue;
+    }
     if (r.w < 1) { rv.lerpVectors(r.snap[p.n].p, rv, r.w); rq2.copy(rq); rq.copy(r.snap[p.n].q).slerp(rq2, r.w); }
     if (rq.dot(k.q) < 0) rq.set(-rq.x, -rq.y, -rq.z, -rq.w); // same rotation; a flipped sign would read as a full turn in one step
     k.v.copy(rv).sub(k.p).divideScalar(dt);
@@ -709,7 +697,7 @@ function runAnim(dt) {
 
 function poseRig() {
   // during a run the clip itself poses the skeleton
-  if (!replay && character.run && character.run.w >= 1) return;
+  if (!replay && character.run && character.run.w >= 1 && !character.run.phys) return;
   for (const d of DRIVE) {
     const m = byName[d.part].mesh;
     if (d.blend) tq.slerpQuaternions(byName[d.blend].mesh.quaternion, m.quaternion, 0.5); else tq.copy(m.quaternion);
@@ -935,12 +923,14 @@ function motorAxis(joint, axis, target, k, d) {
   joint.rawSet.jointConfigureMotorPosition(joint.handle, axis, target, k, d);
 }
 function muscles(dt) {
+  const ph = character.run && character.run.phys ? character.run : null, dip = ph ? runDip(ph) : 1;
   for (const p of parts) {
     p.tone += (p.toneTarget - p.tone) * Math.min(1, p.toneRate * dt);
     if (!p.p) continue;
-    const k = p.k * p.tone * character.vigor;
+    const k = p.k * p.tone * character.vigor * dip;
     const d = p.k * (0.12 * p.tone + 0.006); // a little passive damping remains when limp
-    targetQuat(p.n, qT);
+    if (ph) qT.copy(ph.animQ[p.p]).invert().multiply(ph.animQ[p.n]); // stumbling at a run: the muscles chase the clip
+    else targetQuat(p.n, qT);
     if (qT.w < 0) qT.set(-qT.x, -qT.y, -qT.z, -qT.w);
     if (p.hinge) p.joint.configureMotorPosition(2 * Math.atan2(qT.x, qT.w), k, d);
     else {
@@ -957,7 +947,7 @@ function muscles(dt) {
     balanceJoint = null;
   }
   if (!balanceJoint) return;
-  const kb = BAL_K * c.balance, db = BAL_D * c.balance;
+  const kb = BAL_K * c.balance * (0.35 + 0.65 * dip), db = BAL_D * c.balance;
   // The anchor carries the heading: after running away the body stands facing where it ran.
   const A = anchorBody.translation();
   if (c.run) { // the anchor travels with the runner, so the ragdoll takes over without a jolt
@@ -980,7 +970,12 @@ function muscles(dt) {
     const f = byName['foot' + (c.kneel === 'L' ? 'R' : 'L')].body.translation();
     sx = (knee.x + f.x) / 2; sz = knee.z * 0.65 + f.z * 0.35;
   }
-  const kl = BAL_LIN_K * c.balance * (c.seated || c.noLift ? 0 : 1), dl = BAL_LIN_D * c.balance;
+  if (ph) { // during a stumble the pelvis is drawn toward where the clip has it, and partly held up
+    const ap = ph.animP.pelvis, pb = byName.pelvis.body, y = pb.translation().y, vy = pb.linvel().y;
+    sx = ap.x; sz = ap.z;
+    pb.applyImpulse({ x: 0, y: Math.max(0, Math.min(700, 0.9 * dip * (5000 * (ap.y - y) - 500 * vy))) * dt, z: 0 }, true);
+  }
+  const kl = BAL_LIN_K * c.balance * dip * (c.seated || c.noLift ? 0 : 1), dl = BAL_LIN_D * c.balance;
   // the target offset from the anchor, in the anchor's frame
   const ox = sx - A.x, oz = sz - A.z, ch = Math.cos(c.heading), sh = Math.sin(c.heading);
   motorAxis(balanceJoint, 0, ox * ch - oz * sh, kl, dl);
