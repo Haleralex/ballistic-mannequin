@@ -248,6 +248,12 @@ details .formula { font-family: var(--font-data); font-size: 12.5px; background:
     <section aria-labelledby="h-scr">
       <h2 id="h-scr">Сценарий поведения</h2>
       <div class="scr-head"><span class="scr-badge" id="scrBadge" data-src="none">нет</span><span id="scrTitle">Выстрелите: после каждого выстрела поведение сочиняется заново.</span></div>
+      <p class="subh">Реакция на выстрел</p>
+      <div class="seg" id="reactSeg">
+        <button type="button" id="rAuto" aria-pressed="true">По ситуации</button>
+        <button type="button" id="rFlee" aria-pressed="false">Убегает</button>
+        <button type="button" id="rStay" aria-pressed="false">Остаётся</button>
+      </div>
       <ol id="scrList"></ol>
       <label class="check" for="aiBox"><input type="checkbox" id="aiBox"> Сочинять сценарий через Claude (тратит лимит)</label>
       <p class="note" id="aiNote">Сценарии берутся из встроенной библиотеки: 100 сценариев, бесплатно.</p>
@@ -373,7 +379,7 @@ const controls = new OrbitControls(camera, canvas);
 controls.target.set(0, 1.0, 0);
 controls.enableDamping = true;
 controls.maxPolarAngle = Math.PI * 0.495;
-controls.minDistance = 1.5; controls.maxDistance = 25;
+controls.minDistance = 1.5; controls.maxDistance = 60;
 controls.update();
 
 scene.add(new THREE.HemisphereLight(0xffffff, 0x777777, 1.1));
@@ -591,7 +597,7 @@ function updateWoundUniforms() {
 }
 
 // ---------- physics world & mannequin ----------
-let world, parts, byName, totalMass, simTime, events, character, balanceJoint;
+let world, parts, byName, totalMass, simTime, events, character, balanceJoint, anchorBody;
 
 function buildWorld() {
   if (world) world.free();
@@ -642,16 +648,18 @@ function buildWorld() {
       else for (const ax of ANG) p.joint.rawSet.jointConfigureMotorModel(p.joint.handle, ax, FORCE_BASED);
     }
   }
-  // world-to-pelvis joint with every axis free; only its angular motors act
+  // Joint from a kinematic anchor to the pelvis, every axis free; only its motors act. Turning the anchor turns the
+  // heading the body is held to, and moving it carries the pelvis along when the person runs.
   const pel = byName.pelvis;
+  anchorBody = world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(pel.c[0], pel.c[1] + 0.1, pel.c[2]));
   balanceJoint = world.createImpulseJoint(
-    RAPIER.JointData.generic({ x: pel.c[0], y: pel.c[1] + 0.1, z: pel.c[2] }, { x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 }, 0), gb, pel.body, true);
+    RAPIER.JointData.generic({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 }, 0), anchorBody, pel.body, true);
   for (const ax of [0, 1, ...ANG]) balanceJoint.rawSet.jointConfigureMotorModel(balanceJoint.handle, ax, FORCE_BASED);
   totalMass = parts.reduce((s, p) => s + p.body.mass(), 0);
   document.getElementById('rMass').textContent = totalMass.toFixed(1) + ' кг';
   simTime = 0; events = []; layers.length = 0; history.length = 0;
   character = { balance: 1, balanceTarget: 1, balanceRate: 3, conscious: true, state: 'ok', torsoHits: 0, collapseAt: null, kneel: null,
-    vigor: 1, lost: 0, bleedRate: 0, physT: 0, wounds: [], stage: 0, arrestAt: null, sway: null };
+    vigor: 1, lost: 0, bleedRate: 0, physT: 0, wounds: [], stage: 0, arrestAt: null, sway: null, heading: 0, run: null };
   clearBlood();
   woundSlots.length = 0;
   character.breath = 0; character.ph = Array.from({ length: 14 }, () => Math.random() * 6.28);
@@ -740,12 +748,26 @@ function muscles(dt) {
     world.removeImpulseJoint(balanceJoint, true);
     balanceJoint = null;
   }
-  if (!balanceJoint) return;
+  if (!balanceJoint) { c.run = null; return; }
+  updateRun(dt);
   const kb = BAL_K * c.balance, db = BAL_D * c.balance;
-  // A generic joint built on axis X has the local basis X = world X, Y = world −Z, Z = world Y.
-  motorAxis(balanceJoint, 3, 0, kb, db);              // pitch (about world X)
-  motorAxis(balanceJoint, 4, 0, kb, db);              // roll (about world −Z)
-  motorAxis(balanceJoint, 5, 0, kb * 0.08, db * 0.2); // yaw, kept loose
+  // The anchor carries the heading (and a running lean); its translation follows the run.
+  const A = anchorBody.translation();
+  if (c.run) { A.x = c.run.pos.x; A.z = c.run.pos.z; }
+  anchorQ.setFromEuler(anchorE.set(c.run ? c.run.lean : 0, c.heading, 0, 'YXZ'));
+  anchorBody.setNextKinematicTranslation(A);
+  anchorBody.setNextKinematicRotation(anchorQ);
+  // A generic joint built on axis X has the local basis X = anchor X, Y = anchor −Z, Z = anchor Y.
+  motorAxis(balanceJoint, 3, 0, kb, db);              // pitch
+  motorAxis(balanceJoint, 4, 0, kb, db);              // roll
+  motorAxis(balanceJoint, 5, 0, kb * (c.run ? 0.5 : 0.08), db * (c.run ? 0.5 : 0.2)); // yaw: loose standing, firm while turning to run
+  // while running, a share of the weight is carried by a push under the pelvis; the legs carry the rest.
+  // (A joint motor would not do: Rapier keeps a motor engaged even at zero stiffness, and the body would hang from it.)
+  if (c.run && c.run.support > 0) {
+    const pb = byName.pelvis.body, y = pb.translation().y, vy = pb.linvel().y, sup = c.run.support * c.balance;
+    const f = Math.max(0, Math.min(650, sup * (5000 * (c.run.h - y) - 500 * vy)));
+    pb.applyImpulse({ x: 0, y: f * dt, z: 0 }, true);
+  }
   // keep the pelvis over the support area, weighted toward the leg that still carries load
   const wL = byName.shinL.tone + 0.02, wR = byName.shinR.tone + 0.02;
   const fL = byName.footL.body.translation(), fR = byName.footR.body.translation();
@@ -756,10 +778,63 @@ function muscles(dt) {
     const f = byName['foot' + (c.kneel === 'L' ? 'R' : 'L')].body.translation();
     sx = (knee.x + f.x) / 2; sz = knee.z * 0.65 + f.z * 0.35;
   }
+  if (c.run && !c.kneel) { sx = c.run.pos.x; sz = c.run.pos.z; }
   const kl = BAL_LIN_K * c.balance * (c.seated || c.noLift ? 0 : 1), dl = BAL_LIN_D * c.balance;
-  const rest = byName.pelvis.c;
-  motorAxis(balanceJoint, 0, sx - rest[0], kl, dl);
-  motorAxis(balanceJoint, 1, -(sz - rest[2]), kl, dl);
+  // the target offset from the anchor, in the anchor's frame
+  const ox = sx - A.x, oz = sz - A.z, ch = Math.cos(c.heading), sh = Math.sin(c.heading);
+  motorAxis(balanceJoint, 0, ox * ch - oz * sh, kl, dl);
+  motorAxis(balanceJoint, 1, -(ox * sh + oz * ch), kl, dl);
+}
+const anchorQ = new THREE.Quaternion(), anchorE = new THREE.Euler();
+const wrapAngle = a => Math.atan2(Math.sin(a), Math.cos(a));
+
+// ---------- running away ----------
+// The pelvis is carried by the moving anchor and partly held up; a gait layer swings the legs and arms.
+// Anything that takes the legs or the balance away (a leg wound, a broken pelvis, fainting) turns the run into a
+// stumble: the support goes at once and the body carries its momentum forward.
+function brakeRun() {
+  const r = character.run;
+  if (!r || r.mode === 'brake') return;
+  r.mode = 'brake'; r.support = 0; fadeOut(r.layer, 0.3);
+}
+const RUN_BLOCKED = ['stagger', 'kneel', 'sit', 'lie_down', 'double_over', 'rock', 'curl', 'writhe', 'try_rise', 'straighten'];
+function updateRun(dt) {
+  const c = character, r = c.run;
+  if (!r) return;
+  const legsOk = (c.cap.thighL ?? 1) > 0.5 && (c.cap.thighR ?? 1) > 0.5;
+  if (r.mode !== 'brake' && !(c.conscious && c.state !== 'down' && !c.seated && !c.kneel && legsOk && c.balanceTarget > 0.5)) brakeRun();
+  r.t += dt;
+  let turnLeft = 0;
+  if (r.mode !== 'brake') { // turn toward the way out, quickly but not instantly
+    turnLeft = wrapAngle(r.dirH - c.heading);
+    c.heading = wrapAngle(c.heading + Math.sign(turnLeft) * Math.min(Math.abs(turnLeft), 5.5 * dt));
+    const p = byName.pelvis.body.translation();
+    if (Math.hypot(p.x, p.z) > 24) r.mode = 'stop'; // the edge of the ground
+  }
+  const vT = r.mode === 'go' ? (Math.abs(turnLeft) < 0.9 ? r.vmax : 0.4) : 0;
+  const acc = r.mode === 'brake' ? 7 : r.mode === 'stop' ? 4 : 4.5;
+  r.v += Math.max(-acc * dt, Math.min(acc * dt, vT - r.v));
+  r.pos.x += Math.sin(c.heading) * r.v * dt; r.pos.z += Math.cos(c.heading) * r.v * dt;
+  if (r.mode === 'brake') { if (r.v < 0.05) c.run = null; return; }
+  if (r.mode === 'stop' && r.v < 0.05) { fadeOut(r.layer, 0.6); c.run = null; return; }
+  // gait: about 1.4 strides a second at a jog, the swing grows with speed; a few small steps while turning
+  const a = Math.max(Math.min(1, r.v / 3.2), Math.abs(turnLeft) > 0.2 ? 0.35 : 0, r.mode === 'stop' ? 0 : 0.15);
+  r.phase += 2 * Math.PI * (0.9 + 0.17 * r.v) * dt;
+  r.support = Math.min(1, r.t / 0.3) * (0.5 + 0.5 * a);
+  r.h = 0.96 - 0.05 * a + 0.025 * a * Math.cos(2 * r.phase); // pelvis height, m
+  r.lean = 0.14 * a;
+  const P = r.layer.pose, sw = (S, ph) => {
+    const sn = Math.sin(ph), cs = Math.cos(ph);
+    P['thigh' + S] = [-0.15 * a - 0.62 * a * sn, 0, 0];
+    P['shin' + S] = [0.2 * a + 1.25 * a * Math.max(0, cs), 0, 0];
+    // the opposite arm swings with this leg; an arm already holding a wound or raised barely swings
+    const H = S === 'L' ? 'R' : 'L';
+    const busy = layers.some(l => l.tag === 'ai-arms' && l.pose['uArm' + H] && layerWeight(l) > 0.3);
+    P['uArm' + H] = [-0.8 * a * sn * (busy ? 0.15 : 1), 0, 0];
+    if (busy) delete P['fArm' + H]; else P['fArm' + H] = [-1.3 * a, 0, 0];
+  };
+  sw('L', r.phase); sw('R', r.phase + Math.PI);
+  P.chest = [0.1 * a, 0, 0]; P.head = [-0.12 * a, 0, 0];
 }
 
 // ---------- reactions ----------
@@ -867,11 +942,11 @@ const ACTION_RU = {
   look: 'взгляд', clutch: 'зажимает рану', double_over: 'сгибается', straighten: 'выпрямляется', rock: 'раскачивается',
   stagger: 'шатается', kneel: 'на колено', sit: 'садится', lie_down: 'ложится', curl: 'сжимается', writhe: 'корчится',
   try_rise: 'пытается встать', reach: 'тянется', raise_hands: 'руки вверх', cover_head: 'закрывает голову',
-  gasp: 'дыхание', tremble: 'дрожь', freeze: 'замирает', faint: 'теряет сознание',
+  gasp: 'дыхание', tremble: 'дрожь', freeze: 'замирает', faint: 'теряет сознание', flee: 'убегает',
 };
 const CHANNEL = { look: 'head', clutch: 'arms', reach: 'arms', raise_hands: 'arms', cover_head: 'arms', double_over: 'torso', straighten: 'torso',
   rock: 'torso', stagger: 'legs', kneel: 'body', sit: 'body', lie_down: 'legs', curl: 'body', writhe: 'body', try_rise: 'body',
-  gasp: 'breath', tremble: 'breath', freeze: 'breath', faint: 'body' };
+  gasp: 'breath', tremble: 'breath', freeze: 'breath', faint: 'body', flee: 'legs' };
 const ZONE_KIND = z => /шея|голова/.test(z) ? 'head' : /груд/.test(z) ? 'chest' : /живот/.test(z) ? 'abdomen' : /таз/.test(z) ? 'pelvis'
   : /бедро|голень|стопа/.test(z) ? 'leg' : 'arm';
 let script = null;
@@ -882,6 +957,9 @@ function usableHand(h) {
   if (h === 'L' || h === 'R') return ok(h) ? h : ok(h === 'L' ? 'R' : 'L') ? (h === 'L' ? 'R' : 'L') : null;
   return ok('R') ? 'R' : ok('L') ? 'L' : null;
 }
+// running needs both legs, balance and the person on their feet
+const canRun = () => { const c = character;
+  return c.conscious && c.state !== 'down' && !c.seated && !c.kneel && c.balanceTarget > 0.5 && (c.cap.thighL ?? 1) > 0.5 && (c.cap.thighR ?? 1) > 0.5; };
 const legsWork = () => (character.cap.thighL ?? 1) > 0.1 || (character.cap.thighR ?? 1) > 0.1;
 // direction toward the camera (the shooter) in the chest's frame: yaw and pitch, rad
 function shooterAngles() {
@@ -1055,6 +1133,27 @@ const ACTIONS = {
   gasp(b) { return { update() { character.breathBoost = b.intensity; }, end() { character.breathBoost = 0; } }; },
   tremble(b) { return { update() { character.tremble = b.intensity; }, end() { character.tremble = 0; } }; },
   freeze(b) { return { update() { character.lifeDamp = 0.15; }, end() { character.lifeDamp = 1; } }; },
+  flee(b) {
+    const c = character;
+    if (c.run || !canRun()) return null;
+    const p = byName.pelvis.body.translation();
+    // away from the shooter, angled off to one side the way people run for cover
+    const away = Math.atan2(p.x - camera.position.x, p.z - camera.position.z);
+    const off = b.dir === 'left' ? 0.55 : b.dir === 'right' ? -0.55 : (Math.random() - 0.5) * 0.9;
+    // pace: a healthy person sprints; a wound in the leg makes a limping jog, blood loss and a torso wound slow it
+    const zones = c.wounds.map(w => ZONE_KIND(w.zone));
+    let vmax = 3.4 + 0.8 * b.intensity;
+    if (zones.includes('leg')) vmax *= 0.45;
+    if (zones.includes('abdomen') || zones.includes('chest') || zones.includes('pelvis')) vmax *= 0.75;
+    vmax *= c.vigor;
+    for (const l of layers) if (l.tag === 'buckle' || l.tag === 'ai-legs' || l.tag === 'ai-torso' || l.tag === 'ai-body') fadeOut(l, 0.3);
+    c.run = { mode: 'go', t: 0, v: 0, vmax, dirH: wrapAngle(away + off), phase: 0, pos: { x: p.x, z: p.z }, support: 0, h: 0.96, lean: 0,
+      layer: addLayer({}, { attack: 0.25, hold: Infinity, release: 0.5, tag: 'run' }) };
+    beatTone(b, LEGS, 1, 6);
+    beatTone(b, ['uArmL', 'uArmR', 'fArmL', 'fArmR'], 0.7, 4);
+    const stop = () => { if (c.run && c.run.mode === 'go') c.run.mode = 'stop'; };
+    return { update(t) { if (t > b.dur - 0.8) stop(); }, end: stop };
+  },
   faint(b) {
     // only physiology decides: the script may ask, the blood and the heart answer
     const c = character, f = c.lost / BLOOD_VOLUME;
@@ -1070,6 +1169,7 @@ const UPPER = ['head', 'chest', 'abdomen', 'uArmL', 'uArmR', 'fArmL', 'fArmR'];
 const MOVES = { look: ['head', 'chest'], rock: ['chest', 'abdomen', 'head'], writhe: null, gasp: ['chest', 'abdomen', 'head', 'uArmL', 'uArmR'],
   tremble: ['uArmL', 'uArmR', 'fArmL', 'fArmR', 'head'] };
 function beginBeat(b) {
+  if (character.run && character.run.mode !== 'brake' && RUN_BLOCKED.includes(b.action)) { b.state = 'skip'; return; }
   const fx = ACTIONS[b.action](b);
   if (!fx) { b.state = 'skip'; return; }
   Object.assign(b, { fx, state: 'run' });
@@ -1160,7 +1260,9 @@ Realism, from wound ballistics and emergency medicine:
 - Bullets do not knock people over. Visible behaviour is reflex, pain, fear, loss of support and, later, blood loss.
 - People often do not realise at once that they are hit; they look at the wound, touch it, may keep moving for seconds or minutes.
 - Collapse from torso wounds comes from blood loss or a stopped heart, with the timing given; do not invent an earlier collapse.
-- Fear: looking at the shooter, turning away, covering, raising hands, trying to get away (stagger), seeking to get low.
+- Fear: looking at the shooter, turning away, covering, raising hands, running away (flee), seeking to get low.
+- Flight is the commonest reaction of an unhurt or lightly wounded person. A badly wounded person may still run for seconds and collapse on the way; that collapse comes from the physiology, not from you.
+- If the incident says runs_away: true, the person runs: put a flee beat within the first second; the rest of the story continues after the run ends. If runs_away is false, do not use flee.
 - Pain behaviour: clutching and pressing the wound, doubling over, rocking, curling up when on the ground, ragged breathing, trembling.
 - Respect the "impossible" list exactly: paralysed legs never move, a broken leg does not carry weight, an unusable arm is never used.
 - As blood loss grows the person slows down, sits or lies down, breathes faster, then fades. Use faint only when unconsciousness is due.
@@ -1173,13 +1275,14 @@ Vocabulary (action: parameters):
 - raise_hands {}   cover_head {}
 - double_over {}   straighten {}   rock {}   (torso)
 - stagger {dir: "back"|"forward"|"left"|"right"}   one unsteady step; standing only
+- flee {dir: "left"|"right"|"back"}   turn away from the shooter and run, angled to that side; dur = seconds of running (2-10); standing only, both legs must carry weight. While running only look, arm and breath beats play
 - kneel {knee: "L"|"R"}   sit {}   (going down from standing; both are held until something else replaces them)
 - lie_down {}   from standing, kneeling or sitting down to lying
 - curl {}   writhe {}   try_rise {}   (lying or sitting; from sitting they take the person down to the ground)
 - gasp {}   tremble {}   freeze {}   (breathing and stillness)
 - faint {}   only if unconsciousness is due
 Every beat also has: t (seconds from now; the reflex flinch has already happened), dur (seconds, 0.5-15), intensity (0.2-1), note (Russian, at most 90 characters: what the person does and why, for actors).
-Channels: look=head; clutch/reach/raise_hands/cover_head=arms; double_over/straighten/rock=torso; stagger/lie_down=legs; kneel/sit/curl/writhe/try_rise/faint=whole body; gasp/tremble/freeze=breath. Beats on different channels may overlap; a new beat on a channel replaces the previous one there.
+Channels: look=head; clutch/reach/raise_hands/cover_head=arms; double_over/straighten/rock=torso; stagger/lie_down/flee=legs; kneel/sit/curl/writhe/try_rise/faint=whole body; gasp/tremble/freeze=breath. Beats on different channels may overlap; a new beat on a channel replaces the previous one there.
 
 Write 22-40 beats covering 45-90 seconds, consistent with the posture and what is impossible. Reply with only JSON:
 {"title": "<Russian, at most 60 characters>", "temperament": "<Russian, a few words>", "beats": [{"t": 0.2, "dur": 2, "action": "look", "at": "wound", "intensity": 0.8, "note": "..."}]}
@@ -1343,11 +1446,40 @@ function updateAiNote() {
     : aiOff ? 'Claude недоступен в этом просмотре: сценарии берутся из библиотеки.'
     : 'Сценарии берутся из встроенной библиотеки. Claude доступен, только когда страница открыта на claude.ai.';
 }
+// Reaction mode: stay, flee, or decide by the situation. Flight is the commonest reaction of an unhurt or lightly
+// wounded person; a torso wound sends fewer people running, and a broken leg or pelvis stops it outright.
+let reactMode = 'auto';
+const FLEE_CHANCE = { near: 0.6, arm: 0.55, 'head-graze': 0.4, heart: 0.35, chest: 0.35, abdomen: 0.3, leg: 0.3, 'pelvis-soft': 0.25, neck: 0.15, multi: 0.15 };
+function wantsFlee(hits) {
+  if (reactMode === 'stay' || character.run || !canRun()) return false;
+  return reactMode === 'flee' || Math.random() < (FLEE_CHANCE[incidentKind(hits)] ?? 0);
+}
+// the flight comes first; the chosen scenario plays on from wherever the run ends
+function fleeScript(lib, hits) {
+  const R = Math.random, pick = a => a[Math.floor(R() * a.length)];
+  const lead = hits[0], side = lead ? (lead.side || 1) : (R() < 0.5 ? 1 : -1);
+  const zk = lead ? ZONE_KIND(lead.w.zone) : null, near = side > 0 ? 'L' : 'R', far = near === 'L' ? 'R' : 'L';
+  const go = 0.25 + R() * 0.35, run = 3.5 + R() * 4;
+  const meta = { zoneKind: zk, sideSign: side };
+  const beats = [
+    { ...meta, t: 0, dur: 0.6, action: 'look', at: 'shooter', intensity: 0.9, note: 'Засекает, откуда стреляют' },
+    { ...meta, t: go, dur: run, action: 'flee', dir: pick(['left', 'right', 'back']), intensity: 0.6 + R() * 0.4,
+      note: lead ? 'Бежит прочь, несмотря на рану: адреналин глушит боль' : 'Бросается прочь от стрелка' },
+    { ...meta, t: go + run * (0.4 + R() * 0.2), dur: 1.1, action: 'look', at: 'shooter', intensity: 0.8, note: 'Оглядывается на бегу' },
+  ];
+  if (lead && zk !== 'head') beats.push({ ...meta, t: go + 0.8, dur: Math.max(1, run - 1), action: 'clutch', hand: zk === 'arm' ? far : near, intensity: 0.7, note: 'На бегу прижимает рану рукой' });
+  const after = go + run + 1.2;
+  for (const b of lib?.beats || []) if (b.action !== 'stagger' && b.action !== 'flee') beats.push({ ...b, t: b.t + after });
+  return beats.sort((a, b) => a.t - b.t);
+}
 function composeAfterShot(hits, nearMiss) {
   const rep = incidentReport(hits, nearMiss);
   if (!rep.conscious) { stopScript(); renderScript(null, 'Без сознания: поведения нет.'); return; }
+  const flee = wantsFlee(hits);
+  rep.runs_away = flee;
   const lib = libraryScript(rep, hits);
-  if (lib) startScript(lib.beats, { source: 'lib', title: lib.title, temperament: lib.temperament, id: lib.id });
+  if (flee) startScript(fleeScript(lib, hits), { source: lib ? 'lib' : 'proc', title: 'Убегает' + (lib ? ' · ' + lib.title : ''), temperament: lib?.temperament || 'испуганный', id: lib ? lib.id : '' });
+  else if (lib) startScript(lib.beats, { source: 'lib', title: lib.title, temperament: lib.temperament, id: lib.id });
   else startScript(proceduralBeats(rep, hits), { source: 'proc', title: hits.length ? 'Процедурный сценарий' : 'Испуг', temperament: '' });
   if (!sampleFn || !aiWanted || aiOff) return;
   const ctl = new AbortController();
@@ -1457,6 +1589,7 @@ function react(zone, side, hitDir, w) {
     return { text: 'Кости таза целы: человек может стоять, хотя ходить больно.' };
   }
   if (zone === 'pelvis') {
+    brakeRun();
     flinch(jitter(0.6, 0.25), side, fromFront);
     tone([...LEG('L'), ...LEG('R')], 0.1, 8);
     c.balanceTarget = Math.min(c.balanceTarget, 0.12); c.balanceRate = 4; c.noLift = true;
@@ -1465,11 +1598,19 @@ function react(zone, side, hitDir, w) {
     return { text: 'Перелом таза: это опора для обеих ног. Ноги не держат вес, тело падает сразу, без отброса.' };
   }
   if (zone.startsWith('thigh') || zone.startsWith('shin') || zone.startsWith('foot')) {
+    const running = c.run && c.run.mode !== 'brake';
+    brakeRun();
     const S = zone.slice(-1), H = S === 'L' ? 'R' : 'L';
     flinch(jitter(0.4, 0.3), side, fromFront);
     tone(LEG(S), 0.12, 10);
     c.balanceTarget = Math.min(c.balanceTarget, 0.6); c.balanceRate = 3;
     if (c.kneel) return { text: 'Ещё одно попадание в ногу: тело остаётся на колене.' };
+    if (w.bone && running) { // at a run there is no lowering onto a knee: the leg folds and momentum throws the body forward
+      capTone(LEG(S), 0.05);
+      tone(LEG(S), 0.05, 10);
+      c.balanceTarget = 0; c.balanceRate = 2.5; c.noLift = true;
+      return { text: 'Перелом на бегу: нога подламывается, и тело по инерции летит вперёд на землю.' };
+    }
     if (w.bone) {
       c.kneel = S;
       capTone(LEG(S), 0.05);
@@ -2123,6 +2264,10 @@ function frame(now) {
     tv.set(pl.x, Math.max(0.35, Math.min(1.0, pl.y + 0.05)), pl.z);
     if (Number.isFinite(tv.x + tv.y + tv.z)) controls.target.lerp(tv, k);
   }
+  // a body far away is brought closer by zooming, like a long lens: the shooter, and so the camera, stay where they are
+  const far = camera.position.distanceTo(controls.target);
+  const fov = followCam ? Math.max(6, Math.min(42, 2 * Math.atan(2.6 / far) * 180 / Math.PI)) : 42;
+  if (Math.abs(fov - camera.fov) > 0.01) { camera.fov += (fov - camera.fov) * (1 - Math.exp(-dtReal * 3)); camera.updateProjectionMatrix(); }
   controls.update();
   const dist = camera.position.distanceTo(vecOf(byName.chest.body.translation()));
   distText.textContent = `дистанция: ${dist.toFixed(1)} м`;
@@ -2183,6 +2328,7 @@ segment(['impReal', 'impMovie'], id => {
 });
 const setTime = id => { timeScale = { t1: 1, t025: 0.25, t0: 0 }[id]; };
 segment(['t1', 't025', 't0'], setTime);
+segment(['rAuto', 'rFlee', 'rStay'], id => { reactMode = { rAuto: 'auto', rFlee: 'flee', rStay: 'stay' }[id]; });
 segment(['ph1', 'ph10'], id => { physMult = id === 'ph10' ? 10 : 1; });
 document.getElementById('showBlood').addEventListener('change', e => setBloodVisible(e.target.checked));
 document.getElementById('xrayBox').addEventListener('change', e => setXray(e.target.checked));
