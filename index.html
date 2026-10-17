@@ -378,6 +378,11 @@ camera.position.set(0.9, 1.45, 4.2);
 const controls = new OrbitControls(camera, canvas);
 controls.target.set(0, 1.0, 0);
 controls.enableDamping = true;
+controls.dampingFactor = 0.15; // the default 0.05 drifts on long after the hand stops
+// the distance the viewer picked; the auto-zoom only makes up for the body going farther than that
+let userDist = camera.position.distanceTo(controls.target), interacting = false, lastInteract = 0;
+controls.addEventListener('start', () => { interacting = true; });
+controls.addEventListener('end', () => { interacting = false; lastInteract = performance.now(); });
 controls.maxPolarAngle = Math.PI * 0.495;
 controls.minDistance = 1.5; controls.maxDistance = 60;
 controls.update();
@@ -388,7 +393,7 @@ sun.position.set(3, 6, 4);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 Object.assign(sun.shadow.camera, { left: -4, right: 4, top: 4, bottom: -4, near: 0.5, far: 20 });
-scene.add(sun);
+scene.add(sun, sun.target);
 
 const floorMat = new THREE.MeshStandardMaterial({ roughness: 0.95 });
 const floor = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), floorMat);
@@ -2464,14 +2469,25 @@ function frame(now) {
     if (k >= 1) { scene.remove(e.obj); effects.splice(i, 1); e.done?.(); }
   }
   poseRig();
-  if (followCam) { // keep the body in frame as it goes down or moves
-    const pl = byName.pelvis.mesh.position, k = 1 - Math.exp(-dtReal * 2.5);
+  const pl = byName.pelvis.mesh.position;
+  if (followCam) { // keep the body in frame as it goes down or moves; breathing and sway do not move the view
     tv.set(pl.x, Math.max(0.35, Math.min(1.0, pl.y + 0.05)), pl.z);
-    if (Number.isFinite(tv.x + tv.y + tv.z)) controls.target.lerp(tv, k);
+    if (Number.isFinite(tv.x + tv.y + tv.z)) {
+      tv.sub(controls.target);
+      const d = tv.length(), slack = 0.15;
+      if (d > slack) controls.target.addScaledVector(tv, (d - slack) / d * (1 - Math.exp(-dtReal * 3)));
+    }
   }
-  // a body far away is brought closer by zooming, like a long lens: the shooter, and so the camera, stay where they are
+  // the shadow box travels with the body, so a runner keeps a shadow
+  if (Number.isFinite(pl.x + pl.z)) { // in half-metre steps: a box sliding with every sway would make shadow edges shimmer
+    const gx = Math.round(pl.x * 2) / 2, gz = Math.round(pl.z * 2) / 2;
+    sun.target.position.set(gx, 0, gz); sun.position.set(gx + 3, 6, gz + 4);
+  }
+  // a body that has gone farther than the viewer's chosen distance is brought back by zooming, like a long lens:
+  // the shooter, and so the camera, stay where they are; moving the camera yourself never fights the zoom
   const far = camera.position.distanceTo(controls.target);
-  const fov = followCam ? Math.max(6, Math.min(42, 2 * Math.atan(2.6 / far) * 180 / Math.PI)) : 42;
+  if (interacting || performance.now() - lastInteract < 400) userDist = far / Math.tan(camera.fov * Math.PI / 360) * Math.tan(21 * Math.PI / 180);
+  const fov = followCam ? Math.max(6, Math.min(42, 2 * Math.atan(Math.tan(21 * Math.PI / 180) * userDist / far) * 180 / Math.PI)) : 42;
   if (Math.abs(fov - camera.fov) > 0.01) {
     camera.fov += (fov - camera.fov) * (1 - Math.exp(-dtReal * 3)); camera.updateProjectionMatrix();
     // the haze recedes with the zoom, or a distant body would fade into it
