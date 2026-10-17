@@ -398,8 +398,9 @@ const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 200);
 camera.position.set(0.9, 1.45, 4.2);
 const controls = new OrbitControls(camera, canvas);
 controls.target.set(0, 1.0, 0);
-controls.enableDamping = true;
-controls.dampingFactor = 0.15; // the default 0.05 drifts on long after the hand stops
+// no inertia: with damping the camera only catches up over the following frames, so on a slow GPU it lags behind
+// the hand and keeps sliding after the button is released
+controls.enableDamping = false;
 controls.maxPolarAngle = Math.PI * 0.495;
 controls.minDistance = 1.5; controls.maxDistance = 60;
 controls.update();
@@ -2348,14 +2349,19 @@ function setBloodVisible(v) {
 }
 
 const vEl = id => document.getElementById(id);
+// text and styles written every frame are set only when they change: each write makes the browser lay the page out
+// again, and the pointer handlers then wait for that
+function setText(el, t) { if (typeof el === 'string') el = vEl(el); if (el._t !== t) { el._t = t; el.textContent = t; } }
 function bloodReadout() {
   const c = character, f = c.lost / BLOOD_VOLUME;
-  vEl('bbFill').style.width = Math.min(100, f / 0.5 * 100) + '%';
-  vEl('vLost').textContent = `${Math.round(c.lost)} мл · ${(f * 100).toFixed(1)}%`;
-  vEl('vRate').textContent = c.bleedRate > 0.01 ? `${fmtRate(c.bleedRate)} · ${Math.round(c.bleedRate * 60)} мл/мин` : '—';
+  const bw = Math.min(100, f / 0.5 * 100).toFixed(1) + '%', bb = vEl('bbFill');
+  if (bb._w !== bw) { bb._w = bw; bb.style.width = bw; }
+  const T = {};
+  T.vLost = `${Math.round(c.lost)} мл · ${(f * 100).toFixed(1)}%`;
+  T.vRate = c.bleedRate > 0.01 ? `${fmtRate(c.bleedRate)} · ${Math.round(c.bleedRate * 60)} мл/мин` : '—';
   const hr = heartRate();
-  vEl('vHr').textContent = hr ? `${Math.round(hr)} уд/мин` : 'нет пульса';
-  vEl('vClass').textContent = f < 0.15 ? 'I' : f < 0.3 ? 'II' : f < 0.4 ? 'III' : 'IV';
+  T.vHr = hr ? `${Math.round(hr)} уд/мин` : 'нет пульса';
+  T.vClass = f < 0.15 ? 'I' : f < 0.3 ? 'II' : f < 0.4 ? 'III' : 'IV';
   let eta = '—';
   if (c.conscious) {
     if (c.arrestAt !== null) eta = `≈ ${Math.max(0, c.arrestAt - c.physT).toFixed(0)} с`;
@@ -2364,11 +2370,12 @@ function bloodReadout() {
       eta = s > 3600 ? 'больше часа' : s > 90 ? `≈ ${Math.round(s / 60)} мин` : `≈ ${Math.round(s)} с`;
     }
   } else if (c.wounds.length || c.state === 'down') eta = 'без сознания';
-  vEl('vEta').textContent = eta;
-  vEl('bloodChip').textContent = `кровопотеря: ${Math.round(c.lost)} мл`;
-  const list = vEl('wounds');
-  if (list.children.length !== c.wounds.length || c.physT - (list._t || 0) > 0.25) {
-    list._t = c.physT;
+  T.vEta = eta;
+  T.bloodChip = `кровопотеря: ${Math.round(c.lost)} мл`;
+  for (const k in T) setText(k, T[k]);
+  const list = vEl('wounds'), key = c.wounds.map(w => w.zone + w.name + fmtRate(w.now || w.rate)).join('|');
+  if (list._key !== key) {
+    list._key = key;
     list.replaceChildren(...c.wounds.map(w => {
       const li = document.createElement('li');
       if (w.rate >= 3) li.className = 'art';
@@ -2518,7 +2525,7 @@ function frame(now) {
   }
   controls.update();
   const dist = camera.position.distanceTo(vecOf(byName.chest.body.translation()));
-  distText.textContent = `дистанция: ${dist.toFixed(1)} м`;
+  setText(distText, `дистанция: ${dist.toFixed(1)} м`);
   renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
@@ -2613,9 +2620,17 @@ canvas.addEventListener('pointerup', e => {
 });
 const aimChip = document.getElementById('aimChip');
 let hovered = null;
+// the aim readout under the cursor: at most once a frame, and not while the camera is being dragged
+let hoverAt = null;
 canvas.addEventListener('pointermove', e => {
-  const r = canvas.getBoundingClientRect();
-  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  if (e.buttons) { hoverAt = null; return; }
+  if (!hoverAt) requestAnimationFrame(updateHover);
+  hoverAt = { x: e.offsetX, y: e.offsetY };
+});
+function updateHover() {
+  if (!hoverAt) return;
+  ndc.set((hoverAt.x / canvas.clientWidth) * 2 - 1, -(hoverAt.y / canvas.clientHeight) * 2 + 1);
+  hoverAt = null;
   raycaster.setFromCamera(ndc, camera);
   const h = raycaster.intersectObjects(parts.map(p => p.mesh), false)[0];
   const part = h ? h.object.userData.part : null;
@@ -2625,8 +2640,8 @@ canvas.addEventListener('pointermove', e => {
     const t = woundTrack(byName[part], h.point, raycaster.ray.direction.clone());
     text = ZONE_LABEL[part] + (t.organs.length ? ' → ' + t.organs.map(o => o.name).join(', ') : '');
   }
-  aimChip.textContent = 'прицел: ' + text;
-});
+  setText(aimChip, 'прицел: ' + text);
+}
 
 applyTheme();
 buildWorld();
