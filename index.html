@@ -1800,6 +1800,32 @@ let weapon = WEAPONS[0], impulseMult = 1;
 const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
 const effects = [];
+// Hit testing against the skinned model. three.js would pose every triangle's corners again for each ray (and once
+// more for the bounding sphere); instead the skin is posed on the CPU once per shot into a plain copy, and every
+// pellet, and the search for the exit hole, tests that copy.
+const skinProxies = modelMeshes.map(m => {
+  const g = new THREE.BufferGeometry();
+  g.setIndex(m.geometry.index);
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(m.geometry.attributes.position.count * 3), 3));
+  const proxy = new THREE.Mesh(g, m.material);
+  proxy.matrixAutoUpdate = false; proxy.userData.src = m;
+  return proxy;
+});
+const skinV = new THREE.Vector3();
+function poseSkinProxies() {
+  for (const proxy of skinProxies) {
+    const m = proxy.userData.src, arr = proxy.geometry.attributes.position.array, n = arr.length / 3;
+    for (let i = 0; i < n; i++) { m.getVertexPosition(i, skinV); arr[i * 3] = skinV.x; arr[i * 3 + 1] = skinV.y; arr[i * 3 + 2] = skinV.z; }
+    proxy.geometry.computeBoundingSphere();
+    proxy.matrixWorld.copy(m.matrixWorld);
+  }
+}
+// intersections with the model (and anything else given), reported against the real skinned meshes
+function hitModel(rc, extra = []) {
+  const hits = rc.intersectObjects([...skinProxies, ...extra], false);
+  for (const h of hits) if (h.object.userData.src) h.object = h.object.userData.src;
+  return hits;
+}
 
 // pellet direction: uniform over a cone around the aim
 function spreadDir(base, half) {
@@ -1825,7 +1851,7 @@ function shoot(clientX, clientY) {
   ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
   const ray = raycaster.ray.clone();
-  for (const m of modelMeshes) m.computeBoundingSphere();
+  poseSkinProxies();
   const muzzle = camera.position.clone().add(new THREE.Vector3(0.12, -0.12, 0).applyQuaternion(camera.quaternion));
   const n = weapon.pellets || 1;
   const p = weapon.m * weapon.v * impulseMult; // per projectile
@@ -1834,7 +1860,7 @@ function shoot(clientX, clientY) {
   for (let i = 0; i < n; i++) {
     const d = n > 1 ? spreadDir(ray.direction, weapon.spread) : ray.direction.clone();
     raycaster.set(ray.origin, d);
-    const h = raycaster.intersectObjects([...modelMeshes, floor], false)[0];
+    const h = hitModel(raycaster, [floor])[0];
     if (i === 0) hit = h;
     const end = h ? h.point.clone() : ray.origin.clone().addScaledVector(d, 60);
     const dir = end.clone().sub(muzzle).normalize();
@@ -1917,17 +1943,19 @@ function tracer(a, b, alpha = 0.9) {
   const mat = tracerMat.clone(); mat.opacity = alpha;
   const line = new THREE.Line(g, mat);
   scene.add(line);
-  effects.push({ obj: line, life: 0.35, age: 0, update(e, k) { e.obj.material.opacity = alpha * (1 - k); } });
+  effects.push({ obj: line, life: 0.35, age: 0, update(e, k) { e.obj.material.opacity = alpha * (1 - k); }, done() { g.dispose(); mat.dispose(); } });
 }
 function dust(pt, count = 10) {
   const geo = new THREE.IcosahedronGeometry(0.02, 0);
   const mat = new THREE.MeshBasicMaterial({ color: cssVar('--scene-grid'), transparent: true });
+  let left = count;
+  const done = () => { if (--left === 0) { geo.dispose(); mat.dispose(); } };
   for (let i = 0; i < count; i++) {
     const m = new THREE.Mesh(geo, mat);
     m.position.copy(pt);
     const v = new THREE.Vector3((Math.random() - 0.5) * 1.2, 0.6 + Math.random() * 1.2, (Math.random() - 0.5) * 1.2);
     scene.add(m);
-    effects.push({ obj: m, life: 0.6, age: 0, update(e, k, dt) { v.y -= 6 * dt; e.obj.position.addScaledVector(v, dt); mat.opacity = 1 - k; } });
+    effects.push({ obj: m, life: 0.6, age: 0, update(e, k, dt) { v.y -= 6 * dt; e.obj.position.addScaledVector(v, dt); mat.opacity = 1 - k; }, done });
   }
 }
 
@@ -2111,7 +2139,7 @@ function addWound(part, hit, dir) {
   if (track.perforating) {
     // find where the track leaves the skin of the same segment
     const from = track.exit.clone().addScaledVector(dir, 0.3);
-    const outHit = new THREE.Raycaster(from, dir.clone().negate(), 0, 0.6).intersectObjects(modelMeshes, false)
+    const outHit = hitModel(new THREE.Raycaster(from, dir.clone().negate(), 0, 0.6))
       .find(h => partOfHit(h) === part.n && h.point.distanceTo(track.exit) < 0.12);
     if (outHit) addWoundSlot(w, outHit.object, domBone(outHit), outHit.point, rOut);
   }
@@ -2396,9 +2424,25 @@ function syncMeshes() {
 }
 
 let timeScale = 1, acc = 0, last = performance.now();
+// Quality follows the device: a GPU that cannot hold the frame rate gets fewer pixels, then a smaller shadow map;
+// once it runs smoothly for a while, pixels come back.
+const PR_MAX = Math.min(devicePixelRatio, 2);
+let pixelRatio = PR_MAX, slowT = 0, smoothT = 0;
+function adaptQuality(dt) {
+  slowT = dt > 1 / 45 ? slowT + dt : Math.max(0, slowT - dt * 0.5);
+  smoothT = dt < 1 / 55 ? smoothT + dt : 0;
+  if (slowT > 2) {
+    slowT = 0; smoothT = 0;
+    if (pixelRatio > 0.75) { pixelRatio = Math.max(0.75, pixelRatio - 0.25); renderer.setPixelRatio(pixelRatio); resize(); }
+    else if (sun.shadow.mapSize.x > 1024) { sun.shadow.mapSize.set(1024, 1024); sun.shadow.map?.dispose(); sun.shadow.map = null; }
+  } else if (smoothT > 10 && pixelRatio < PR_MAX) {
+    smoothT = 0; pixelRatio = Math.min(PR_MAX, pixelRatio + 0.25); renderer.setPixelRatio(pixelRatio); resize();
+  }
+}
 function frame(now) {
   const dtReal = Math.min(0.05, (now - last) / 1000);
   last = now;
+  if (!document.hidden) adaptQuality(dtReal);
   if (replay) {
     replay.i += dtReal * 60 * 0.25;
     if (replay.i >= replay.frames.length - 1) { replay = null; document.getElementById('replayBadge').hidden = true; syncMeshes(); }
@@ -2417,7 +2461,7 @@ function frame(now) {
     const e = effects[i]; e.age += dtReal;
     const k = Math.min(1, e.age / e.life);
     e.update(e, k, dtReal);
-    if (k >= 1) { scene.remove(e.obj); effects.splice(i, 1); }
+    if (k >= 1) { scene.remove(e.obj); effects.splice(i, 1); e.done?.(); }
   }
   poseRig();
   if (followCam) { // keep the body in frame as it goes down or moves
@@ -2552,6 +2596,16 @@ buildWorld();
 resize();
 document.getElementById('loading').remove();
 log('info', 'Готово', 'Манекен стоит в 4 м от камеры. Выстрел идёт из точки, где находится камера.');
+// compile the shaders of tracers, dust, blood and pools now rather than in the frame of the first shot; the
+// warm-up materials stay alive so their programs are kept for the clones made later
+{
+  const warm = [new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0.01, 0)]), tracerMat),
+    new THREE.Mesh(new THREE.IcosahedronGeometry(0.01, 0), new THREE.MeshBasicMaterial({ transparent: true })),
+    new THREE.Mesh(new THREE.IcosahedronGeometry(0.01, 0), bloodMat), new THREE.Mesh(new THREE.CircleGeometry(0.01, 6), poolMat)];
+  for (const o of warm) { o.position.set(0, -5, 0); scene.add(o); }
+  renderer.compile(scene, camera);
+  for (const o of warm) scene.remove(o);
+}
 requestAnimationFrame(frame);
 </script>
 </body>
