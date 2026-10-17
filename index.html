@@ -391,7 +391,7 @@ Object.assign(sun.shadow.camera, { left: -4, right: 4, top: 4, bottom: -4, near:
 scene.add(sun);
 
 const floorMat = new THREE.MeshStandardMaterial({ roughness: 0.95 });
-const floor = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), floorMat);
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), floorMat);
 floor.rotation.x = -Math.PI / 2;
 floor.receiveShadow = true;
 scene.add(floor);
@@ -502,7 +502,123 @@ for (const m of modelMeshes) {
   }
 }
 const tq = new THREE.Quaternion(), pq = new THREE.Quaternion(), tv = new THREE.Vector3();
+
+// motion capture for running: the clips that ship with the model
+const mixer = new THREE.AnimationMixer(model);
+const CLIPS = Object.fromEntries(gltf.animations.map(a => [a.name, a]));
+const CLIP_SPEED = { run: 3.55, walk: 1.5 }; // m/s of ground covered by the planted foot, measured from the clips
+const DRIVEN = new Set(DRIVE.map(d => d.bone));
+const restLocal = [];
+model.traverse(o => { if (o.isBone) restLocal.push([o, o.quaternion.clone(), o.position.clone()]); });
+// the bone that places each physics part; at rest a part has no rotation and sits at a fixed offset from it
+const PART_BONE = { pelvis: 'Hips', abdomen: 'Spine1', chest: 'Spine2', head: 'Head', uArmL: 'LeftArm', fArmL: 'LeftForeArm', uArmR: 'RightArm',
+  fArmR: 'RightForeArm', thighL: 'LeftUpLeg', shinL: 'LeftLeg', footL: 'LeftFoot', thighR: 'RightUpLeg', shinR: 'RightLeg', footR: 'RightFoot' };
+const PART_REST = Object.fromEntries(Object.entries(PART_BONE).map(([n, b]) => [n, {
+  bone: rigBones[b], qInv: rigBones[b].getWorldQuaternion(new THREE.Quaternion()).invert(), pos: rigBones[b].getWorldPosition(new THREE.Vector3()) }]));
+function resetRig() {
+  mixer.stopAllAction();
+  for (const [b, q, p] of restLocal) { b.quaternion.copy(q); b.position.copy(p); }
+  model.position.set(0, 0, 0); model.quaternion.identity(); model.updateMatrixWorld(true);
+}
+const rq = new THREE.Quaternion(), rq2 = new THREE.Quaternion(), rv = new THREE.Vector3();
+// turn a bone about the world vertical, for looking back over the shoulder
+function turnBone(b, yaw) {
+  b.parent.getWorldQuaternion(pq);
+  rq.setFromAxisAngle(UP, yaw);
+  b.quaternion.premultiply(rq2.copy(pq).invert().multiply(rq).multiply(pq));
+}
+function startRun(vmax, dirH) {
+  const c = character, pel = byName.pelvis.body, pt = pel.translation();
+  const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(toQ(pel.rotation(), rq));
+  const clip = vmax < 2.4 ? 'walk' : 'run';
+  const r = { mode: 'go', t: 0, v: 0, vmax, dirH, heading: Math.atan2(fwd.x, fwd.z), root: { x: pt.x, z: pt.z }, clip, w: 0, idle: null,
+    lookAt: 1.2 + Math.random() * 1.5, snap: {}, kin: {} };
+  for (const p of parts) {
+    const t = p.body.translation(), q = p.body.rotation();
+    r.snap[p.n] = { p: new THREE.Vector3(t.x, t.y, t.z), q: new THREE.Quaternion(q.x, q.y, q.z, q.w) };
+    r.kin[p.n] = { p: r.snap[p.n].p.clone(), q: r.snap[p.n].q.clone(), v: new THREE.Vector3(), w: new THREE.Vector3() };
+    p.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
+  }
+  mixer.stopAllAction();
+  r.action = mixer.clipAction(CLIPS[clip]);
+  r.action.reset().setEffectiveWeight(1).play();
+  r.action.time = Math.random() * CLIPS[clip].duration;
+  c.run = r;
+}
+// hand the body back to the ragdoll at the pose and with the velocity the clip gave it
+function releaseRun(stumble) {
+  const c = character, r = c.run;
+  if (!r) return;
+  c.run = null;
+  for (const p of parts) {
+    const k = r.kin[p.n];
+    p.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+    p.body.setLinvel(k.v, true); p.body.setAngvel(k.w, true);
+  }
+  mixer.stopAllAction();
+  for (const [b, q, p] of restLocal) if (!DRIVEN.has(b)) { b.quaternion.copy(q); b.position.copy(p); }
+  c.heading = r.heading;
+  // cut down at speed, nobody catches their balance
+  if (stumble && r.v > 1.5) { c.balanceTarget = Math.min(c.balanceTarget, 0.25); c.balanceRate = 3; c.noLift = true; }
+}
+function runAnim(dt) {
+  const c = character, r = c.run;
+  if (!r) return;
+  if (!canRun()) { releaseRun(true); return; }
+  r.t += dt;
+  const turnLeft = wrapAngle(r.dirH - r.heading);
+  if (r.mode === 'go') {
+    r.heading = wrapAngle(r.heading + Math.sign(turnLeft) * Math.min(Math.abs(turnLeft), 6 * dt));
+    if (Math.hypot(r.root.x, r.root.z) > 35) r.mode = 'stop'; // far enough: the zoom has its limits
+  }
+  const vT = r.mode === 'go' ? (Math.abs(turnLeft) < 1 ? r.vmax : 0.8) : 0;
+  r.v += Math.max(-5 * dt, Math.min(5 * dt, vT - r.v));
+  r.root.x += Math.sin(r.heading) * r.v * dt; r.root.z += Math.cos(r.heading) * r.v * dt;
+  // the clip plays at the speed the ground goes by, so the planted foot stays planted
+  r.action.timeScale = Math.max(0.55, Math.min(1.5, r.v / CLIP_SPEED[r.clip]));
+  if (r.mode === 'stop' && r.v < 1 && !r.idle) {
+    r.idle = mixer.clipAction(CLIPS.idle);
+    r.idle.reset().setEffectiveWeight(1).play();
+    r.action.crossFadeTo(r.idle, 0.45, false);
+    r.idleT = r.t;
+  }
+  if (r.idle && r.t - r.idleT > 0.5) { releaseRun(false); return; }
+  mixer.update(dt);
+  model.position.set(r.root.x, 0, r.root.z);
+  model.quaternion.setFromAxisAngle(UP, r.heading);
+  // halfway, a glance back at the shooter over the nearer shoulder
+  const lt = (r.t - r.lookAt) / 1.1;
+  if (r.mode === 'go' && lt > 0 && lt < 1) {
+    const back = wrapAngle(Math.atan2(camera.position.x - r.root.x, camera.position.z - r.root.z) - r.heading);
+    const yaw = Math.sign(back || 1) * Math.min(1.5, Math.abs(back)) * Math.sin(lt * Math.PI);
+    model.updateMatrixWorld(true);
+    turnBone(rigBones.Spine2, yaw * 0.25); model.updateMatrixWorld(true);
+    turnBone(rigBones.Neck, yaw * 0.35); model.updateMatrixWorld(true);
+    turnBone(rigBones.Head, yaw * 0.4);
+  }
+  model.updateMatrixWorld(true);
+  // the bodies follow the skeleton; at the start they blend in from where the ragdoll was
+  r.w = Math.min(1, r.t / 0.3);
+  for (const p of parts) {
+    const pr = PART_REST[p.n], k = r.kin[p.n];
+    pr.bone.getWorldQuaternion(rq).multiply(pr.qInv);
+    pr.bone.getWorldPosition(rv).add(tv.set(p.c[0], p.c[1], p.c[2]).sub(pr.pos).applyQuaternion(rq));
+    if (r.w < 1) { rv.lerpVectors(r.snap[p.n].p, rv, r.w); rq2.copy(rq); rq.copy(r.snap[p.n].q).slerp(rq2, r.w); }
+    if (rq.dot(k.q) < 0) rq.set(-rq.x, -rq.y, -rq.z, -rq.w); // same rotation; a flipped sign would read as a full turn in one step
+    k.v.copy(rv).sub(k.p).divideScalar(dt);
+    rq2.copy(k.q).invert().premultiply(rq); // rotation over this step, in world
+    if (rq2.w < 0) rq2.set(-rq2.x, -rq2.y, -rq2.z, -rq2.w);
+    const ang = 2 * Math.acos(Math.min(1, rq2.w)), sn = Math.sqrt(Math.max(1e-12, 1 - rq2.w * rq2.w));
+    k.w.set(rq2.x / sn, rq2.y / sn, rq2.z / sn).multiplyScalar(ang / dt);
+    k.p.copy(rv); k.q.copy(rq);
+    p.body.setNextKinematicTranslation(rv);
+    p.body.setNextKinematicRotation(rq);
+  }
+}
+
 function poseRig() {
+  // during a run the clip itself poses the skeleton
+  if (!replay && character.run && character.run.w >= 1) return;
   for (const d of DRIVE) {
     const m = byName[d.part].mesh;
     if (d.blend) tq.slerpQuaternions(byName[d.blend].mesh.quaternion, m.quaternion, 0.5); else tq.copy(m.quaternion);
@@ -601,10 +717,11 @@ let world, parts, byName, totalMass, simTime, events, character, balanceJoint, a
 
 function buildWorld() {
   if (world) world.free();
+  resetRig();
   world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
   world.timestep = DT;
   const gb = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, -0.1, 0));
-  world.createCollider(RAPIER.ColliderDesc.cuboid(30, 0.1, 30).setFriction(1.2).setCollisionGroups(FILTER.ground), gb);
+  world.createCollider(RAPIER.ColliderDesc.cuboid(100, 0.1, 100).setFriction(1.2).setCollisionGroups(FILTER.ground), gb);
 
   const defs = partDefs();
   const density = BODY_MASS / defs.reduce((s, d) => s + volume(d), 0);
@@ -748,26 +865,20 @@ function muscles(dt) {
     world.removeImpulseJoint(balanceJoint, true);
     balanceJoint = null;
   }
-  if (!balanceJoint) { c.run = null; return; }
-  updateRun(dt);
+  if (!balanceJoint) return;
   const kb = BAL_K * c.balance, db = BAL_D * c.balance;
-  // The anchor carries the heading (and a running lean); its translation follows the run.
+  // The anchor carries the heading: after running away the body stands facing where it ran.
   const A = anchorBody.translation();
-  if (c.run) { A.x = c.run.pos.x; A.z = c.run.pos.z; }
-  anchorQ.setFromEuler(anchorE.set(c.run ? c.run.lean : 0, c.heading, 0, 'YXZ'));
+  if (c.run) { // the anchor travels with the runner, so the ragdoll takes over without a jolt
+    const pt = byName.pelvis.body.translation();
+    A.x = pt.x; A.z = pt.z; c.heading = c.run.heading;
+  }
   anchorBody.setNextKinematicTranslation(A);
-  anchorBody.setNextKinematicRotation(anchorQ);
+  anchorBody.setNextKinematicRotation(anchorQ.setFromAxisAngle(UP, c.heading));
   // A generic joint built on axis X has the local basis X = anchor X, Y = anchor −Z, Z = anchor Y.
   motorAxis(balanceJoint, 3, 0, kb, db);              // pitch
   motorAxis(balanceJoint, 4, 0, kb, db);              // roll
-  motorAxis(balanceJoint, 5, 0, kb * (c.run ? 0.5 : 0.08), db * (c.run ? 0.5 : 0.2)); // yaw: loose standing, firm while turning to run
-  // while running, a share of the weight is carried by a push under the pelvis; the legs carry the rest.
-  // (A joint motor would not do: Rapier keeps a motor engaged even at zero stiffness, and the body would hang from it.)
-  if (c.run && c.run.support > 0) {
-    const pb = byName.pelvis.body, y = pb.translation().y, vy = pb.linvel().y, sup = c.run.support * c.balance;
-    const f = Math.max(0, Math.min(650, sup * (5000 * (c.run.h - y) - 500 * vy)));
-    pb.applyImpulse({ x: 0, y: f * dt, z: 0 }, true);
-  }
+  motorAxis(balanceJoint, 5, 0, kb * 0.08, db * 0.2); // yaw, kept loose
   // keep the pelvis over the support area, weighted toward the leg that still carries load
   const wL = byName.shinL.tone + 0.02, wR = byName.shinR.tone + 0.02;
   const fL = byName.footL.body.translation(), fR = byName.footR.body.translation();
@@ -778,64 +889,24 @@ function muscles(dt) {
     const f = byName['foot' + (c.kneel === 'L' ? 'R' : 'L')].body.translation();
     sx = (knee.x + f.x) / 2; sz = knee.z * 0.65 + f.z * 0.35;
   }
-  if (c.run && !c.kneel) { sx = c.run.pos.x; sz = c.run.pos.z; }
   const kl = BAL_LIN_K * c.balance * (c.seated || c.noLift ? 0 : 1), dl = BAL_LIN_D * c.balance;
   // the target offset from the anchor, in the anchor's frame
   const ox = sx - A.x, oz = sz - A.z, ch = Math.cos(c.heading), sh = Math.sin(c.heading);
   motorAxis(balanceJoint, 0, ox * ch - oz * sh, kl, dl);
   motorAxis(balanceJoint, 1, -(ox * sh + oz * ch), kl, dl);
 }
-const anchorQ = new THREE.Quaternion(), anchorE = new THREE.Euler();
+const anchorQ = new THREE.Quaternion(), UP = new THREE.Vector3(0, 1, 0);
 const wrapAngle = a => Math.atan2(Math.sin(a), Math.cos(a));
 
 // ---------- running away ----------
-// The pelvis is carried by the moving anchor and partly held up; a gait layer swings the legs and arms.
-// Anything that takes the legs or the balance away (a leg wound, a broken pelvis, fainting) turns the run into a
-// stumble: the support goes at once and the body carries its momentum forward.
-function brakeRun() {
-  const r = character.run;
-  if (!r || r.mode === 'brake') return;
-  r.mode = 'brake'; r.support = 0; fadeOut(r.layer, 0.3);
-}
-const RUN_BLOCKED = ['stagger', 'kneel', 'sit', 'lie_down', 'double_over', 'rock', 'curl', 'writhe', 'try_rise', 'straighten'];
-function updateRun(dt) {
-  const c = character, r = c.run;
-  if (!r) return;
-  const legsOk = (c.cap.thighL ?? 1) > 0.5 && (c.cap.thighR ?? 1) > 0.5;
-  if (r.mode !== 'brake' && !(c.conscious && c.state !== 'down' && !c.seated && !c.kneel && legsOk && c.balanceTarget > 0.5)) brakeRun();
-  r.t += dt;
-  let turnLeft = 0;
-  if (r.mode !== 'brake') { // turn toward the way out, quickly but not instantly
-    turnLeft = wrapAngle(r.dirH - c.heading);
-    c.heading = wrapAngle(c.heading + Math.sign(turnLeft) * Math.min(Math.abs(turnLeft), 5.5 * dt));
-    const p = byName.pelvis.body.translation();
-    if (Math.hypot(p.x, p.z) > 24) r.mode = 'stop'; // the edge of the ground
-  }
-  const vT = r.mode === 'go' ? (Math.abs(turnLeft) < 0.9 ? r.vmax : 0.4) : 0;
-  const acc = r.mode === 'brake' ? 7 : r.mode === 'stop' ? 4 : 4.5;
-  r.v += Math.max(-acc * dt, Math.min(acc * dt, vT - r.v));
-  r.pos.x += Math.sin(c.heading) * r.v * dt; r.pos.z += Math.cos(c.heading) * r.v * dt;
-  if (r.mode === 'brake') { if (r.v < 0.05) c.run = null; return; }
-  if (r.mode === 'stop' && r.v < 0.05) { fadeOut(r.layer, 0.6); c.run = null; return; }
-  // gait: about 1.4 strides a second at a jog, the swing grows with speed; a few small steps while turning
-  const a = Math.max(Math.min(1, r.v / 3.2), Math.abs(turnLeft) > 0.2 ? 0.35 : 0, r.mode === 'stop' ? 0 : 0.15);
-  r.phase += 2 * Math.PI * (0.9 + 0.17 * r.v) * dt;
-  r.support = Math.min(1, r.t / 0.3) * (0.5 + 0.5 * a);
-  r.h = 0.96 - 0.05 * a + 0.025 * a * Math.cos(2 * r.phase); // pelvis height, m
-  r.lean = 0.14 * a;
-  const P = r.layer.pose, sw = (S, ph) => {
-    const sn = Math.sin(ph), cs = Math.cos(ph);
-    P['thigh' + S] = [-0.15 * a - 0.62 * a * sn, 0, 0];
-    P['shin' + S] = [0.2 * a + 1.25 * a * Math.max(0, cs), 0, 0];
-    // the opposite arm swings with this leg; an arm already holding a wound or raised barely swings
-    const H = S === 'L' ? 'R' : 'L';
-    const busy = layers.some(l => l.tag === 'ai-arms' && l.pose['uArm' + H] && layerWeight(l) > 0.3);
-    P['uArm' + H] = [-0.8 * a * sn * (busy ? 0.15 : 1), 0, 0];
-    if (busy) delete P['fArm' + H]; else P['fArm' + H] = [-1.3 * a, 0, 0];
-  };
-  sw('L', r.phase); sw('R', r.phase + Math.PI);
-  P.chest = [0.1 * a, 0, 0]; P.head = [-0.12 * a, 0, 0];
-}
+// Running is motion capture: the skeleton plays the X Bot's own run (or walk, when hurt) clip, the model moves
+// along the heading at the clip's ground speed, and the physics bodies follow the bones kinematically, so
+// shots still land where the body is. When the run ends the clip settles into a stand and the ragdoll takes over
+// at that pose. Anything that takes the legs or consciousness away hands the body back at once with the
+// velocity it had: the ragdoll stumbles on and falls.
+function brakeRun() { if (character.run) releaseRun(true); }
+// while the clip runs the body, scripted poses cannot act: only breathing and fainting go through
+const RUN_ALLOWED = ['gasp', 'faint'];
 
 // ---------- reactions ----------
 // caps hold what an injury makes impossible (a paralysed or broken limb cannot be tensed again)
@@ -1146,13 +1217,11 @@ const ACTIONS = {
     if (zones.includes('leg')) vmax *= 0.45;
     if (zones.includes('abdomen') || zones.includes('chest') || zones.includes('pelvis')) vmax *= 0.75;
     vmax *= c.vigor;
-    for (const l of layers) if (l.tag === 'buckle' || l.tag === 'ai-legs' || l.tag === 'ai-torso' || l.tag === 'ai-body') fadeOut(l, 0.3);
-    c.run = { mode: 'go', t: 0, v: 0, vmax, dirH: wrapAngle(away + off), phase: 0, pos: { x: p.x, z: p.z }, support: 0, h: 0.96, lean: 0,
-      layer: addLayer({}, { attack: 0.25, hold: Infinity, release: 0.5, tag: 'run' }) };
-    beatTone(b, LEGS, 1, 6);
-    beatTone(b, ['uArmL', 'uArmR', 'fArmL', 'fArmR'], 0.7, 4);
+    // poses held from before would pull the body back into them once the run hands it back
+    for (const l of layers) if (l.tag !== 'life') fadeOut(l, 0.3);
+    startRun(vmax, wrapAngle(away + off));
     const stop = () => { if (c.run && c.run.mode === 'go') c.run.mode = 'stop'; };
-    return { update(t) { if (t > b.dur - 0.8) stop(); }, end: stop };
+    return { update(t) { if (t > b.dur - 0.6) stop(); }, end: stop };
   },
   faint(b) {
     // only physiology decides: the script may ask, the blood and the heart answer
@@ -1169,7 +1238,7 @@ const UPPER = ['head', 'chest', 'abdomen', 'uArmL', 'uArmR', 'fArmL', 'fArmR'];
 const MOVES = { look: ['head', 'chest'], rock: ['chest', 'abdomen', 'head'], writhe: null, gasp: ['chest', 'abdomen', 'head', 'uArmL', 'uArmR'],
   tremble: ['uArmL', 'uArmR', 'fArmL', 'fArmR', 'head'] };
 function beginBeat(b) {
-  if (character.run && character.run.mode !== 'brake' && RUN_BLOCKED.includes(b.action)) { b.state = 'skip'; return; }
+  if (character.run && !RUN_ALLOWED.includes(b.action)) { b.state = 'skip'; return; }
   const fx = ACTIONS[b.action](b);
   if (!fx) { b.state = 'skip'; return; }
   Object.assign(b, { fx, state: 'run' });
@@ -1464,11 +1533,9 @@ function fleeScript(lib, hits) {
   const beats = [
     { ...meta, t: 0, dur: 0.6, action: 'look', at: 'shooter', intensity: 0.9, note: 'Засекает, откуда стреляют' },
     { ...meta, t: go, dur: run, action: 'flee', dir: pick(['left', 'right', 'back']), intensity: 0.6 + R() * 0.4,
-      note: lead ? 'Бежит прочь, несмотря на рану: адреналин глушит боль' : 'Бросается прочь от стрелка' },
-    { ...meta, t: go + run * (0.4 + R() * 0.2), dur: 1.1, action: 'look', at: 'shooter', intensity: 0.8, note: 'Оглядывается на бегу' },
+      note: lead ? 'Бежит прочь, несмотря на рану, на бегу оглядывается: адреналин глушит боль' : 'Бросается прочь от стрелка, на бегу оглядывается' },
   ];
-  if (lead && zk !== 'head') beats.push({ ...meta, t: go + 0.8, dur: Math.max(1, run - 1), action: 'clutch', hand: zk === 'arm' ? far : near, intensity: 0.7, note: 'На бегу прижимает рану рукой' });
-  const after = go + run + 1.2;
+  const after = go + run + 1.4;
   for (const b of lib?.beats || []) if (b.action !== 'stagger' && b.action !== 'flee') beats.push({ ...b, t: b.t + after });
   return beats.sort((a, b) => a.t - b.t);
 }
@@ -1598,7 +1665,7 @@ function react(zone, side, hitDir, w) {
     return { text: 'Перелом таза: это опора для обеих ног. Ноги не держат вес, тело падает сразу, без отброса.' };
   }
   if (zone.startsWith('thigh') || zone.startsWith('shin') || zone.startsWith('foot')) {
-    const running = c.run && c.run.mode !== 'brake';
+    const running = c.run && c.run.mode === 'go';
     brakeRun();
     const S = zone.slice(-1), H = S === 'L' ? 'R' : 'L';
     flinch(jitter(0.4, 0.3), side, fromFront);
@@ -2191,6 +2258,7 @@ function applyFrame(f) {
 function step() {
   runScript();
   muscles(DT);
+  runAnim(DT);
   world.step();
   simTime += DT;
   for (const l of layers) l.age += DT;
@@ -2267,7 +2335,12 @@ function frame(now) {
   // a body far away is brought closer by zooming, like a long lens: the shooter, and so the camera, stay where they are
   const far = camera.position.distanceTo(controls.target);
   const fov = followCam ? Math.max(6, Math.min(42, 2 * Math.atan(2.6 / far) * 180 / Math.PI)) : 42;
-  if (Math.abs(fov - camera.fov) > 0.01) { camera.fov += (fov - camera.fov) * (1 - Math.exp(-dtReal * 3)); camera.updateProjectionMatrix(); }
+  if (Math.abs(fov - camera.fov) > 0.01) {
+    camera.fov += (fov - camera.fov) * (1 - Math.exp(-dtReal * 3)); camera.updateProjectionMatrix();
+    // the haze recedes with the zoom, or a distant body would fade into it
+    const z = 42 / camera.fov;
+    scene.fog.near = 14 * z; scene.fog.far = 40 * z;
+  }
   controls.update();
   const dist = camera.position.distanceTo(vecOf(byName.chest.body.translation()));
   distText.textContent = `дистанция: ${dist.toFixed(1)} м`;
