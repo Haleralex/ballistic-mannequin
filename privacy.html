@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Конфиденциальность · Баллистический манекен</title>
+<meta name="description" content="Какие данные собирает симулятор «Баллистический манекен», зачем, где они хранятся и как попросить их удалить.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Barlow:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap">
+<style>
+:root {
+  --bg: #e4e7e8; --panel: #f5f6f6; --ink: #1b2226; --muted: #5a666c; --line: #c6cdd0; --accent: #1d5bb8; --warn: #b8730f;
+  --font-display: "Barlow Condensed", "Arial Narrow", "Roboto Condensed", sans-serif;
+  --font-body: "Barlow", "Segoe UI", Roboto, sans-serif;
+  --font-data: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #13171a; --panel: #1a2024; --ink: #e2e7e9; --muted: #95a2a8; --line: #2d363b; --accent: #6c9cff; --warn: #e6a640; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.55 var(--font-body); }
+main { max-width: 760px; margin: 0 auto; padding: 32px max(16px, env(safe-area-inset-left, 0px)) 48px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 28px clamp(18px, 4vw, 36px); }
+h1 { font-family: var(--font-display); font-weight: 700; font-size: clamp(30px, 6vw, 40px); line-height: 1; text-transform: uppercase; margin: 0 0 8px; }
+h2 { font-family: var(--font-display); font-weight: 600; font-size: 15px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin: 28px 0 8px; }
+p, li { max-width: 65ch; }
+p { margin: 8px 0; }
+ul { padding-left: 22px; margin: 8px 0; }
+li { margin: 4px 0; }
+a { color: var(--accent); }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sub { color: var(--muted); margin: 0; }
+code { font-family: var(--font-data); font-size: 13.5px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+.todo { border-left: 3px solid var(--warn); background: var(--bg); padding: 8px 12px; border-radius: 0 6px 6px 0; }
+.back { display: inline-block; margin-bottom: 16px; font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <a class="back" href="./">← К симулятору</a>
+  <div class="card">
+    <h1>Конфиденциальность</h1>
+    <p class="sub">Что собирает «Баллистический манекен», зачем и как это удалить.</p>
+
+    <h2>Коротко</h2>
+    <p>Аккаунтов нет, имя и телефон мы не спрашиваем. Сайт помнит анонимный номер браузера и считает, какими функциями пользуются. Почту мы получаем, только если вы сами оставили её в листе ожидания и дали согласие.</p>
+
+    <h2>Что собирается</h2>
+    <ul>
+      <li><b>Анонимный номер посетителя.</b> Случайный идентификатор, который браузер создаёт при первом визите и хранит у себя (<code>localStorage</code>). По нему нельзя узнать, кто вы. Cookie мы не ставим.</li>
+      <li><b>Номер сеанса.</b> Такой же случайный идентификатор вкладки, меняется после 30 минут бездействия (<code>sessionStorage</code>).</li>
+      <li><b>События использования:</b> открыта страница, нажата кнопка «Попробовать», сделан выстрел (оружие и зона попадания), досмотрена реакция, создана ссылка, скачан клип, поставлена оценка, открыто описание будущей функции. Плюс адрес сайта, с которого вы пришли, и метки рекламной кампании (utm), если они были в ссылке.</li>
+      <li><b>Вариант эксперимента.</b> Мы сравниваем разные тексты и подсказки; сервер запоминает, какой вариант показан вашему браузеру.</li>
+      <li><b>Реакции, которыми вы поделились.</b> Если нажать «Поделиться», на сервер уходит запись выстрелов и настроек симулятора (без видео), чтобы её можно было открыть по ссылке.</li>
+      <li><b>Оценки и комментарии</b> к реалистичности сценария, если вы их оставили.</li>
+      <li><b>Адрес почты</b> — только если вы оставили его в листе ожидания «Репетиционной комнаты» или Pro и отметили согласие на обработку.</li>
+    </ul>
+    <p>Клипы записываются и сохраняются прямо в вашем браузере, на сервер они не попадают.</p>
+
+    <h2>Зачем</h2>
+    <ul>
+      <li>Понять, кому и чем полезен симулятор, и что в нём улучшать.</li>
+      <li>Открывать реакции по ссылкам, которыми вы делитесь.</li>
+      <li>Почта — чтобы один раз написать о запуске функции, за которой вы записались (и, для Pro, прислать обещанную скидку). Рассылок и передачи адреса третьим лицам нет.</li>
+    </ul>
+
+    <h2>Где хранится и сколько</h2>
+    <p>Данные хранятся в базе на серверах в России, в соответствии с Федеральным законом № 152-ФЗ «О персональных данных». Анонимные события хранятся до конца исследования, но не дольше двух лет. Почта хранится, пока функция не запущена и вам не написали, либо до вашего запроса на удаление.</p>
+
+    <h2>Как удалить данные или отозвать согласие</h2>
+    <p>Напишите на <a href="mailto:privacy@example.ru">privacy@example.ru</a> и укажите адрес почты, который оставляли. Мы удалим его и подтвердим удаление в течение 30 дней. Согласие можно отозвать тем же письмом.</p>
+    <p class="todo"><b>TODO до запуска:</b> <code>privacy@example.ru</code> — временный адрес-заглушка. Заменить на настоящий контакт оператора персональных данных, указать наименование оператора и его адрес, подтвердить сроки хранения.</p>
+    <p>Анонимный номер посетителя хранится в вашем браузере: чтобы сбросить его, очистите данные этого сайта в настройках браузера.</p>
+  </div>
+</main>
+</body>
+</html>
