@@ -61,18 +61,19 @@ func staticFixture(t *testing.T) string {
 	parent := t.TempDir()
 	dir := filepath.Join(parent, "site")
 	files := map[string]string{
-		"index.html":           "<!doctype html><title>sim</title>",
-		"app.js":               "export const app = 1;",
-		"xbot.js":              "export default 'glb';",
-		".env":                 "ADMIN_PASSWORD=leak",
-		".git/config":          "[core]",
-		"server/main.go":       "package main",
-		"deploy/Caddyfile":     "example.com",
-		"features/share.js":    "export {};",
-		"assets/og/heart.png":  "png",
-		"docs/index.html":      "<p>docs</p>",
-		"emptydir/readme.txt":  "no index here",
-		"tests/smoke.test.mjs": "test",
+		"index.html":            "<!doctype html><title>sim</title>",
+		"app.js":                "export const app = 1;",
+		"xbot.js":               "export default 'glb';",
+		".env":                  "ADMIN_PASSWORD=leak",
+		".git/config":           "[core]",
+		"server/main.go":        "package main",
+		"deploy/Caddyfile":      "example.com",
+		"features/share.js":     "export {};",
+		"assets/og/heart.png":   "png",
+		"assets/og/abdomen.png": "png",
+		"docs/index.html":       "<p>docs</p>",
+		"emptydir/readme.txt":   "no index here",
+		"tests/smoke.test.mjs":  "test",
 	}
 	for name, body := range files {
 		p := filepath.Join(dir, name)

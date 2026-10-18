@@ -24,6 +24,17 @@ func createCase(t *testing.T, e *env, caseJSON string) string {
 	return r.json(t)["id"].(string)
 }
 
+func TestSharePageFallsBackToDefaultImage(t *testing.T) {
+	e := newEnv(t)
+	id := createCase(t, e, strings.Replace(exampleCase, `"kind": "abdomen"`, `"kind": "spine"`, 1))
+	r := e.get("/r/" + id)
+	if r.status != 200 {
+		t.Fatalf("%d %s", r.status, r.body)
+	}
+	// there is no assets/og/spine.png in the test site
+	contains(t, r.body, `<meta property="og:image" content="`+e.srv.URL+`/assets/og/default.png">`)
+}
+
 func TestSharePageOpenGraphAndRedirect(t *testing.T) {
 	e := newEnv(t)
 	id := createCase(t, e, exampleCase)

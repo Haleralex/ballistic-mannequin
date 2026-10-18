@@ -37,6 +37,15 @@ func newStatic(dir string, log *slog.Logger, notFound http.HandlerFunc) *staticH
 	return h
 }
 
+// exists reports whether a regular file is present under STATIC_DIR (name relative, slash-separated).
+func (h *staticHandler) exists(name string) bool {
+	if h.root == nil {
+		return false
+	}
+	fi, err := h.root.Stat(name)
+	return err == nil && fi.Mode().IsRegular()
+}
+
 func (h *staticHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")

@@ -71,7 +71,7 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	page := sharePage{
 		Title:       previewTitle(cp),
 		Description: previewDescription(cp),
-		Image:       base + "/assets/og/" + ogKind(cp.Meta.Kind, c.Kind) + ".png",
+		Image:       base + "/assets/og/" + s.ogImage(ogKind(cp.Meta.Kind, c.Kind)) + ".png",
 		URL:         base + "/r/" + id,
 		Target:      "/?case=" + id,
 		SiteName:    siteName,
@@ -85,6 +85,15 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=300")
 	_, _ = w.Write(buf.Bytes())
+}
+
+// ogImage falls back to the generic picture when there is none for this kind yet: a preview with a broken image
+// looks worse than a generic one.
+func (s *Server) ogImage(kind string) string {
+	if kind != "default" && !s.static.exists("assets/og/"+kind+".png") {
+		return "default"
+	}
+	return kind
 }
 
 func ogKind(metaKind string, column *string) string {

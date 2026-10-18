@@ -42,7 +42,7 @@ type Server struct {
 	cfg    config.Config
 	store  *store.Store
 	log    *slog.Logger
-	static http.Handler
+	static *staticHandler
 	tmpl   *template.Template
 
 	events, cases, ratings, waitlist, other, adminFail *ratelimit.Limiter
