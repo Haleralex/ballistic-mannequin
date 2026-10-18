@@ -630,7 +630,7 @@ function buildWorld() {
   document.getElementById('rMass').textContent = totalMass.toFixed(1) + ' кг';
   simTime = 0; events = []; layers.length = 0; history.length = 0;
   character = { balance: 1, balanceTarget: 1, balanceRate: 3, conscious: true, state: 'ok', torsoHits: 0, collapseAt: null, kneel: null,
-    vigor: 1, lost: 0, bleedRate: 0, physT: 0, wounds: [], stage: 0, arrestAt: null, sway: null, heading: 0, run: null };
+    vigor: 1, lost: 0, bleedRate: 0, physT: 0, wounds: [], stage: 0, sway: null, heading: 0, run: null };
   clearBlood();
   woundSlots.length = 0;
   character.breath = 0; character.ph = Array.from({ length: 14 }, () => rand() * 6.28);
