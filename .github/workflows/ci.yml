@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go (vet, test on Postgres 16)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mq
+          POSTGRES_PASSWORD: mq
+          POSTGRES_DB: mq_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mq -d mq_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://mq:mq@localhost:5432/mq_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+      - name: Is the Go server here?
+        id: server
+        run: |
+          if [ -f server/go.mod ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Go job skipped::server/go.mod is not in this commit yet (team B's Go API)."
+          fi
+      - uses: actions/setup-go@v6
+        if: steps.server.outputs.present == 'true'
+        with:
+          go-version: "1.24"
+          cache-dependency-path: server/go.sum
+      - name: go vet
+        if: steps.server.outputs.present == 'true'
+        working-directory: server
+        run: go vet ./...
+      - name: go test
+        if: steps.server.outputs.present == 'true'
+        working-directory: server
+        run: go test -race -count=1 ./...
+
+  browser:
+    name: Browser tests (headless Chromium)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tests/package-lock.json
+      - name: npm ci
+        working-directory: tests
+        run: npm ci
+      - name: Chromium (playwright-core)
+        working-directory: tests
+        run: npx --no-install playwright-core install --with-deps chromium
+      - name: npm test
+        working-directory: tests
+        run: npm test
+
+  image:
+    name: Docker image (build only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Is the Go server here?
+        id: server
+        run: |
+          echo "build=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          if [ -f server/go.mod ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=API image skipped::server/go.mod is not in this commit yet (team B's Go API)."
+          fi
+      - uses: docker/setup-buildx-action@v3
+      - name: Build deploy/Dockerfile.api
+        if: steps.server.outputs.present == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.api
+          build-args: BUILD=${{ steps.server.outputs.build }}
+          tags: mq-api:ci
+          push: false
+          load: true
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+      - name: Image runs as non-root and carries the frontend
+        if: steps.server.outputs.present == 'true'
+        run: |
+          test "$(docker image inspect mq-api:ci --format '{{.Config.User}}')" = "nonroot:nonroot"
+          docker create --name probe mq-api:ci >/dev/null
+          docker export probe | tar -t | grep -x 'srv/static/index.html' >/dev/null
+          docker rm probe >/dev/null
+      - name: Build deploy/caddy/Dockerfile
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/caddy
+          tags: mq-caddy:ci
+          push: false
+          cache-from: type=gha,scope=caddy
+          cache-to: type=gha,scope=caddy,mode=max
