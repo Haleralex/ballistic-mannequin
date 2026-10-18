@@ -402,7 +402,7 @@ function runAnim(dt) {
   // halfway, a glance back at the shooter over the nearer shoulder
   const lt = (r.t - r.lookAt) / 1.1;
   if (r.mode === 'go' && lt > 0 && lt < 1) {
-    const back = wrapAngle(Math.atan2(camera.position.x - r.root.x, camera.position.z - r.root.z) - r.heading);
+    const back = wrapAngle(Math.atan2(shooter.x - r.root.x, shooter.z - r.root.z) - r.heading);
     const yaw = Math.sign(back || 1) * Math.min(1.5, Math.abs(back)) * Math.sin(lt * Math.PI);
     model.updateMatrixWorld(true);
     turnBone(rigBones.Spine2, yaw * 0.25); model.updateMatrixWorld(true);
@@ -871,10 +871,10 @@ function usableHand(h) {
 const canRun = () => { const c = character;
   return c.conscious && c.state !== 'down' && !c.seated && !c.kneel && c.balanceTarget > 0.5 && (c.cap.thighL ?? 1) > 0.5 && (c.cap.thighR ?? 1) > 0.5; };
 const legsWork = () => (character.cap.thighL ?? 1) > 0.1 || (character.cap.thighR ?? 1) > 0.1;
-// direction toward the camera (the shooter) in the chest's frame: yaw and pitch, rad
+// direction toward the shooter in the chest's frame: yaw and pitch, rad
 function shooterAngles() {
   const chest = byName.chest.body, head = vecOf(byName.head.body.translation());
-  const v = camera.position.clone().sub(head).applyQuaternion(toQ(chest.rotation(), new THREE.Quaternion()).invert());
+  const v = shooter.clone().sub(head).applyQuaternion(toQ(chest.rotation(), new THREE.Quaternion()).invert());
   return { yaw: Math.max(-1.3, Math.min(1.3, Math.atan2(v.x, v.z))), pitch: Math.max(-0.6, Math.min(0.6, -Math.atan2(v.y, Math.hypot(v.x, v.z)))) };
 }
 function armPose(kind, S, k = 1) {
@@ -1050,7 +1050,7 @@ const ACTIONS = {
     if (c.run || !canRun()) return null;
     const p = byName.pelvis.body.translation();
     // away from the shooter, angled off to one side the way people run for cover
-    const away = Math.atan2(p.x - camera.position.x, p.z - camera.position.z);
+    const away = Math.atan2(p.x - shooter.x, p.z - shooter.z);
     const off = b.dir === 'left' ? 0.55 : b.dir === 'right' ? -0.55 : (rand() - 0.5) * 0.9;
     const vmax = runPace(b.intensity);
     // poses held from before would pull the body back into them once the run hands it back
@@ -1551,7 +1551,12 @@ function react(zone, side, hitDir, w) {
 
 // ---------- shooting ----------
 let weapon = WEAPONS[0], impulseMult = 1;
-const raycaster = new THREE.Raycaster();
+// Where the shooter stands: the origin of the latest shot (before the first one, where the camera starts). The
+// simulation looks, turns and runs relative to this point and never to the camera, which is only the viewer: a
+// replay seen from anywhere else must come out the same.
+const SHOOTER0 = [0.9, 1.45, 4.2];
+const shooter = new THREE.Vector3(...SHOOTER0);
+const raycaster = new THREE.Raycaster(), shotRay = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
 const effects = [];
 // Hit testing against the skinned model. three.js would pose every triangle's corners again for each ray (and once
@@ -1600,13 +1605,30 @@ function severity(w) {
   if (t === 'head') return 45;
   return 10 + Math.min(9, w.rate);
 }
+// a click: the ray from the camera through that pixel becomes the shot, rounded the way a case stores it
 function shoot(clientX, clientY) {
   const r = canvas.getBoundingClientRect();
   ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
-  const ray = raycaster.ray.clone();
+  fire(raycaster.ray.origin.toArray(), raycaster.ray.direction.toArray());
+}
+function fire(origin, dir) {
+  const o = origin.map(v => +(+v).toFixed(6)), d = dir.map(v => +(+v).toFixed(6));
+  shootRay(new THREE.Vector3(...o), new THREE.Vector3(...d));
+}
+// everything a shot does, from a ray in world metres (origin, unit direction); never reads the camera
+function shootRay(origin, direction) {
+  const ray = new THREE.Ray(origin.clone(), direction.clone().normalize());
+  shooter.copy(origin);
+  // hit testing reads the meshes and the posed skin: bring them to this physics state, whatever was last drawn
+  syncMeshes(); poseRig(); scene.updateMatrixWorld();
   poseSkinProxies();
-  const muzzle = camera.position.clone().add(new THREE.Vector3(0.12, -0.12, 0).applyQuaternion(camera.quaternion));
+  // the muzzle sits a little right of and below the eye, square to the line of fire
+  const right = new THREE.Vector3().crossVectors(ray.direction, UP_Y);
+  if (right.lengthSq() < 1e-8) right.set(1, 0, 0);
+  right.normalize();
+  const muzzle = ray.origin.clone().addScaledVector(right, 0.12).addScaledVector(new THREE.Vector3().crossVectors(right, ray.direction), -0.12);
+  const raycaster = shotRay;
   const n = weapon.pellets || 1;
   const p = weapon.m * weapon.v * impulseMult; // per projectile
   const wounds = [];
@@ -1630,7 +1652,6 @@ function shoot(clientX, clientY) {
       .applyQuaternion(toQ(byName.chest.body.rotation(), new THREE.Quaternion()).invert());
     wounds.push({ w, dir, side: Math.abs(local.x) < 0.04 ? 0 : Math.sign(local.x), part });
   }
-  raycaster.set(ray.origin, ray.direction);
   if (wounds.length) {
     // the worst wound leads the reaction; the others still apply their own effects
     wounds.sort((a, b) => severity(b.w) - severity(a.w));
@@ -2336,6 +2357,7 @@ function startReplay() {
 }
 function reset() {
   replay = null; document.getElementById('replayBadge').hidden = true;
+  shooter.set(...SHOOTER0);
   buildWorld();
   log('info', 'Сброс', 'Манекен снова стоит.');
   emit('reset');
