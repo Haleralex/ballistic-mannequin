@@ -1,0 +1,2382 @@
+import * as THREE from 'three';
+import { emit } from './bus.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import RAPIER from '@dimforge/rapier3d-compat';
+
+await RAPIER.init();
+
+// ---------- constants ----------
+const DT = 1 / 120;
+const BODY_MASS = 80;
+const BAL_K = 2500, BAL_D = 450;   // N·m/rad and N·m·s/rad of the upright assist
+const BAL_LIN_K = 2500, BAL_LIN_D = 500; // N/m and N·s/m keeping the pelvis above the feet
+const STRENGTH = {      // joint stiffness at full tone, N·m/rad
+  abdomen: 1400, chest: 1000, head: 160, uArm: 160, fArm: 90, thigh: 1600, shin: 1600, foot: 700,
+};
+const WEAPONS = [
+  // pen: how deep the bullet goes in tissue, m; reach: extra radius of damage around the track (temporary cavity), m
+  { id: 'pistol', name: 'Пистолет 9×19', m: 0.008, v: 360, pen: 0.4, reach: 0.004 },
+  { id: 'rifle', name: 'Винтовка 5,56×45', m: 0.004, v: 940, pen: 0.7, reach: 0.015 },
+  // 00 buckshot: nine 8.4 mm pellets; the pattern opens about 4 cm per metre (spread is the half-angle, rad)
+  { id: 'buck', name: 'Дробовик, картечь 00', m: 0.0035, v: 400, pellets: 9, spread: 0.02, pen: 0.3, reach: 0.004 },
+  { id: 'slug', name: 'Дробовик, пуля 12 к.', m: 0.028, v: 450, pen: 0.45, reach: 0.012 },
+];
+const G_GROUND = 0x1, G_CHEST = 0x2, G_ARML = 0x4, G_ARMR = 0x8, G_LEGL = 0x10, G_LEGR = 0x20, G_LOWER = 0x40, G_FARML = 0x80, G_FARMR = 0x100;
+const G_ARMS = G_ARML | G_ARMR | G_FARML | G_FARMR;
+const groups = (member, filter) => (member << 16) | filter;
+const FILTER = {
+  // joined neighbours never collide (they overlap at the joint); everything else does
+  chest: groups(G_CHEST, G_GROUND | G_FARML | G_FARMR),
+  lower: groups(G_LOWER, G_GROUND | G_ARMS),
+  armL: groups(G_ARML, G_GROUND | G_LOWER | G_ARMR | G_FARMR | G_LEGL | G_LEGR),
+  armR: groups(G_ARMR, G_GROUND | G_LOWER | G_ARML | G_FARML | G_LEGL | G_LEGR),
+  farmL: groups(G_FARML, G_GROUND | G_CHEST | G_LOWER | G_ARMR | G_FARMR | G_LEGL | G_LEGR),
+  farmR: groups(G_FARMR, G_GROUND | G_CHEST | G_LOWER | G_ARML | G_FARML | G_LEGL | G_LEGR),
+  legL: groups(G_LEGL, G_GROUND | G_ARMS | G_LEGR),
+  legR: groups(G_LEGR, G_GROUND | G_ARMS | G_LEGL),
+  ground: groups(G_GROUND, 0xffff),
+};
+const ZONE_LABEL = {
+  head: 'голова', chest: 'грудная клетка', abdomen: 'живот', pelvis: 'таз',
+  uArmL: 'левое плечо', fArmL: 'левое предплечье', uArmR: 'правое плечо', fArmR: 'правое предплечье',
+  thighL: 'левое бедро', shinL: 'левая голень', footL: 'левая стопа',
+  thighR: 'правое бедро', shinR: 'правая голень', footR: 'правая стопа',
+};
+
+// Character faces +Z. Its left side is +X. Rest pose has every body at identity rotation.
+// Joint positions come from the model's skeleton (Mixamo X Bot, 1.78 m) posed with the arms down.
+const RIG = {
+  spine: [0, 1.142, 0.022], chest: [0, 1.334, -0.002], neck: [0, 1.5, -0.027],
+  shoulder: [0.152, 1.438, -0.05], elbow: [0.185, 1.161, -0.05], fingertip: [0.241, 0.691, -0.05],
+  hip: [0.082, 0.972, 0.005], knee: [0.082, 0.529, 0.008], ankle: [0.082, 0.084, -0.022],
+};
+// S scales the organ layout (drawn for a generic torso) to this body's segment sizes
+function partDefs() {
+  const m = (v, s) => [v[0] * s, v[1], v[2]];
+  const defs = [
+    { n: 'pelvis', shape: 'capX', r: 0.115, h: 0.02, c: [0, 1.0, -0.005], g: 'lower', S: [0.71, 0.96, 0.96] },
+    { n: 'abdomen', p: 'pelvis', shape: 'capY', r: 0.1, h: 0.04, c: [0, 1.21, 0.015], j: RIG.spine, g: 'lower', S: [0.83, 0.875, 0.83] },
+    { n: 'chest', p: 'abdomen', shape: 'capX', r: 0.12, h: 0.04, c: [0, 1.4, 0], j: RIG.chest, g: 'chest', S: [0.8, 0.92, 0.92] },
+    { n: 'head', p: 'chest', shape: 'ball', r: 0.1, c: [0, 1.69, 0.005], j: RIG.neck, g: 'lower', S: [0.95, 0.95, 0.95] },
+  ];
+  for (const [S, s] of [['L', 1], ['R', -1]]) defs.push(
+    limb('uArm' + S, 'chest', m(RIG.shoulder, s), m(RIG.elbow, s), 0.05, 'arm' + S, [1, 0.82, 1], 0.6),
+    limb('fArm' + S, 'uArm' + S, m(RIG.elbow, s), m(RIG.fingertip, s), 0.045, 'farm' + S, [1, 1.05, 1], 1, [-2.5, 0.05]),
+    limb('thigh' + S, 'pelvis', m(RIG.hip, s), m(RIG.knee, s), 0.078, 'leg' + S, [1.07, 1.11, 1.07], 0.6),
+    limb('shin' + S, 'thigh' + S, m(RIG.knee, s), m(RIG.ankle, s), 0.062, 'leg' + S, [1, 1.03, 1], 0.6, [-0.05, 2.5]),
+    { n: 'foot' + S, p: 'shin' + S, shape: 'box', hx: 0.04, hy: 0.045, hz: 0.125, c: [0.08 * s, 0.045, 0.055], j: m(RIG.ankle, s), g: 'leg' + S, hinge: [-0.8, 0.8], S: [1, 1, 1] },
+  );
+  return defs;
+}
+// a limb capsule runs from joint a down to joint b; `inset` pulls its caps back toward the joints
+function limb(n, p, a, b, r, g, S, inset, hinge) {
+  const A = new THREE.Vector3(...a), B = new THREE.Vector3(...b), axis = A.clone().sub(B), len = axis.length();
+  return {
+    n, p, shape: 'capY', r, h: Math.max(0.01, len / 2 - r * inset), c: A.clone().add(B).multiplyScalar(0.5).toArray(), j: a, g, S, hinge,
+    axisQ: new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), axis.normalize()),
+  };
+}
+const volume = d => d.shape === 'box' ? 8 * d.hx * d.hy * d.hz
+  : d.shape === 'ball' ? 4 / 3 * Math.PI * d.r ** 3
+  : Math.PI * d.r * d.r * 2 * d.h + 4 / 3 * Math.PI * d.r ** 3;
+
+// ---------- rendering ----------
+const canvas = document.getElementById('c');
+const stage = document.getElementById('stage');
+// Which GPU the browser draws with. Without hardware acceleration WebGL runs on the CPU (SwiftShader, llvmpipe):
+// then everything starts light, or even turning the camera stutters.
+const GPU_NAME = (() => {
+  try {
+    const gl = document.createElement('canvas').getContext('webgl2') || document.createElement('canvas').getContext('webgl');
+    const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+    const name = gl ? String(gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER)) : '';
+    gl?.getExtension('WEBGL_lose_context')?.loseContext();
+    return name;
+  } catch { return ''; }
+})();
+const SOFTWARE_GL = /swiftshader|llvmpipe|softpipe|software|basic render/i.test(GPU_NAME);
+// Integrated Intel graphics: multisampling is slow there (Chromium itself says so), so no MSAA, plain PCF shadows and
+// a smaller shadow map. Laptops often run the browser on these even when a discrete GPU sits next to them.
+const INTEGRATED_GL = /intel/i.test(GPU_NAME) && !/arc/i.test(GPU_NAME);
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: !SOFTWARE_GL && !INTEGRATED_GL, powerPreference: 'high-performance' });
+renderer.setPixelRatio(SOFTWARE_GL ? 0.75 : Math.min(devicePixelRatio, INTEGRATED_GL ? 1.25 : 2));
+renderer.shadowMap.enabled = !SOFTWARE_GL;
+renderer.shadowMap.type = INTEGRATED_GL ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 200);
+camera.position.set(0.9, 1.45, 4.2);
+const controls = new OrbitControls(camera, canvas);
+controls.target.set(0, 1.0, 0);
+// no inertia: with damping the camera only catches up over the following frames, so on a slow GPU it lags behind
+// the hand and keeps sliding after the button is released
+controls.enableDamping = false;
+// the right button stays free: browsers with mouse gestures (Vivaldi, Opera) turn a right-button drag into "back".
+// Panning is Shift + drag or the middle button.
+controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: null };
+controls.maxPolarAngle = Math.PI * 0.495;
+controls.minDistance = 1.5; controls.maxDistance = 60;
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x777777, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(3, 6, 4);
+sun.castShadow = true;
+sun.shadow.mapSize.set(INTEGRATED_GL ? 1024 : 2048, INTEGRATED_GL ? 1024 : 2048);
+Object.assign(sun.shadow.camera, { left: -4, right: 4, top: 4, bottom: -4, near: 0.5, far: 20 });
+scene.add(sun, sun.target);
+
+const floorMat = new THREE.MeshStandardMaterial({ roughness: 0.95 });
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), floorMat);
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+scene.add(floor);
+let grid = null;
+const bodyMat = new THREE.MeshStandardMaterial({ flatShading: true, roughness: 0.75 });
+const hotMat = new THREE.MeshStandardMaterial({ flatShading: true, roughness: 0.75 });
+const hitMat = new THREE.MeshBasicMaterial();
+const bloodMat = new THREE.MeshStandardMaterial({ roughness: 0.35, flatShading: true });
+const poolMat = new THREE.MeshStandardMaterial({ roughness: 0.15, metalness: 0.1, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
+const tracerMat = new THREE.LineBasicMaterial({ transparent: true });
+
+function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+function applyTheme() {
+  scene.background = new THREE.Color(cssVar('--scene-bg'));
+  scene.fog = new THREE.Fog(scene.background, 20, 70);
+  floorMat.color.set(cssVar('--scene-floor'));
+  bodyMat.color.set(cssVar('--mannequin'));
+  hotMat.color.set(cssVar('--mannequin-hot'));
+  if (typeof surfaceMat !== 'undefined') { surfaceMat.color.set(cssVar('--mannequin')); jointMat.color.set(cssVar('--mannequin-joint')); woundU.uBlood.value.set(cssVar('--blood')); }
+  hitMat.color.set(cssVar('--hit'));
+  bloodMat.color.set(cssVar('--blood'));
+  poolMat.color.set(cssVar('--blood')).multiplyScalar(0.75);
+  tracerMat.color.set(cssVar('--hit'));
+  if (grid) scene.remove(grid);
+  grid = new THREE.GridHelper(30, 120, cssVar('--scene-grid'), cssVar('--scene-grid2'));
+  grid.position.y = 0.002;
+  scene.add(grid);
+}
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+function meshFor(d) {
+  let geo;
+  if (d.shape === 'box') geo = new THREE.BoxGeometry(d.hx * 2, d.hy * 2, d.hz * 2);
+  else if (d.shape === 'ball') geo = new THREE.IcosahedronGeometry(d.r, 1);
+  else { geo = new THREE.CapsuleGeometry(d.r, d.h * 2, 2, 7); if (d.shape === 'capX') geo.rotateZ(Math.PI / 2); }
+  if (d.axisQ) geo.applyQuaternion(d.axisQ);
+  const mat = bodyMat.clone();
+  mat.visible = false; // the visible body is the skinned model; this capsule is the hitbox
+  const m = new THREE.Mesh(geo, mat);
+  m.userData.part = d.n;
+  scene.add(m);
+  return m;
+}
+
+// ---------- model ----------
+// Visible body: the Mixamo X Bot from the three.js examples. Its skeleton is driven by the physics bodies.
+const { default: SCENARIOS } = await import('./scenarios.js'); // 100 hand-written behaviour scenarios
+const { default: XBOT } = await import('./xbot.js'); // the glb as base64: artifact hosting serves .js but not .glb
+const gltf = await new GLTFLoader().parseAsync(Uint8Array.from(atob(XBOT), ch => ch.charCodeAt(0)).buffer, '');
+const model = gltf.scene;
+scene.add(model);
+const rigBones = {}, modelMeshes = [];
+model.traverse(o => {
+  if (o.isBone) rigBones[o.name.replace('mixamorig', '')] = o;
+  if (o.isSkinnedMesh) { modelMeshes.push(o); o.castShadow = true; o.receiveShadow = true; o.frustumCulled = false; }
+});
+const surfaceMat = modelMeshes.find(m => !/Joints/.test(m.name)).material, jointMat = modelMeshes.find(m => /Joints/.test(m.name)).material;
+for (const m of [surfaceMat, jointMat]) { m.roughness = 0.62; m.metalness = 0; }
+// the model ships in a T-pose; the physics rest pose has the arms down with a slight outward tilt
+model.updateMatrixWorld(true);
+for (const S of ['Left', 'Right']) {
+  const arm = rigBones[S + 'Arm'];
+  const a = arm.getWorldPosition(new THREE.Vector3()), f = rigBones[S + 'ForeArm'].getWorldPosition(new THREE.Vector3());
+  const q = new THREE.Quaternion().setFromUnitVectors(f.sub(a).normalize(), new THREE.Vector3(0.12 * Math.sign(a.x), -1, 0).normalize());
+  const wq = arm.getWorldQuaternion(new THREE.Quaternion()), pq = arm.parent.getWorldQuaternion(new THREE.Quaternion());
+  arm.quaternion.copy(pq.invert().multiply(q.multiply(wq)));
+  model.updateMatrixWorld(true);
+}
+// relaxed hands: fingers curl a little toward the palm (the palms face the thighs)
+for (const S of ['Left', 'Right']) {
+  const axis = new THREE.Vector3(0, 0, S === 'Left' ? -1 : 1);
+  for (const f of ['Index', 'Middle', 'Ring', 'Pinky']) for (const [k, ang] of [[1, 0.25], [2, 0.45], [3, 0.35]]) {
+    const b = rigBones[S + 'Hand' + f + k];
+    if (!b) continue;
+    const wq = b.getWorldQuaternion(new THREE.Quaternion()), pq = b.parent.getWorldQuaternion(new THREE.Quaternion());
+    b.quaternion.copy(pq.invert().multiply(new THREE.Quaternion().setFromAxisAngle(axis, ang).multiply(wq)));
+    b.updateMatrixWorld(true);
+  }
+}
+model.updateMatrixWorld(true);
+// which physics body drives each bone; the neck takes the average of chest and head
+const DRIVE = [['Hips', 'pelvis'], ['Spine', 'abdomen'], ['Spine1', 'abdomen'], ['Spine2', 'chest'], ['LeftShoulder', 'chest'], ['RightShoulder', 'chest'],
+  ['Neck', 'head', 'chest'], ['Head', 'head'], ['LeftArm', 'uArmL'], ['LeftForeArm', 'fArmL'], ['LeftHand', 'fArmL'], ['RightArm', 'uArmR'], ['RightForeArm', 'fArmR'],
+  ['RightHand', 'fArmR'], ['LeftUpLeg', 'thighL'], ['LeftLeg', 'shinL'], ['LeftFoot', 'footL'], ['RightUpLeg', 'thighR'], ['RightLeg', 'shinR'], ['RightFoot', 'footR']]
+  .map(([bone, part, blend]) => ({ bone: rigBones[bone], part, blend, rest: rigBones[bone].getWorldQuaternion(new THREE.Quaternion()) }));
+const hipsRest = rigBones.Hips.getWorldPosition(new THREE.Vector3());
+function boneToPart(name) {
+  const n = name.replace('mixamorig', ''), S = n.startsWith('Left') ? 'L' : 'R';
+  if (/^(Left|Right)(ForeArm|Hand)/.test(n)) return 'fArm' + S;
+  if (/^(Left|Right)Arm/.test(n)) return 'uArm' + S;
+  if (/^(Left|Right)UpLeg/.test(n)) return 'thigh' + S;
+  if (/^(Left|Right)Leg/.test(n)) return 'shin' + S;
+  if (/^(Left|Right)(Foot|Toe)/.test(n)) return 'foot' + S;
+  if (/Shoulder|Spine2/.test(n)) return 'chest';
+  if (/Spine/.test(n)) return 'abdomen';
+  if (/Hips/.test(n)) return 'pelvis';
+  return 'head';
+}
+// dominant bone of every vertex, to name the segment a bullet hits
+for (const m of modelMeshes) {
+  const si = m.geometry.attributes.skinIndex, sw = m.geometry.attributes.skinWeight;
+  m.userData.dom = new Uint8Array(si.count);
+  for (let i = 0; i < si.count; i++) {
+    let best = 0, bw = -1;
+    for (let k = 0; k < 4; k++) { const w = sw.getComponent(i, k); if (w > bw) { bw = w; best = si.getComponent(i, k); } }
+    m.userData.dom[i] = best;
+  }
+}
+const tq = new THREE.Quaternion(), pq = new THREE.Quaternion(), tv = new THREE.Vector3();
+
+// motion capture for running: the clips that ship with the model
+const mixer = new THREE.AnimationMixer(model);
+const CLIPS = Object.fromEntries(gltf.animations.map(a => [a.name, a]));
+const CLIP_SPEED = { run: 3.55, walk: 1.5 }; // m/s of ground covered by the planted foot, measured from the clips
+const DRIVEN = new Set(DRIVE.map(d => d.bone));
+const restLocal = [];
+model.traverse(o => { if (o.isBone) restLocal.push([o, o.quaternion.clone(), o.position.clone()]); });
+// the bone that places each physics part; at rest a part has no rotation and sits at a fixed offset from it
+const PART_BONE = { pelvis: 'Hips', abdomen: 'Spine1', chest: 'Spine2', head: 'Head', uArmL: 'LeftArm', fArmL: 'LeftForeArm', uArmR: 'RightArm',
+  fArmR: 'RightForeArm', thighL: 'LeftUpLeg', shinL: 'LeftLeg', footL: 'LeftFoot', thighR: 'RightUpLeg', shinR: 'RightLeg', footR: 'RightFoot' };
+const PART_REST = Object.fromEntries(Object.entries(PART_BONE).map(([n, b]) => [n, {
+  bone: rigBones[b], qInv: rigBones[b].getWorldQuaternion(new THREE.Quaternion()).invert(), pos: rigBones[b].getWorldPosition(new THREE.Vector3()) }]));
+function resetRig() {
+  mixer.stopAllAction();
+  for (const [b, q, p] of restLocal) { b.quaternion.copy(q); b.position.copy(p); }
+  model.position.set(0, 0, 0); model.quaternion.identity(); model.updateMatrixWorld(true);
+}
+const rq = new THREE.Quaternion(), rq2 = new THREE.Quaternion(), rv = new THREE.Vector3();
+// turn a bone about a world axis (the vertical by default), on top of what the clip gave it
+function turnBone(b, angle, axis = UP) {
+  b.parent.getWorldQuaternion(pq);
+  rq.setFromAxisAngle(axis, angle);
+  b.quaternion.premultiply(rq2.copy(pq).invert().multiply(rq).multiply(pq));
+  b.updateMatrixWorld(true);
+}
+// A hit taken at a run is physical: the body turns back into the ragdoll, its muscles keep tracking the run clip,
+// but for a moment they lose most of their strength (the shock of the hit) while the bullet's push and the run's
+// momentum act on it. The stumble that comes out of that is different every time. If the body sinks too far it
+// falls; otherwise the muscles catch it and the clip takes over again.
+function runDip(r) {
+  const t = r.t - r.phys.t0;
+  const d = r.phys.depth; // how much strength the shock takes away
+  return t < 0.08 ? 1 - d * t / 0.08 : 1 - d + d * Math.min(1, (t - 0.08) / 0.45);
+}
+// pace from the wounds: a healthy person sprints; a wound in the leg leaves a fast walk, blood loss and a torso wound slow it
+function runPace(k) {
+  const c = character, zones = c.wounds.map(w => ZONE_KIND(w.zone));
+  let v = 3.4 + 0.8 * k;
+  if (zones.includes('leg')) v *= 0.45;
+  if (zones.includes('abdomen') || zones.includes('chest') || zones.includes('pelvis')) v *= 0.75;
+  return v * c.vigor;
+}
+function setRunClip(r, clip) {
+  if (r.clip === clip) return;
+  const next = mixer.clipAction(CLIPS[clip]);
+  next.reset().setEffectiveWeight(1).play();
+  r.action.crossFadeTo(next, 0.4, false);
+  r.action = next; r.clip = clip;
+}
+// A shot that lands while running. Something that takes the legs (a leg, the pelvis, the spine) has already
+// ended the run. A wound in the back or the belly drops some people on the spot, and buckshot drops most;
+// everyone else jolts, staggers, loses speed and keeps running with a hand on the wound.
+// Returns whether the run goes on.
+function runHit(wounds) {
+  const c = character, r = c.run;
+  if (!r || r.mode !== 'go') return false;
+  if (!canRun()) { releaseRun(true); c.fellRunning = true; return false; } // the wound took the legs (the spine, say): down at once
+  if (!wounds.length) return true; // a bullet past the ear: the run goes on
+  const kind = incidentKind(wounds), lead = wounds[0];
+  const drops = kind === 'multi' ? 0.75 : ['chest', 'abdomen', 'pelvis-soft', 'neck'].includes(kind) ? 0.35 : 0;
+  if (Math.random() < drops) {
+    releaseRun(true);
+    c.balanceTarget = 0; c.balanceRate = 2.5; c.noLift = true; c.fellRunning = true;
+    return false;
+  }
+  // the ragdoll takes the hit: dynamic again with the run's velocities, then the bullet's push on the struck part
+  const torso = ['chest', 'abdomen', 'pelvis', 'neck'].includes(ZONE_KIND(lead.w.zone));
+  r.phys = { t0: r.t, dur: 0.8 + Math.random() * 0.3, depth: torso ? 0.35 + Math.random() * 0.45 : 0.25 + Math.random() * 0.25 };
+  for (const p of parts) {
+    const k = r.kin[p.n];
+    p.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+    p.body.setLinvel(k.v, true); p.body.setAngvel(k.w, true);
+  }
+  const push = 14 + Math.random() * 10;
+  for (const x of wounds) x.part.body.applyImpulse({ x: x.dir.x * push, y: 0, z: x.dir.z * push }, true);
+  r.v *= 0.6;
+  r.vmax = Math.min(r.vmax, runPace(0.6));
+  if (r.vmax < 2.4) setRunClip(r, 'walk');
+  return true;
+}
+function startRun(vmax, dirH) {
+  const c = character, pel = byName.pelvis.body, pt = pel.translation();
+  const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(toQ(pel.rotation(), rq));
+  const clip = vmax < 2.4 ? 'walk' : 'run';
+  const r = { mode: 'go', t: 0, v: 0, vmax, dirH, heading: Math.atan2(fwd.x, fwd.z), root: { x: pt.x, z: pt.z }, clip, w: 0, idle: null,
+    lookAt: 1.2 + Math.random() * 1.5, snap: {}, kin: {}, animQ: {}, animP: {}, phys: null, blend0: 0 };
+  for (const p of parts) {
+    const t = p.body.translation(), q = p.body.rotation();
+    r.snap[p.n] = { p: new THREE.Vector3(t.x, t.y, t.z), q: new THREE.Quaternion(q.x, q.y, q.z, q.w) };
+    r.kin[p.n] = { p: r.snap[p.n].p.clone(), q: r.snap[p.n].q.clone(), v: new THREE.Vector3(), w: new THREE.Vector3() };
+    r.animQ[p.n] = r.snap[p.n].q.clone(); r.animP[p.n] = r.snap[p.n].p.clone();
+    p.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
+  }
+  mixer.stopAllAction();
+  r.action = mixer.clipAction(CLIPS[clip]);
+  r.action.reset().setEffectiveWeight(1).play();
+  r.action.time = Math.random() * CLIPS[clip].duration;
+  c.run = r;
+}
+// hand the body back to the ragdoll at the pose and with the velocity the clip gave it
+function releaseRun(stumble) {
+  const c = character, r = c.run;
+  if (!r) return;
+  c.run = null;
+  if (!r.phys) for (const p of parts) {
+    const k = r.kin[p.n];
+    p.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+    p.body.setLinvel(k.v, true); p.body.setAngvel(k.w, true);
+  }
+  mixer.stopAllAction();
+  for (const [b, q, p] of restLocal) if (!DRIVEN.has(b)) { b.quaternion.copy(q); b.position.copy(p); }
+  c.heading = r.heading;
+  // cut down at speed, nobody catches their balance
+  if (stumble && r.v > 1.5) { c.balanceTarget = Math.min(c.balanceTarget, 0.25); c.balanceRate = 3; c.noLift = true; }
+}
+function runAnim(dt) {
+  const c = character, r = c.run;
+  if (!r) return;
+  if (!canRun()) { releaseRun(true); return; }
+  r.t += dt;
+  // a run no script holds any more winds down on its own
+  r.orphan = r.owner ? 0 : (r.orphan || 0) + dt;
+  if (r.mode === 'go' && r.orphan > 1.5) r.mode = 'stop';
+  const turnLeft = wrapAngle(r.dirH - r.heading);
+  if (r.mode === 'go') {
+    r.heading = wrapAngle(r.heading + Math.sign(turnLeft) * Math.min(Math.abs(turnLeft), 6 * dt));
+    if (Math.hypot(r.root.x, r.root.z) > 35) r.mode = 'stop'; // far enough: the zoom has its limits
+  }
+  const vT = r.mode === 'go' ? (Math.abs(turnLeft) < 1 ? r.vmax : 0.8) : 0;
+  r.v += Math.max(-5 * dt, Math.min(5 * dt, vT - r.v));
+  r.root.x += Math.sin(r.heading) * r.v * dt; r.root.z += Math.cos(r.heading) * r.v * dt;
+  // the clip plays at the speed the ground goes by, so the planted foot stays planted
+  r.action.timeScale = Math.max(0.55, Math.min(1.5, r.v / CLIP_SPEED[r.clip]));
+  if (r.mode === 'stop' && r.v < 1 && !r.idle) {
+    r.idle = mixer.clipAction(CLIPS.idle);
+    r.idle.reset().setEffectiveWeight(1).play();
+    r.action.crossFadeTo(r.idle, 0.45, false);
+    r.idleT = r.t;
+  }
+  if (r.idle && r.t - r.idleT > 0.5) { releaseRun(false); return; }
+  mixer.update(dt);
+  model.position.set(r.root.x, 0, r.root.z);
+  model.quaternion.setFromAxisAngle(UP, r.heading);
+  // halfway, a glance back at the shooter over the nearer shoulder
+  const lt = (r.t - r.lookAt) / 1.1;
+  if (r.mode === 'go' && lt > 0 && lt < 1) {
+    const back = wrapAngle(Math.atan2(camera.position.x - r.root.x, camera.position.z - r.root.z) - r.heading);
+    const yaw = Math.sign(back || 1) * Math.min(1.5, Math.abs(back)) * Math.sin(lt * Math.PI);
+    model.updateMatrixWorld(true);
+    turnBone(rigBones.Spine2, yaw * 0.25); model.updateMatrixWorld(true);
+    turnBone(rigBones.Neck, yaw * 0.35); model.updateMatrixWorld(true);
+    turnBone(rigBones.Head, yaw * 0.4);
+  }
+  model.updateMatrixWorld(true);
+  // the bodies follow the skeleton; at the start, and after a stumble, they blend in from where the ragdoll was
+  r.w = Math.min(1, (r.t - (r.blend0 || 0)) / 0.3);
+  if (r.phys) {
+    const pt = byName.pelvis.body.translation(), ht = byName.head.body.translation();
+    if (pt.y < 0.62 || ht.y < 1.05) { releaseRun(true); c.balanceTarget = 0; c.balanceRate = 2.5; c.fellRunning = true; return; } // stumbled too far: down
+    if (r.t - r.phys.t0 > r.phys.dur) { // caught: the clip takes over again from this pose
+      r.phys = null; r.blend0 = r.t; r.w = 0;
+      for (const p of parts) {
+        const t = p.body.translation(), q = p.body.rotation();
+        r.snap[p.n].p.set(t.x, t.y, t.z); r.snap[p.n].q.set(q.x, q.y, q.z, q.w);
+        r.kin[p.n].p.copy(r.snap[p.n].p); r.kin[p.n].q.copy(r.snap[p.n].q);
+        p.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
+      }
+    }
+  }
+  for (const p of parts) {
+    const pr = PART_REST[p.n], k = r.kin[p.n];
+    pr.bone.getWorldQuaternion(rq).multiply(pr.qInv);
+    pr.bone.getWorldPosition(rv).add(tv.set(p.c[0], p.c[1], p.c[2]).sub(pr.pos).applyQuaternion(rq));
+    if (r.phys) { // the clip pose becomes what the muscles aim for
+      r.animQ[p.n].copy(rq); r.animP[p.n].copy(rv);
+      const t = p.body.translation(), q = p.body.rotation();
+      k.p.set(t.x, t.y, t.z); k.q.set(q.x, q.y, q.z, q.w);
+      continue;
+    }
+    if (r.w < 1) { rv.lerpVectors(r.snap[p.n].p, rv, r.w); rq2.copy(rq); rq.copy(r.snap[p.n].q).slerp(rq2, r.w); }
+    if (rq.dot(k.q) < 0) rq.set(-rq.x, -rq.y, -rq.z, -rq.w); // same rotation; a flipped sign would read as a full turn in one step
+    k.v.copy(rv).sub(k.p).divideScalar(dt);
+    rq2.copy(k.q).invert().premultiply(rq); // rotation over this step, in world
+    if (rq2.w < 0) rq2.set(-rq2.x, -rq2.y, -rq2.z, -rq2.w);
+    const ang = 2 * Math.acos(Math.min(1, rq2.w)), sn = Math.sqrt(Math.max(1e-12, 1 - rq2.w * rq2.w));
+    k.w.set(rq2.x / sn, rq2.y / sn, rq2.z / sn).multiplyScalar(ang / dt);
+    k.p.copy(rv); k.q.copy(rq);
+    p.body.setNextKinematicTranslation(rv);
+    p.body.setNextKinematicRotation(rq);
+  }
+}
+
+function poseRig() {
+  // during a run the clip itself poses the skeleton
+  if (!replay && character.run && character.run.w >= 1 && !character.run.phys) return;
+  for (const d of DRIVE) {
+    const m = byName[d.part].mesh;
+    if (d.blend) tq.slerpQuaternions(byName[d.blend].mesh.quaternion, m.quaternion, 0.5); else tq.copy(m.quaternion);
+    tq.multiply(d.rest);
+    d.bone.parent.getWorldQuaternion(pq);
+    d.bone.quaternion.copy(pq.invert().multiply(tq));
+    if (d.part === 'pelvis' && !d.blend && d.bone === rigBones.Hips) {
+      tv.copy(hipsRest).sub(vecOf3(byName.pelvis.c)).applyQuaternion(m.quaternion).add(m.position);
+      d.bone.position.copy(d.bone.parent.worldToLocal(tv));
+    }
+  }
+}
+const vecOf3 = a => new THREE.Vector3(a[0], a[1], a[2]);
+
+// Wounds are painted on the skin in the shader, in the model's bind space, so they stay put as the body moves.
+const MAXW = 48; // entry and exit each take a slot; a buckshot hit uses up to 18
+const woundU = {
+  uW: { value: Array.from({ length: MAXW }, () => new THREE.Vector4()) },
+  uW2: { value: Array.from({ length: MAXW }, () => new THREE.Vector4()) },
+  uW3: { value: Array.from({ length: MAXW }, () => new THREE.Vector4()) },
+  uWN: { value: 0 }, uBlood: { value: new THREE.Color() }, uUnit: { value: 1 }, uBloodOn: { value: 1 },
+};
+for (const m of modelMeshes) m.material.onBeforeCompile = sh => {
+  Object.assign(sh.uniforms, woundU);
+  sh.vertexShader = sh.vertexShader
+    .replace('#include <common>', '#include <common>\nvarying vec3 vRest;')
+    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvRest = position;');
+  sh.fragmentShader = sh.fragmentShader
+    .replace('#include <common>', `#include <common>
+varying vec3 vRest;
+uniform vec4 uW[${MAXW}]; uniform vec4 uW2[${MAXW}]; uniform vec4 uW3[${MAXW}];
+uniform int uWN; uniform vec3 uBlood; uniform float uUnit; uniform float uBloodOn;
+float wHash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float wNoise(vec3 x) {
+  vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(wHash(i), wHash(i + vec3(1, 0, 0)), f.x), mix(wHash(i + vec3(0, 1, 0)), wHash(i + vec3(1, 1, 0)), f.x), f.y),
+             mix(mix(wHash(i + vec3(0, 0, 1)), wHash(i + vec3(1, 0, 1)), f.x), mix(wHash(i + vec3(0, 1, 1)), wHash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+float wWet = 0.0;`)
+    .replace('#include <color_fragment>', `#include <color_fragment>
+{
+  float hole = 0.0, ring = 0.0;
+  vec3 q = vRest / uUnit; // metres in the bind pose
+  for (int i = 0; i < ${MAXW}; i++) {
+    if (i >= uWN) break;
+    vec3 d = q - uW[i].xyz; float dist = length(d);
+    float n = wNoise(q * 400.0 + float(i) * 3.1);
+    float rh = uW[i].w * (0.7 + 0.6 * n);
+    hole = max(hole, 1.0 - smoothstep(rh * 0.55, rh, dist));
+    ring = max(ring, 1.0 - smoothstep(rh, rh * 2.2, dist));
+    // wet blood: a spot around the wound and a run in the direction of gravity at the time of wounding
+    float spread = uW2[i].x * (0.65 + 0.7 * wNoise(q * 70.0 + float(i)));
+    float spot = 1.0 - smoothstep(spread * 0.6, spread, dist);
+    vec3 down = uW3[i].xyz; float along = dot(d, down); float lat = length(d - down * along);
+    float len = uW2[i].y;
+    float w = uW2[i].z * (1.0 - 0.6 * clamp(along / max(len, 1e-4), 0.0, 1.0)) * (0.5 + wNoise(q * 120.0 + vec3(float(i))));
+    float run = (along > 0.0 && along < len) ? 1.0 - smoothstep(w * 0.5, w, lat) : 0.0;
+    wWet = max(wWet, max(spot, run) * uW2[i].w);
+  }
+  wWet *= uBloodOn;
+  diffuseColor.rgb = mix(diffuseColor.rgb, uBlood * 0.5, ring * 0.65);
+  diffuseColor.rgb = mix(diffuseColor.rgb, uBlood * (0.75 + 0.25 * wWet), wWet * 0.92);
+  diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.05, 0.008, 0.008), hole);
+}`)
+    .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix(roughnessFactor, 0.2, wWet);');
+};
+// bind-space position of a world point on the skin, through its dominant bone
+function toBind(mesh, boneIndex, world) {
+  const sk = mesh.skeleton;
+  const M = new THREE.Matrix4().multiplyMatrices(mesh.matrixWorld, mesh.bindMatrixInverse)
+    .multiply(sk.bones[boneIndex].matrixWorld).multiply(sk.boneInverses[boneIndex]).multiply(mesh.bindMatrix);
+  return M.invert();
+}
+const woundSlots = [];
+function addWoundSlot(w, mesh, boneIndex, point, holeR) {
+  if (woundSlots.length >= MAXW) return;
+  const inv = toBind(mesh, boneIndex, point);
+  const unit = new THREE.Vector3(1, 0, 0).transformDirection(inv).length() ? new THREE.Vector3(0.01, 0, 0).applyMatrix4(inv).sub(new THREE.Vector3(0, 0, 0).applyMatrix4(inv)).length() / 0.01 : 1;
+  woundU.uUnit.value = unit;
+  const pos = point.clone().applyMatrix4(inv).divideScalar(unit);
+  const down = new THREE.Vector3(0, -1, 0).transformDirection(inv);
+  woundSlots.push({ w, pos, holeR, down });
+}
+function updateWoundUniforms() {
+  woundU.uWN.value = woundSlots.length;
+  woundSlots.forEach((sl, i) => {
+    const ml = sl.w.extLost;
+    woundU.uW.value[i].set(sl.pos.x, sl.pos.y, sl.pos.z, sl.holeR);
+    woundU.uW2.value[i].set(Math.min(0.07, 0.01 + 0.025 * Math.sqrt(ml / 40)), Math.min(0.5, 0.01 + ml / 500), Math.min(0.03, 0.007 + 0.008 * Math.sqrt(ml / 50)), Math.min(1, 0.35 + ml / 25));
+    woundU.uW3.value[i].set(sl.down.x, sl.down.y, sl.down.z, 0);
+  });
+}
+
+// ---------- physics world & mannequin ----------
+let world, parts, byName, totalMass, simTime, events, character, balanceJoint, anchorBody;
+
+function buildWorld() {
+  if (world) world.free();
+  resetRig();
+  world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+  world.timestep = DT;
+  const gb = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, -0.1, 0));
+  world.createCollider(RAPIER.ColliderDesc.cuboid(100, 0.1, 100).setFriction(1.2).setCollisionGroups(FILTER.ground), gb);
+
+  const defs = partDefs();
+  const density = BODY_MASS / defs.reduce((s, d) => s + volume(d), 0);
+  if (!parts) {
+    parts = defs.map(d => ({ ...d, mesh: meshFor(d) }));
+    for (const p of parts) {
+      p.organs = organsFor(p);
+      p.organRoot = new THREE.Group();
+      if (p.axisQ) p.organRoot.quaternion.copy(p.axisQ);
+      p.mesh.add(p.organRoot);
+      for (const o of p.organs) { o.mesh = organMesh(o); p.organRoot.add(o.mesh); }
+    }
+  }
+  for (const p of parts) for (const o of p.organs) o.mesh.material.emissive.set(0x000000);
+  byName = {};
+  for (const p of parts) {
+    byName[p.n] = p;
+    for (const holder of [p.mesh, p.organRoot]) for (const ch of [...holder.children]) if (ch.userData.marker) holder.remove(ch);
+    p.body = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(...p.c)
+      .setLinearDamping(0.05).setAngularDamping(0.4).setCanSleep(false));
+    let cd = p.shape === 'box' ? RAPIER.ColliderDesc.cuboid(p.hx, p.hy, p.hz)
+      : p.shape === 'ball' ? RAPIER.ColliderDesc.ball(p.r)
+      : RAPIER.ColliderDesc.capsule(p.h, p.r);
+    if (p.shape === 'capX') cd.setRotation(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2));
+    if (p.axisQ) cd.setRotation(p.axisQ);
+    cd.setDensity(density).setFriction(p.n.startsWith('foot') ? 1.2 : 0.6).setCollisionGroups(FILTER[p.g]);
+    world.createCollider(cd, p.body);
+    p.tone = 1; p.baseTone = 1; p.boosts = {}; p.toneTarget = 1; p.toneRate = 3;
+    if (p.p) {
+      const par = byName[p.p];
+      const a1 = { x: p.j[0] - par.c[0], y: p.j[1] - par.c[1], z: p.j[2] - par.c[2] };
+      const a2 = { x: p.j[0] - p.c[0], y: p.j[1] - p.c[1], z: p.j[2] - p.c[2] };
+      let jd;
+      if (p.hinge) {
+        jd = RAPIER.JointData.revolute(a1, a2, { x: 1, y: 0, z: 0 });
+        jd.limitsEnabled = true; jd.limits = p.hinge;
+      } else jd = RAPIER.JointData.spherical(a1, a2);
+      p.joint = world.createImpulseJoint(jd, par.body, p.body, true);
+      p.k = STRENGTH[p.n.replace(/[LR]$/, '')];
+      if (p.hinge) p.joint.configureMotorModel(FORCE_BASED);
+      else for (const ax of ANG) p.joint.rawSet.jointConfigureMotorModel(p.joint.handle, ax, FORCE_BASED);
+    }
+  }
+  // Joint from a kinematic anchor to the pelvis, every axis free; only its motors act. Turning the anchor turns the
+  // heading the body is held to, and moving it carries the pelvis along when the person runs.
+  const pel = byName.pelvis;
+  anchorBody = world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(pel.c[0], pel.c[1] + 0.1, pel.c[2]));
+  balanceJoint = world.createImpulseJoint(
+    RAPIER.JointData.generic({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 }, 0), anchorBody, pel.body, true);
+  for (const ax of [0, 1, ...ANG]) balanceJoint.rawSet.jointConfigureMotorModel(balanceJoint.handle, ax, FORCE_BASED);
+  totalMass = parts.reduce((s, p) => s + p.body.mass(), 0);
+  document.getElementById('rMass').textContent = totalMass.toFixed(1) + ' кг';
+  simTime = 0; events = []; layers.length = 0; history.length = 0;
+  character = { balance: 1, balanceTarget: 1, balanceRate: 3, conscious: true, state: 'ok', torsoHits: 0, collapseAt: null, kneel: null,
+    vigor: 1, lost: 0, bleedRate: 0, physT: 0, wounds: [], stage: 0, arrestAt: null, sway: null, heading: 0, run: null };
+  clearBlood();
+  woundSlots.length = 0;
+  character.breath = 0; character.ph = Array.from({ length: 14 }, () => Math.random() * 6.28);
+  character.life = addLayer({}, { attack: 1, hold: Infinity, release: 0.5, tag: 'life' });
+  character.cap = {}; character.supportShift = new THREE.Vector3(); character.breathBoost = 0; character.lifeDamp = 1; character.tremble = 0;
+  stopScript(); renderScript(null);
+  setState('ok');
+  syncMeshes();
+}
+
+// ---------- pose layers ----------
+// Each layer is an additive pose (Euler XYZ offsets relative to the parent) with an envelope.
+const layers = [];
+const BASE = { thighL: [-0.05, 0, 0], thighR: [-0.05, 0, 0], shinL: [0.1, 0, 0], shinR: [0.1, 0, 0], uArmL: [0, 0, 0.06], uArmR: [0, 0, -0.06], fArmL: [-0.15, 0, 0], fArmR: [-0.15, 0, 0] };
+function addLayer(pose, { peak = 1, attack = 0.08, hold = 0.3, release = 0.8, tag } = {}) {
+  // a new pose of the same kind takes over from the old one instead of adding to it. It is a crossfade over the
+  // new pose's attack: a faster fade-out would pass through the neutral pose, e.g. a straight leg between kneeling and sitting
+  if (tag) for (const o of layers) if (o.tag === tag) fadeOut(o, Math.max(0.05, attack));
+  const l = { pose, peak, attack, hold, release, age: 0, tag };
+  layers.push(l);
+  return l;
+}
+function fadeOut(l, release) {
+  const w = layerWeight(l);
+  // restart the envelope at the current weight so the fade has no jump
+  l.peak = w; l.attack = 1e-6; l.age = 1e-6; l.hold = 0; l.release = release;
+}
+function layerWeight(l) {
+  if (l.age < l.attack) return l.peak * l.age / l.attack;
+  if (l.age < l.attack + l.hold) return l.peak;
+  return l.peak * Math.max(0, 1 - (l.age - l.attack - l.hold) / l.release);
+}
+const tmpE = new THREE.Euler(), tmpQ = new THREE.Quaternion();
+function targetQuat(name, out) {
+  const b = BASE[name] || [0, 0, 0];
+  let x = b[0], y = b[1], z = b[2];
+  for (const l of layers) {
+    const v = l.pose[name]; if (!v) continue;
+    const w = layerWeight(l);
+    x += v[0] * w; y += v[1] * w; z += v[2] * w;
+  }
+  if (name.startsWith('foot')) { // keep the sole roughly parallel to the floor
+    const S = name.slice(-1);
+    x -= targetEulerX('thigh' + S) + targetEulerX('shin' + S);
+  }
+  // stacked poses must never ask for more than a joint can do: past half a turn the target wraps to the other side
+  const h = byName[name]?.hinge, lim = 2.4;
+  x = h ? Math.max(h[0], Math.min(h[1], x)) : Math.max(-lim, Math.min(lim, x));
+  y = Math.max(-lim, Math.min(lim, y)); z = Math.max(-lim, Math.min(lim, z));
+  return out.setFromEuler(tmpE.set(x, y, z, 'XYZ'));
+}
+function targetEulerX(name) {
+  let x = (BASE[name] || [0])[0];
+  for (const l of layers) { const v = l.pose[name]; if (v) x += v[0] * layerWeight(l); }
+  return x;
+}
+
+// ---------- muscle controller ----------
+// Muscles are force-based joint motors (implicit springs inside the solver), one per angular axis.
+const qT = new THREE.Quaternion();
+const toQ = (r, q) => q.set(r.x, r.y, r.z, r.w);
+const ANG = [3, 4, 5]; // RawJointAxis.AngX / AngY / AngZ
+const FORCE_BASED = 1;
+function motorAxis(joint, axis, target, k, d) {
+  joint.rawSet.jointConfigureMotorPosition(joint.handle, axis, target, k, d);
+}
+function muscles(dt) {
+  const ph = character.run && character.run.phys ? character.run : null, dip = ph ? runDip(ph) : 1;
+  for (const p of parts) {
+    p.tone += (p.toneTarget - p.tone) * Math.min(1, p.toneRate * dt);
+    if (!p.p) continue;
+    const k = p.k * p.tone * character.vigor * dip;
+    const d = p.k * (0.12 * p.tone + 0.006); // a little passive damping remains when limp
+    if (ph) qT.copy(ph.animQ[p.p]).invert().multiply(ph.animQ[p.n]); // stumbling at a run: the muscles chase the clip
+    else targetQuat(p.n, qT);
+    if (qT.w < 0) qT.set(-qT.x, -qT.y, -qT.z, -qT.w);
+    if (p.hinge) p.joint.configureMotorPosition(2 * Math.atan2(qT.x, qT.w), k, d);
+    else {
+      const v = [qT.x, qT.y, qT.z];
+      for (let i = 0; i < 3; i++) motorAxis(p.joint, ANG[i], 2 * Math.asin(Math.max(-1, Math.min(1, v[i]))), k, d);
+    }
+  }
+  // Upright assist: a motorized joint between the world and the pelvis stands in for balance reflexes.
+  const c = character;
+  c.balance += (c.balanceTarget - c.balance) * Math.min(1, c.balanceRate * dt);
+  if (balanceJoint && c.balanceTarget === 0 && c.balance < 0.01) {
+    // balance is gone for good: drop the assist joint, it only adds solver noise from here on
+    world.removeImpulseJoint(balanceJoint, true);
+    balanceJoint = null;
+  }
+  if (!balanceJoint) return;
+  const kb = BAL_K * c.balance * (0.35 + 0.65 * dip), db = BAL_D * c.balance;
+  // The anchor carries the heading: after running away the body stands facing where it ran.
+  const A = anchorBody.translation();
+  if (c.run) { // the anchor travels with the runner, so the ragdoll takes over without a jolt
+    const pt = byName.pelvis.body.translation();
+    A.x = pt.x; A.z = pt.z; c.heading = c.run.heading;
+  }
+  anchorBody.setNextKinematicTranslation(A);
+  anchorBody.setNextKinematicRotation(anchorQ.setFromAxisAngle(UP, c.heading));
+  // A generic joint built on axis X has the local basis X = anchor X, Y = anchor −Z, Z = anchor Y.
+  motorAxis(balanceJoint, 3, 0, kb, db);              // pitch
+  motorAxis(balanceJoint, 4, 0, kb, db);              // roll
+  motorAxis(balanceJoint, 5, 0, kb * 0.08, db * 0.2); // yaw, kept loose
+  // keep the pelvis over the support area, weighted toward the leg that still carries load
+  const wL = byName.shinL.tone + 0.02, wR = byName.shinR.tone + 0.02;
+  const fL = byName.footL.body.translation(), fR = byName.footR.body.translation();
+  let sx = (fL.x * wL + fR.x * wR) / (wL + wR) + c.supportShift.x, sz = (fL.z * wL + fR.z * wR) / (wL + wR) - 0.03 + c.supportShift.z;
+  if (c.kneel) {
+    const k = byName['shin' + c.kneel].body, kt = k.translation();
+    const knee = new THREE.Vector3(0, 0.155, 0).applyQuaternion(toQ(k.rotation(), qT)).add(vecOf(kt));
+    const f = byName['foot' + (c.kneel === 'L' ? 'R' : 'L')].body.translation();
+    sx = (knee.x + f.x) / 2; sz = knee.z * 0.65 + f.z * 0.35;
+  }
+  if (ph) { // during a stumble the pelvis is drawn toward where the clip has it, and partly held up
+    const ap = ph.animP.pelvis, pb = byName.pelvis.body, y = pb.translation().y, vy = pb.linvel().y;
+    sx = ap.x; sz = ap.z;
+    pb.applyImpulse({ x: 0, y: Math.max(0, Math.min(700, 0.9 * dip * (5000 * (ap.y - y) - 500 * vy))) * dt, z: 0 }, true);
+  }
+  const kl = BAL_LIN_K * c.balance * dip * (c.seated || c.noLift ? 0 : 1), dl = BAL_LIN_D * c.balance;
+  // the target offset from the anchor, in the anchor's frame
+  const ox = sx - A.x, oz = sz - A.z, ch = Math.cos(c.heading), sh = Math.sin(c.heading);
+  motorAxis(balanceJoint, 0, ox * ch - oz * sh, kl, dl);
+  motorAxis(balanceJoint, 1, -(ox * sh + oz * ch), kl, dl);
+}
+const anchorQ = new THREE.Quaternion(), UP = new THREE.Vector3(0, 1, 0);
+const wrapAngle = a => Math.atan2(Math.sin(a), Math.cos(a));
+
+// ---------- running away ----------
+// Running is motion capture: the skeleton plays the X Bot's own run (or walk, when hurt) clip, the model moves
+// along the heading at the clip's ground speed, and the physics bodies follow the bones kinematically, so
+// shots still land where the body is. When the run ends the clip settles into a stand and the ragdoll takes over
+// at that pose. Anything that takes the legs or consciousness away hands the body back at once with the
+// velocity it had: the ragdoll stumbles on and falls.
+function brakeRun() { if (character.run) releaseRun(true); }
+// while the clip runs the body, scripted poses cannot act: only breathing, fainting and the run itself go through
+const RUN_ALLOWED = ['gasp', 'faint', 'flee'];
+
+// ---------- reactions ----------
+// caps hold what an injury makes impossible (a paralysed or broken limb cannot be tensed again)
+// Tone has a base, set by physiology and injuries, and temporary boosts from scripted beats. The target is the
+// larger of them, never above what the injury allows. A beat removes only its own boost, so it can never hand
+// back strength that blood loss or a wound has taken away in the meantime.
+function effTone(p) {
+  let v = p.baseTone;
+  for (const k in p.boosts) v = Math.max(v, p.boosts[k]);
+  return Math.min(v, character.cap[p.n] ?? 1);
+}
+const tone = (names, target, rate) => names.forEach(n => { const p = byName[n]; p.baseTone = target; p.toneRate = rate; p.toneTarget = effTone(p); });
+const capTone = (names, v) => names.forEach(n => { character.cap[n] = Math.min(character.cap[n] ?? 1, v); byName[n].toneTarget = effTone(byName[n]); });
+function clearBoosts(names) { for (const n of names) { byName[n].boosts = {}; byName[n].toneTarget = effTone(byName[n]); } }
+const LEG = S => ['thigh' + S, 'shin' + S, 'foot' + S];
+const ARM = S => ['uArm' + S, 'fArm' + S];
+const ALL = () => parts.filter(p => p.p).map(p => p.n);
+const at = (delay, fn) => events.push({ t: simTime + delay, fn });
+
+function setState(s) {
+  character && (character.state = s);
+  const chip = document.getElementById('stateChip');
+  chip.dataset.s = s;
+  document.getElementById('stateText').textContent = { ok: 'стоит', wounded: 'ранен, на ногах', kneel: 'на колене', sit: 'сидит', down: 'упал' }[s];
+}
+
+const jitter = (x, k = 0.3) => x * (1 + (Math.random() * 2 - 1) * k);
+// every reaction is drawn fresh: each joint's offset and the timing vary, so no two look the same
+function addVaried(pose, env, k = 0.3) {
+  const out = {};
+  for (const [j, v] of Object.entries(pose)) out[j] = v.map(x => jitter(x, k));
+  return addLayer(out, { ...env, attack: jitter(env.attack ?? 0.08, 0.35), hold: env.hold === Infinity ? Infinity : jitter(env.hold ?? 0.3, 0.4), release: jitter(env.release ?? 0.8, 0.35) });
+}
+function startle(intensity, side) {
+  const c = character;
+  if (!c.conscious) return;
+  // repeated shots nearby: the startle fades, but the person crouches and stays low
+  c.startles = (c.startles || []).filter(t => simTime - t < 10);
+  const k = Math.min(1, intensity) * Math.pow(0.6, c.startles.length);
+  c.startles.push(simTime);
+  if (c.startles.length >= 3 && !c.crouch) {
+    c.crouch = addVaried({ thighL: [-0.9, 0, 0], thighR: [-0.9, 0, 0], shinL: [1.5, 0, 0], shinR: [1.5, 0, 0], chest: [0.35, 0, 0], head: [0.2, 0, 0],
+      uArmL: [-0.8, 0, -0.2], uArmR: [-0.8, 0, 0.2], fArmL: [-1.6, 0, 0], fArmR: [-1.6, 0, 0] }, { attack: 0.5, hold: 4, release: 1.5, tag: 'crouch' }, 0.15);
+    at(6, () => { c.crouch = null; });
+  }
+  if (k < 0.08) return;
+  const away = -side;
+  const variant = Math.random();
+  const legs = { thighL: [-0.35, 0, 0], thighR: [-0.35, 0, 0], shinL: [0.6, 0, 0], shinR: [0.6, 0, 0] };
+  let pose;
+  if (variant < 0.4) pose = { // arms come up over the head
+    head: [0.35, away * 0.6, 0], chest: [0.3, away * 0.2, -side * 0.12], abdomen: [0.15, 0, 0],
+    uArmL: [-1.25, 0, -0.25], uArmR: [-1.25, 0, 0.25], fArmL: [-1.9, 0, 0], fArmR: [-1.9, 0, 0], ...legs };
+  else if (variant < 0.75) pose = { // ducks and hunches, hands in front of the chest
+    head: [0.5, away * 0.3, 0], chest: [0.4, 0, 0], abdomen: [0.2, 0, 0],
+    uArmL: [-0.6, 0, 0.15], uArmR: [-0.6, 0, -0.15], fArmL: [-1.7, 0, 0], fArmR: [-1.7, 0, 0],
+    thighL: [-0.4, 0, 0], thighR: [-0.4, 0, 0], shinL: [0.7, 0, 0], shinR: [0.7, 0, 0] };
+  else { // turns away and lifts the arm on the bullet's side
+    const near = side > 0 ? 'L' : 'R', far = near === 'L' ? 'R' : 'L', sn = near === 'L' ? 1 : -1;
+    pose = { head: [0.25, away * 0.9, 0], chest: [0.2, away * 0.45, -side * 0.15], abdomen: [0.1, away * 0.2, 0],
+      ['uArm' + near]: [-1.4, 0, -0.2 * sn], ['fArm' + near]: [-1.8, 0, 0], ['uArm' + far]: [-0.3, 0, 0.1 * sn], ['fArm' + far]: [-1.0, 0, 0], ...legs };
+  }
+  addVaried(pose, { peak: 0.35 + 0.65 * k, attack: 0.09, hold: 0.25 + 0.4 * k, release: 0.9, tag: 'startle' });
+}
+
+// fromFront: the bullet came from in front of the chest
+function flinch(strength, side, fromFront = true) {
+  if (!character.conscious) return;
+  if (!fromFront) // shot in the back: a brief arch before the body folds
+    addVaried({ chest: [-0.3, side * 0.1, 0], abdomen: [-0.15, 0, 0], head: [-0.25, 0, 0] }, { peak: strength, attack: 0.05, hold: 0.08, release: 0.35, tag: 'arch' });
+  const fold = () => addVaried({
+    chest: [0.45, side * 0.25, -side * 0.08], abdomen: [0.3, side * 0.1, 0], head: [0.3, side * 0.2, 0],
+    thighL: [-0.25, 0, 0], thighR: [-0.25, 0, 0], shinL: [0.45, 0, 0], shinR: [0.45, 0, 0],
+  }, { peak: strength, attack: 0.07, hold: 0.15, release: 0.7, tag: 'flinch' });
+  if (fromFront) fold(); else at(0.12, () => character.conscious && fold());
+}
+
+// breathing, small shifts of weight and glances; faster and bigger once hurt or losing blood
+function updateLife() {
+  const c = character, l = c.life;
+  if (!l || !c.conscious) return;
+  const f = c.lost / BLOOD_VOLUME, hurt = c.state === 'ok' ? 0 : 1, t = simTime;
+  c.breath += (0.23 + 0.35 * Math.min(1, f / 0.3) + 0.12 * hurt + 0.4 * c.breathBoost) * Math.PI * 2 * DT;
+  const b = Math.sin(c.breath), amp = (1 + 1.5 * Math.min(1, f / 0.3) + 0.8 * hurt) * (1 + 1.5 * c.breathBoost);
+  const tr = c.tremble;
+  const n = (i, f1, f2) => (Math.sin(t * f1 + c.ph[i]) * 0.6 + Math.sin(t * f2 + c.ph[i] * 1.7) * 0.4) * c.lifeDamp;
+  // laboured breathing heaves the chest and lifts the shoulders; a tremor shakes the arms and head
+  const gasp = c.breathBoost, shake = k => tr * k * (Math.sin(t * 13.7 + k * 40) * 0.6 + Math.sin(t * 9.3 + k * 17) * 0.4);
+  l.pose.chest = [(-0.018 * amp - 0.07 * gasp) * b + 0.02 * n(0, 0.31, 0.53), 0.03 * n(1, 0.17, 0.41), 0.015 * n(2, 0.23, 0.37)];
+  l.pose.abdomen = [(0.012 * amp + 0.05 * gasp) * b, 0.015 * n(3, 0.19, 0.44), 0];
+  l.pose.head = [0.04 * n(4, 0.21, 0.47) + (0.012 + 0.06 * gasp) * b + shake(0.06), 0.12 * n(5, 0.13, 0.29) * (1 + hurt) + shake(0.05), 0.03 * n(6, 0.19, 0.43)];
+  l.pose.uArmL = [0.05 * n(7, 0.27, 0.51) + shake(0.08), 0, 0.02 * n(8, 0.33, 0.61) + 0.05 * gasp * b];
+  l.pose.uArmR = [0.05 * n(9, 0.29, 0.49) + shake(0.08), 0, -0.02 * n(10, 0.31, 0.57) - 0.05 * gasp * b];
+  l.pose.fArmL = [shake(0.12), 0, 0]; l.pose.fArmR = [shake(0.12), 0, 0];
+  const shift = 0.025 * n(11, 0.11, 0.23) * (1 + hurt);
+  l.pose.thighL = [0.015 * n(12, 0.2, 0.4), 0, shift]; l.pose.thighR = [0.015 * n(13, 0.21, 0.39), 0, shift];
+}
+
+// ---------- behaviour scripts ----------
+// After every shot a long behaviour timeline is composed (by Claude when available, otherwise by a
+// procedural generator) from what was hit and the state of the body; the physics performs it.
+// Every action is a pose on one channel; a new beat on a channel takes over from the previous one.
+const ACTION_RU = {
+  look: 'взгляд', clutch: 'зажимает рану', double_over: 'сгибается', straighten: 'выпрямляется', rock: 'раскачивается',
+  stagger: 'шатается', kneel: 'на колено', sit: 'садится', lie_down: 'ложится', curl: 'сжимается', writhe: 'корчится',
+  try_rise: 'пытается встать', reach: 'тянется', raise_hands: 'руки вверх', cover_head: 'закрывает голову',
+  gasp: 'дыхание', tremble: 'дрожь', freeze: 'замирает', faint: 'теряет сознание', flee: 'убегает',
+};
+const CHANNEL = { look: 'head', clutch: 'arms', reach: 'arms', raise_hands: 'arms', cover_head: 'arms', double_over: 'torso', straighten: 'torso',
+  rock: 'torso', stagger: 'legs', kneel: 'body', sit: 'body', lie_down: 'legs', curl: 'body', writhe: 'body', try_rise: 'body',
+  gasp: 'breath', tremble: 'breath', freeze: 'breath', faint: 'body', flee: 'legs' };
+const ZONE_KIND = z => /шея|голова/.test(z) ? 'head' : /груд/.test(z) ? 'chest' : /живот/.test(z) ? 'abdomen' : /таз/.test(z) ? 'pelvis'
+  : /бедро|голень|стопа/.test(z) ? 'leg' : 'arm';
+let script = null;
+
+function usableHand(h) {
+  const ok = S => (character.cap['uArm' + S] ?? 1) > 0.1;
+  if (h === 'both') return ok('L') && ok('R') ? 'both' : ok('L') ? 'L' : ok('R') ? 'R' : null;
+  if (h === 'L' || h === 'R') return ok(h) ? h : ok(h === 'L' ? 'R' : 'L') ? (h === 'L' ? 'R' : 'L') : null;
+  return ok('R') ? 'R' : ok('L') ? 'L' : null;
+}
+// running needs both legs, balance and the person on their feet
+const canRun = () => { const c = character;
+  return c.conscious && c.state !== 'down' && !c.seated && !c.kneel && c.balanceTarget > 0.5 && (c.cap.thighL ?? 1) > 0.5 && (c.cap.thighR ?? 1) > 0.5; };
+const legsWork = () => (character.cap.thighL ?? 1) > 0.1 || (character.cap.thighR ?? 1) > 0.1;
+// direction toward the camera (the shooter) in the chest's frame: yaw and pitch, rad
+function shooterAngles() {
+  const chest = byName.chest.body, head = vecOf(byName.head.body.translation());
+  const v = camera.position.clone().sub(head).applyQuaternion(toQ(chest.rotation(), new THREE.Quaternion()).invert());
+  return { yaw: Math.max(-1.3, Math.min(1.3, Math.atan2(v.x, v.z))), pitch: Math.max(-0.6, Math.min(0.6, -Math.atan2(v.y, Math.hypot(v.x, v.z)))) };
+}
+function armPose(kind, S, k = 1) {
+  const s = S === 'L' ? 1 : -1;
+  const P = {
+    head: [[-1.7, -0.6 * s, -0.2 * s], -2.2], chest: [[-0.9, -0.9 * s, -0.25 * s], -2.1], abdomen: [[-0.65, -0.85 * s, -0.3 * s], -2.0],
+    pelvis: [[-0.35, -0.6 * s, -0.25 * s], -1.5], leg: [[-0.5, -0.3 * s, -0.15 * s], -0.4], arm: [[-0.8, -0.9 * s, -0.5 * s], -1.7],
+  }[kind] || [[-0.65, -0.85 * s, -0.3 * s], -2.0];
+  return { ['uArm' + S]: P[0].map(x => x * k), ['fArm' + S]: [P[1] * k, 0, 0] };
+}
+// tone for the beat; restored when it ends (only while conscious)
+let beatUid = 0;
+function beatTone(b, names, v, rate = 3) {
+  b.uid = b.uid || ++beatUid;
+  b.boosted = b.boosted || new Set();
+  for (const n of names) { const p = byName[n]; p.boosts[b.uid] = v; p.toneRate = rate; p.toneTarget = effTone(p); b.boosted.add(n); }
+}
+function dropBoosts(b) {
+  if (!b.boosted) return;
+  for (const n of b.boosted) { const p = byName[n]; delete p.boosts[b.uid]; p.toneRate = Math.min(p.toneRate, 2.5); p.toneTarget = effTone(p); }
+  b.boosted = null;
+}
+
+// ground actions start from lying or from sitting (and end the sitting)
+function groundStart() {
+  const c = character;
+  if (c.seated) { c.seated = false; c.noLift = true; c.balanceTarget = 0; return true; }
+  return c.state === 'down';
+}
+const ACTIONS = {
+  look(b) {
+    let pitch = 0, yaw = 0;
+    if (b.at === 'wound' && b.zoneKind) { pitch = { head: 0.1, chest: 0.6, abdomen: 0.8, pelvis: 0.9, leg: 0.95, arm: 0.55 }[b.zoneKind]; yaw = (b.sideSign || 0) * 0.45; }
+    else if (b.at === 'shooter') ({ yaw, pitch } = shooterAngles());
+    else if (b.at === 'away') { yaw = -shooterAngles().yaw * 0.8; }
+    else if (b.at === 'down') pitch = 0.75;
+    else if (b.at === 'up') pitch = -0.5;
+    const k = b.intensity;
+    const layer = addLayer({ head: [pitch * 0.75 * k, yaw * 0.7 * k, 0], chest: [pitch * 0.15 * k, yaw * 0.3 * k, 0] }, { attack: 0.35, hold: Infinity, release: 0.6, tag: 'ai-head' });
+    if (b.at === 'around') return { layer, update(t) { layer.pose.head = [0.1, Math.sin(t * 1.3) * 0.9 * k, 0]; layer.pose.chest = [0, Math.sin(t * 1.3 - 0.4) * 0.25 * k, 0]; } };
+    return { layer };
+  },
+  clutch(b) {
+    const h = usableHand(b.hand || 'both');
+    if (!h) return null;
+    const kind = b.zoneKind || 'abdomen', k = b.intensity;
+    let pose = {};
+    if (kind === 'arm') { const other = b.sideSign > 0 ? 'R' : 'L'; if ((character.cap['uArm' + other] ?? 1) > 0.1) pose = armPose('arm', other, k); }
+    else if (h === 'both') pose = { ...armPose(kind, b.sideSign >= 0 ? 'L' : 'R', k), ...armPose(kind, b.sideSign >= 0 ? 'R' : 'L', 0.8 * k) };
+    else pose = armPose(kind, h, k);
+    if (kind === 'leg' || kind === 'pelvis') Object.assign(pose, { chest: [0.45 * k, 0, 0], abdomen: [0.25 * k, 0, 0] });
+    for (const l of layers) if (l.tag === 'clutch') fadeOut(l, 0.5);
+    return { layer: addLayer(pose, { attack: 0.5, hold: Infinity, release: 0.7, tag: 'ai-arms' }) };
+  },
+  double_over(b) {
+    const c = character;
+    if (c.state === 'down' && !c.seated) return null; // on the ground the trunk flex rolls the body over its head
+    if (c.seated) { // sitting already bends the trunk: only a little more, and the legs stay as they are
+      const k = 0.4 * b.intensity;
+      return { layer: addLayer({ chest: [0.6 * k, 0, 0], abdomen: [0.4 * k, 0, 0], head: [0.4 * k, 0, 0] }, { attack: 0.8, hold: Infinity, release: 0.8, tag: 'ai-torso' }) };
+    }
+    const k = b.intensity;
+    return { layer: addLayer({ chest: [0.6 * k, 0, 0], abdomen: [0.4 * k, 0, 0], head: [0.3 * k, 0, 0], thighL: [-0.2 * k, 0, 0], thighR: [-0.2 * k, 0, 0], shinL: [0.35 * k, 0, 0], shinR: [0.35 * k, 0, 0] }, { attack: 0.6, hold: Infinity, release: 0.8, tag: 'ai-torso' }) };
+  },
+  straighten(b) { return { layer: addLayer({ chest: [-0.12, 0, 0], abdomen: [-0.06, 0, 0], head: [-0.1, 0, 0] }, { attack: 0.8, hold: Infinity, release: 0.8, tag: 'ai-torso' }) }; },
+  rock(b) {
+    if (character.state === 'down' && !character.seated) return null; // rocking is done sitting or kneeling
+    const k = b.intensity, layer = addLayer({}, { attack: 0.5, hold: Infinity, release: 0.8, tag: 'ai-torso' });
+    return { layer, update(t) { const v = 0.3 + 0.22 * Math.sin(t * 2.4); layer.pose.chest = [v * k, 0, 0]; layer.pose.abdomen = [v * 0.6 * k, 0, 0]; layer.pose.head = [v * 0.5 * k, 0, 0]; } };
+  },
+  stagger(b) {
+    if (character.state === 'down' || character.seated || character.kneel || !legsWork()) return null;
+    const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(toQ(byName.pelvis.body.rotation(), new THREE.Quaternion())).setY(0).normalize();
+    const left = new THREE.Vector3(fwd.z, 0, -fwd.x);
+    const v = { back: fwd.clone().negate(), forward: fwd, left, right: left.clone().negate() }[b.dir] || fwd.clone().negate();
+    b.vec = v.multiplyScalar(0.07 + 0.08 * b.intensity);
+    const S = b.dir === 'left' ? 'L' : b.dir === 'right' ? 'R' : (Math.random() < 0.5 ? 'L' : 'R'), s = S === 'L' ? 1 : -1;
+    const leg = b.dir === 'back' ? [0.35, 0, 0] : b.dir === 'forward' ? [-0.45, 0, 0] : [-0.15, 0, 0.25 * s];
+    const layer = addLayer({ ['thigh' + S]: leg, ['shin' + S]: [0.9, 0, 0] }, { attack: 0.15, hold: Math.min(0.35, b.dur * 0.3), release: 0.3, tag: 'ai-legs' });
+    for (const l of layers) if (l.tag === 'buckle') fadeOut(l, 0.4);
+    return { layer, update(t) { const e = Math.min(1, t / 0.4) * Math.max(0, Math.min(1, (b.dur - t) / 0.6)); character.supportShift.addScaledVector(b.vec, e); } };
+  },
+  kneel(b) {
+    if (character.state === 'down' || character.seated || character.kneel || !legsWork()) return null;
+    const S = b.knee === 'L' || b.knee === 'R' ? b.knee : (character.cap.thighL ?? 1) < (character.cap.thighR ?? 1) ? 'L' : 'R', H = S === 'L' ? 'R' : 'L';
+    character.kneel = S;
+    tone(LEG(S), Math.min(byName['thigh' + S].baseTone, 0.25), 3);
+    return { layer: addLayer({ ['thigh' + S]: [0.05, 0, 0], ['shin' + S]: [1.45, 0, 0], ['thigh' + H]: [-1.35, 0, 0], ['shin' + H]: [1.45, 0, 0], chest: [0.15, 0, 0] }, { attack: 1.2, hold: Infinity, release: 1, tag: 'ai-body' }), keepTone: true, keepLayer: true };
+  },
+  sit(b) {
+    const c = character;
+    if (c.state === 'down' || c.seated) return null;
+    // sitting is held: the pelvis stays upright and the posture lasts until something else takes over
+    c.seated = true; c.kneel = null;
+    // the injury's kneeling or buckled leg hands over to the sitting pose instead of adding to it
+    for (const l of layers) if (l.tag === 'kneel' || l.tag === 'buckle' || l.tag === 'sag') fadeOut(l, 1.4);
+    // the legs only fold: they carry no weight, otherwise the folded pose pushes off the ground and lifts the body
+    clearBoosts([...LEG('L'), ...LEG('R')]);
+    tone([...LEG('L'), ...LEG('R')], Math.min(byName.thighL.baseTone, 0.15), 5);
+    c.balanceTarget = Math.min(c.balanceTarget, 0.35); c.balanceRate = 1;
+    return { layer: addLayer({ thighL: [-1.4, 0, 0], thighR: [-1.4, 0, 0], shinL: [1.9, 0, 0], shinR: [1.9, 0, 0], chest: [0.45, 0, 0], abdomen: [0.2, 0, 0] }, { attack: 1.4, hold: Infinity, release: 1, tag: 'ai-body' }), keepTone: true, keepLayer: true };
+  },
+  lie_down(b) {
+    const c = character;
+    if (c.state === 'down' && !c.seated) return null;
+    // the kneeling or sitting pose stays until the body is on the ground, and the legs let go first:
+    // otherwise the healthy leg straightens and lifts the body before it goes down
+    // once sitting or kneeling, the balance never lifts the pelvis again: it only keeps the trunk from flopping
+    if (c.seated || c.kneel) c.noLift = true;
+    c.seated = false;
+    clearBoosts([...LEG('L'), ...LEG('R')]);
+    tone([...LEG('L'), ...LEG('R')], 0.12, 5);
+    c.balanceTarget = 0; c.balanceRate = 1.2;
+    return { keepTone: true };
+  },
+  curl(b) {
+    if (!groundStart()) return null;
+    const k = b.intensity;
+    beatTone(b, UPPER, 0.35, 2);
+    beatTone(b, [...LEG('L'), ...LEG('R')], 0.2, 2);
+    // a gentle tuck: a full knees-to-chest flex on the back jackknifes the hips off the ground
+    return { layer: addLayer({ thighL: [-0.85 * k, 0, 0], thighR: [-0.85 * k, 0, 0], shinL: [1.4 * k, 0, 0], shinR: [1.4 * k, 0, 0], chest: [0.3 * k, 0, 0], abdomen: [0.2 * k, 0, 0], head: [0.35 * k, 0, 0], ...armPose('abdomen', 'L', k), ...armPose('abdomen', 'R', k) }, { attack: 1, hold: Infinity, release: 1, tag: 'ai-body' }) };
+  },
+  writhe(b) {
+    if (!groundStart()) return null;
+    const k = b.intensity;
+    beatTone(b, UPPER, 0.35, 2);
+    beatTone(b, [...LEG('L'), ...LEG('R')], 0.15, 2);
+    const layer = addLayer({}, { attack: 0.6, hold: Infinity, release: 1, tag: 'ai-body' });
+    return { layer, update(t) {
+      const a = Math.sin(t * 1.7), c2 = Math.sin(t * 1.1 + 1);
+      layer.pose.abdomen = [0.3 * k * a, 0.4 * k * c2, 0.2 * k * a]; layer.pose.chest = [0.25 * k * c2, 0.3 * k * a, 0];
+      layer.pose.thighL = [-0.25 * k * (1 + a) / 2, 0, 0]; layer.pose.thighR = [-0.25 * k * (1 - a) / 2, 0, 0];
+      layer.pose.shinL = [0.35 * k * (1 + a) / 2, 0, 0]; layer.pose.shinR = [0.35 * k * (1 - a) / 2, 0, 0];
+      layer.pose.head = [0.2 * k * c2, 0.3 * k * a, 0];
+    } };
+  },
+  try_rise(b) {
+    if (!groundStart()) return null;
+    const k = b.intensity, arms = ['L', 'R'].filter(S => (character.cap['uArm' + S] ?? 1) > 0.1);
+    if (!arms.length) return null;
+    beatTone(b, [...arms.flatMap(ARM), 'chest', 'abdomen', 'head'], 0.8, 3);
+    const pose = { chest: [-0.35 * k, 0, 0], head: [-0.3 * k, 0, 0] };
+    for (const S of arms) Object.assign(pose, { ['uArm' + S]: [-0.5 * k, 0, (S === 'L' ? 0.3 : -0.3) * k], ['fArm' + S]: [-0.25, 0, 0] });
+    return { layer: addLayer(pose, { attack: 0.8, hold: Infinity, release: 1.2, tag: 'ai-body' }) };
+  },
+  reach(b) {
+    const h = usableHand(b.hand === 'both' ? 'R' : b.hand);
+    if (!h) return null;
+    const s = h === 'L' ? 1 : -1, k = b.intensity;
+    const U = { forward: [-1.5, 0, 0], up: [-2.6, 0, 0.1 * s], ground: [-0.6, 0, 0.35 * s], shooter: [-1.4, 0, 0] }[b.dir] || [-1.5, 0, 0];
+    const pose = { ['uArm' + h]: U.map(x => x * k), ['fArm' + h]: [-0.25 * k, 0, 0] };
+    if (b.dir === 'shooter') pose.chest = [0, shooterAngles().yaw * 0.3, 0];
+    return { layer: addLayer(pose, { attack: 0.7, hold: Infinity, release: 0.8, tag: 'ai-arms' }) };
+  },
+  raise_hands(b) {
+    const k = b.intensity, pose = {};
+    for (const S of ['L', 'R']) if ((character.cap['uArm' + S] ?? 1) > 0.1) Object.assign(pose, { ['uArm' + S]: [-2.2 * k, 0, (S === 'L' ? 0.4 : -0.4) * k], ['fArm' + S]: [-1.4 * k, 0, 0] });
+    return Object.keys(pose).length ? { layer: addLayer(pose, { attack: 0.6, hold: Infinity, release: 0.8, tag: 'ai-arms' }) } : null;
+  },
+  cover_head(b) {
+    const k = b.intensity, pose = { head: [0.4 * k, 0, 0] };
+    for (const S of ['L', 'R']) if ((character.cap['uArm' + S] ?? 1) > 0.1) Object.assign(pose, { ['uArm' + S]: [-1.3 * k, 0, (S === 'L' ? -0.25 : 0.25) * k], ['fArm' + S]: [-1.9 * k, 0, 0] });
+    return { layer: addLayer(pose, { attack: 0.25, hold: Infinity, release: 0.8, tag: 'ai-arms' }) };
+  },
+  gasp(b) { return { update() { character.breathBoost = b.intensity; }, end() { character.breathBoost = 0; } }; },
+  tremble(b) { return { update() { character.tremble = b.intensity; }, end() { character.tremble = 0; } }; },
+  freeze(b) { return { update() { character.lifeDamp = 0.15; }, end() { character.lifeDamp = 1; } }; },
+  flee(b) {
+    const c = character;
+    const stop = () => { if (c.run && c.run.owner === b && c.run.mode === 'go') c.run.mode = 'stop'; };
+    if (c.run && c.run.mode === 'go') { c.run.owner = b; return { update(t) { if (t > b.dur - 0.6) stop(); }, end: stop }; } // hit on the way: keep going
+    if (c.run || !canRun()) return null;
+    const p = byName.pelvis.body.translation();
+    // away from the shooter, angled off to one side the way people run for cover
+    const away = Math.atan2(p.x - camera.position.x, p.z - camera.position.z);
+    const off = b.dir === 'left' ? 0.55 : b.dir === 'right' ? -0.55 : (Math.random() - 0.5) * 0.9;
+    const vmax = runPace(b.intensity);
+    // poses held from before would pull the body back into them once the run hands it back
+    for (const l of layers) if (l.tag !== 'life') fadeOut(l, 0.3);
+    startRun(vmax, wrapAngle(away + off));
+    c.run.owner = b;
+    return { update(t) { if (t > b.dur - 0.6) stop(); }, end: stop };
+  },
+  faint(b) {
+    // only physiology decides: the script may ask, the blood and the heart answer
+    const c = character, f = c.lost / BLOOD_VOLUME;
+    if (!(f > 0.25 || (c.arrestAt !== null && c.physT > c.arrestAt - 3))) return null;
+    collapse(false);
+    return {};
+  },
+};
+
+// parts each action moves, for actions whose pose is written while they run
+const LEGS = ['thighL', 'thighR', 'shinL', 'shinR', 'footL', 'footR'];
+const UPPER = ['head', 'chest', 'abdomen', 'uArmL', 'uArmR', 'fArmL', 'fArmR'];
+const MOVES = { look: ['head', 'chest'], rock: ['chest', 'abdomen', 'head'], writhe: null, gasp: ['chest', 'abdomen', 'head', 'uArmL', 'uArmR'],
+  tremble: ['uArmL', 'uArmR', 'fArmL', 'fArmR', 'head'] };
+function beginBeat(b) {
+  if (character.run && !RUN_ALLOWED.includes(b.action)) { b.state = 'skip'; return; }
+  const fx = ACTIONS[b.action](b);
+  if (!fx) { b.state = 'skip'; return; }
+  Object.assign(b, { fx, state: 'run' });
+  // a conscious person tenses what they move: on the ground the resting tone is too low to perform anything
+  const c = character;
+  const used = new Set([...(fx.layer ? Object.keys(fx.layer.pose) : []), ...(MOVES[b.action] || [])]);
+  const need = c.state === 'down' || c.seated ? 0.6 : 0.85;
+  const weak = [...used].filter(n => UPPER.includes(n) && byName[n].toneTarget < need);
+  if (weak.length && c.conscious) beatTone(b, weak, need, 4);
+  if (fx.layer) fx.layer.attack = Math.min(fx.layer.attack, Math.max(0.2, b.dur * 0.3));
+}
+function endBeat(b, quiet) {
+  const fx = b.fx;
+  b.state = 'done';
+  if (!fx) return;
+  if (fx.layer && !fx.keepLayer) fadeOut(fx.layer, Math.min(fx.layer.release, 0.9));
+  fx.end?.();
+  dropBoosts(b);
+}
+function stopScript() {
+  if (!script) return;
+  for (const b of script.beats) if (b.state === 'run') endBeat(b, true);
+  script.ctl?.abort();
+  script = null;
+}
+function runScript() {
+  const c = character;
+  c.supportShift.set(0, 0, 0);
+  if (!script) return;
+  const t = simTime - script.t0;
+  let changed = false;
+  for (const b of script.beats) {
+    if (b.state === 'wait' && t >= b.t) {
+      if (!c.conscious) { b.state = 'skip'; changed = true; continue; }
+      beginBeat(b); changed = true;
+    }
+    if (b.state === 'run') {
+      if (!c.conscious) { endBeat(b, true); changed = true; continue; }
+      b.fx.update?.(t - b.t);
+      if (t - b.t >= b.dur) { endBeat(b); changed = true; }
+    }
+  }
+  if (changed) renderScript(script);
+}
+function startScript(beats, meta) {
+  stopScript();
+  // intensity 0..1 maps to 45..100 % of the pose: a beat is always visible
+  script = { t0: simTime, beats: beats.map(b => ({ ...b, intensity: 0.45 + 0.55 * b.intensity, state: 'wait' })), ...meta };
+  renderScript(script);
+  emit('reaction', { id: meta.id || null, source: meta.source, title: meta.title });
+}
+
+// ---------- incident report: what the composer is told ----------
+const TEMPERAMENTS = ['ошеломлённый, долго не понимает, что ранен', 'паникующий', 'сдержанный, сжимает зубы', 'агрессивный, пытается держаться на ногах',
+  'дезориентированный', 'испуганный, ищет укрытие', 'в шоке, почти не двигается', 'упрямый, пытается встать'];
+function incidentReport(hits, nearMiss) {
+  const c = character, f = c.lost / BLOOD_VOLUME;
+  // fresh wounds have not bled yet this step: use their starting rates
+  const bleed = c.wounds.reduce((sum, w) => sum + (w.now || w.rate), 0);
+  const etaLoc = c.arrestAt !== null ? Math.max(0, c.arrestAt - c.physT) : bleed > 0.05 ? (0.38 * BLOOD_VOLUME - c.lost) / bleed : null;
+  const legsBroken = ['L', 'R'].filter(S => (c.cap['thigh' + S] ?? 1) <= 0.05 && (c.cap['thigh' + S] ?? 1) > 0);
+  return {
+    weapon: weapon.name,
+    near_miss_cm: nearMiss ?? null,
+    hits: hits.map(x => ({
+      zone: x.w.zone, side_of_body: x.side > 0 ? 'left' : x.side < 0 ? 'right' : 'center',
+      hit: x.w.organs.length ? x.w.organs.map(o => o.name) : ['только мягкие ткани'], bleed_ml_per_s: +x.w.rate.toFixed(1),
+      through_and_through: x.w.perforating,
+    })),
+    bullet_came_from: hits[0] ? (hits[0].fromFront ? 'front' : 'back') : null,
+    posture: c.seated ? 'sitting on the ground' : c.state === 'down' ? 'lying on the ground' : c.kneel ? 'on one knee' : 'standing',
+    conscious: c.conscious,
+    blood_lost_percent: +(f * 100).toFixed(1), total_bleed_ml_per_s: +bleed.toFixed(1),
+    estimated_seconds_until_unconscious: etaLoc === null ? null : Math.round(etaLoc),
+    impossible: {
+      legs_paralysed: (c.cap.thighL ?? 1) === 0 && (c.cap.thighR ?? 1) === 0,
+      cannot_stand_on_leg: legsBroken,
+      arm_unusable: ['L', 'R'].filter(S => (c.cap['uArm' + S] ?? 1) <= 0.1),
+    },
+    earlier_wounds: c.wounds.filter(w => !hits.some(x => x.w === w)).map(w => `${w.zone}: ${w.name}`),
+    temperament_hint: TEMPERAMENTS[Math.floor(Math.random() * TEMPERAMENTS.length)],
+  };
+}
+
+function composePrompt(rep) {
+  return `You direct the body of a physics-driven mannequin (an adult, 80 kg) in an educational simulator that shows actors and students how a person realistically behaves after being shot. Compose ONE new, unique behaviour timeline for the incident below. It is performed by a ragdoll with muscle motors, so you choose actions from a fixed vocabulary.
+
+Realism, from wound ballistics and emergency medicine:
+- Bullets do not knock people over. Visible behaviour is reflex, pain, fear, loss of support and, later, blood loss.
+- People often do not realise at once that they are hit; they look at the wound, touch it, may keep moving for seconds or minutes.
+- Collapse from torso wounds comes from blood loss or a stopped heart, with the timing given; do not invent an earlier collapse.
+- Fear: looking at the shooter, turning away, covering, raising hands, running away (flee), seeking to get low.
+- Flight is the commonest reaction of an unhurt or lightly wounded person. A badly wounded person may still run for seconds and collapse on the way; that collapse comes from the physiology, not from you.
+- If the incident says runs_away: true, the person runs: put a flee beat within the first second; the rest of the story continues after the run ends. If runs_away is false, do not use flee.
+- Pain behaviour: clutching and pressing the wound, doubling over, rocking, curling up when on the ground, ragged breathing, trembling.
+- Respect the "impossible" list exactly: paralysed legs never move, a broken leg does not carry weight, an unusable arm is never used.
+- As blood loss grows the person slows down, sits or lies down, breathes faster, then fades. Use faint only when unconsciousness is due.
+- Vary rhythm: pauses (freeze), small repeated actions, attempts that fail. Follow the temperament hint.
+
+Vocabulary (action: parameters):
+- look {at: "wound"|"shooter"|"away"|"down"|"up"|"around"}
+- clutch {hand: "L"|"R"|"both", wound: index into hits, default 0}   press the wound with the hand(s)
+- reach {hand: "L"|"R", dir: "forward"|"up"|"ground"|"shooter"}
+- raise_hands {}   cover_head {}
+- double_over {}   straighten {}   rock {}   (torso)
+- stagger {dir: "back"|"forward"|"left"|"right"}   one unsteady step; standing only
+- flee {dir: "left"|"right"|"back"}   turn away from the shooter and run, angled to that side; dur = seconds of running (2-10); standing only, both legs must carry weight. While running only look, arm and breath beats play
+- kneel {knee: "L"|"R"}   sit {}   (going down from standing; both are held until something else replaces them)
+- lie_down {}   from standing, kneeling or sitting down to lying
+- curl {}   writhe {}   try_rise {}   (lying or sitting; from sitting they take the person down to the ground)
+- gasp {}   tremble {}   freeze {}   (breathing and stillness)
+- faint {}   only if unconsciousness is due
+Every beat also has: t (seconds from now; the reflex flinch has already happened), dur (seconds, 0.5-15), intensity (0.2-1), note (Russian, at most 90 characters: what the person does and why, for actors).
+Channels: look=head; clutch/reach/raise_hands/cover_head=arms; double_over/straighten/rock=torso; stagger/lie_down/flee=legs; kneel/sit/curl/writhe/try_rise/faint=whole body; gasp/tremble/freeze=breath. Beats on different channels may overlap; a new beat on a channel replaces the previous one there.
+
+Write 22-40 beats covering 45-90 seconds, consistent with the posture and what is impossible. Reply with only JSON:
+{"title": "<Russian, at most 60 characters>", "temperament": "<Russian, a few words>", "beats": [{"t": 0.2, "dur": 2, "action": "look", "at": "wound", "intensity": 0.8, "note": "..."}]}
+
+Incident:
+${JSON.stringify(rep, null, 1)}`;
+}
+
+const ENUMS = { at: ['wound', 'shooter', 'away', 'down', 'up', 'around'], hand: ['L', 'R', 'both'], dir: ['back', 'forward', 'left', 'right', 'up', 'ground', 'shooter'], knee: ['L', 'R'] };
+// whatever comes back is checked: known actions, bounded numbers, known parameter values
+function sanitizeBeats(raw, hits) {
+  const list = Array.isArray(raw?.beats) ? raw.beats : [];
+  const out = [];
+  for (const r of list.slice(0, 60)) {
+    if (!r || !ACTIONS[r.action]) continue;
+    const num = (v, lo, hi, d) => Number.isFinite(+v) ? Math.max(lo, Math.min(hi, +v)) : d;
+    const b = { action: r.action, t: num(r.t, 0, 180, 0), dur: num(r.dur, 0.5, 15, 2), intensity: num(r.intensity, 0.2, 1, 0.7), note: String(r.note || '').slice(0, 120) };
+    for (const k of ['at', 'hand', 'dir', 'knee']) if (ENUMS[k].includes(r[k])) b[k] = r[k];
+    const wi = Math.max(0, Math.min(hits.length - 1, Math.floor(num(r.wound, 0, 99, 0))));
+    if (hits[wi]) { b.zoneKind = ZONE_KIND(hits[wi].w.zone); b.sideSign = hits[wi].side; }
+    out.push(b);
+  }
+  return out.sort((a, b) => a.t - b.t);
+}
+
+// procedural composer: the same vocabulary, drawn from weighted choices
+function proceduralBeats(rep, hits) {
+  const R = Math.random, pick = a => a[Math.floor(R() * a.length)];
+  const lead = hits[0], kind = lead ? ZONE_KIND(lead.w.zone) : null, side = lead ? lead.side : 0;
+  const beats = [];
+  let t = 0.1 + R() * 0.4;
+  const add = (b, gap = 0.6 + R() * 1.6) => { beats.push({ intensity: 0.5 + R() * 0.5, dur: 1.5 + R() * 3, ...b, t, zoneKind: kind, sideSign: side }); t += gap; };
+  const down = rep.posture.startsWith('lying'), eta = rep.estimated_seconds_until_unconscious;
+  const legs = !rep.impossible.legs_paralysed;
+  if (!hits.length) { // a near miss: fear and getting low
+    add({ action: 'look', at: pick(['shooter', 'around', 'away']), note: 'Ищет, откуда стреляли' });
+    if (R() < 0.5) add({ action: 'cover_head', dur: 2 + R() * 2, note: 'Закрывает голову' });
+    if (!down && legs && R() < 0.6) add({ action: pick(['stagger', 'stagger', 'kneel']), dir: pick(['back', 'left', 'right']), dur: 1.2, note: 'Пятится от линии огня' });
+    if (R() < 0.4) add({ action: 'raise_hands', dur: 3 + R() * 4, note: 'Показывает пустые руки' });
+    add({ action: 'gasp', dur: 6 + R() * 6, note: 'Частое дыхание после испуга' }, 0.2);
+    add({ action: 'look', at: pick(['shooter', 'around']), dur: 3 + R() * 3, note: 'Следит за стрелком' });
+    if (R() < 0.5) add({ action: 'freeze', dur: 2 + R() * 3, note: 'Замер, боится пошевелиться' });
+    return beats;
+  }
+  if (R() < 0.6) add({ action: 'freeze', dur: 0.6 + R() * 1.2, note: 'Секунду не понимает, что произошло' }, 0.3);
+  add({ action: 'look', at: 'wound', dur: 1 + R() * 2, note: 'Смотрит на рану' });
+  add({ action: 'clutch', hand: pick(['both', 'L', 'R']), dur: 5 + R() * 10, note: 'Зажимает рану рукой' }, 0.4);
+  add({ action: 'gasp', dur: 8 + R() * 10, note: 'Дыхание сбивается от боли' }, 0.2);
+  if (!down && legs && !rep.impossible.cannot_stand_on_leg.length && R() < 0.6) add({ action: 'stagger', dir: pick(['back', 'back', 'left', 'right']), dur: 1.2, note: 'Неуверенный шаг назад' });
+  add({ action: 'look', at: pick(['shooter', 'shooter', 'away', 'around']), dur: 1.5 + R() * 2.5, note: 'Смотрит на стрелка' });
+  if (kind === 'chest' || kind === 'abdomen' || kind === 'pelvis') add({ action: pick(['double_over', 'double_over', 'rock']), dur: 3 + R() * 5, note: 'Сгибается от боли' });
+  if (R() < 0.5) add({ action: 'tremble', dur: 4 + R() * 6, note: 'Начинается дрожь' }, 0.3);
+  if (R() < 0.3) add({ action: 'raise_hands', dur: 2 + R() * 3, note: 'Поднимает руки, сдаётся' });
+  if (R() < 0.3) add({ action: 'reach', hand: pick(['L', 'R']), dir: pick(['forward', 'shooter']), dur: 2 + R() * 2, note: 'Тянется вперёд, ищет опору' });
+  add({ action: 'clutch', hand: pick(['both', 'L', 'R']), dur: 6 + R() * 8, note: 'Снова прижимает рану' });
+  // going down: sooner when bleeding fast or a leg is hurt
+  const soon = (eta !== null && eta < 60) || kind === 'leg' || rep.impossible.cannot_stand_on_leg.length;
+  if (!down && legs && (soon || R() < 0.5)) {
+    add({ action: pick(['kneel', 'sit', 'sit']), knee: side > 0 ? 'L' : 'R', dur: 4 + R() * 6, note: 'Ноги слабеют, опускается вниз' });
+    if (R() < 0.7) add({ action: 'lie_down', dur: 3, note: 'Ложится на землю' }, 2 + R() * 2);
+  }
+  add({ action: 'curl', dur: 5 + R() * 8, note: 'Сжимается, прикрывая живот' });
+  if (R() < 0.6) add({ action: 'writhe', dur: 3 + R() * 5, intensity: 0.4 + R() * 0.4, note: 'Корчится от боли' });
+  if (R() < 0.6) add({ action: 'try_rise', dur: 2 + R() * 2, note: 'Пытается подняться, не выходит' });
+  add({ action: 'look', at: pick(['shooter', 'up', 'around']), dur: 2 + R() * 3, note: 'Ищет помощь взглядом' });
+  add({ action: 'gasp', dur: 10 + R() * 10, intensity: 0.8, note: 'Дыхание частое и поверхностное' }, 0.2);
+  add({ action: 'reach', hand: pick(['L', 'R']), dir: 'ground', dur: 3 + R() * 3, note: 'Рука ищет опору на полу' });
+  add({ action: 'freeze', dur: 3 + R() * 4, note: 'Затихает, экономит силы' });
+  // late phase: weaker, slower, with long pauses, until a minute or more has passed
+  const end = 60 + R() * 40;
+  const late = [
+    () => ({ action: 'look', at: pick(['wound', 'shooter', 'up', 'around', 'down']), dur: 2 + R() * 4, intensity: 0.3 + R() * 0.4, note: pick(['Медленно поднимает взгляд', 'Снова смотрит на рану', 'Озирается, ищет помощь']) }),
+    () => ({ action: 'clutch', hand: pick(['both', 'L', 'R']), dur: 6 + R() * 10, intensity: 0.4 + R() * 0.4, note: 'Держит руку на ране' }),
+    () => ({ action: 'gasp', dur: 8 + R() * 10, intensity: 0.6 + R() * 0.4, note: 'Дышит часто и неглубоко' }),
+    () => ({ action: 'tremble', dur: 4 + R() * 8, intensity: 0.3 + R() * 0.5, note: 'Мелкая дрожь, руки холодеют' }),
+    () => ({ action: 'freeze', dur: 3 + R() * 6, note: 'Почти не двигается' }),
+    () => ({ action: pick(['curl', 'writhe', 'try_rise']), dur: 3 + R() * 6, intensity: 0.3 + R() * 0.4, note: pick(['Подтягивает колени', 'Ворочается от боли', 'Ещё одна попытка приподняться']) }),
+    () => ({ action: 'reach', hand: pick(['L', 'R']), dir: pick(['ground', 'forward', 'shooter']), dur: 2 + R() * 4, intensity: 0.3 + R() * 0.4, note: 'Тянется рукой, сил мало' }),
+  ];
+  while (t < end) add(pick(late)(), 1.5 + R() * 4);
+  if (eta !== null && eta < end + 30) add({ action: 'faint', dur: 1, note: 'Сознание уходит' });
+  return beats;
+}
+
+// ---------- scenario library ----------
+// The incident picks a scenario kind; one of the matching scenarios is drawn (recent ones are avoided)
+// and varied: hands and knees follow the wound side, the tempo follows the bleeding, intensities and
+// minor beats change, and a late phase is added so the behaviour runs for a minute or more.
+const recentScenarios = [];
+function incidentKind(hits) {
+  if (!hits.length) return 'near';
+  const ws = hits.map(x => x.w);
+  if (ws.some(w => w.arrest)) return 'heart';
+  if (ws.some(w => w.spine)) return 'spine';
+  if (hits.length >= 3) return 'multi';
+  const w = hits[0].w, t = w.part.n.replace(/[LR]$/, '');
+  if (t === 'head') return w.zone === 'шея' ? 'neck' : 'head-graze';
+  if (t === 'pelvis') return w.bone ? 'pelvis' : 'pelvis-soft';
+  if (t === 'thigh' || t === 'shin' || t === 'foot') return w.bone ? 'leg-bone' : 'leg';
+  if (t === 'uArm' || t === 'fArm') return 'arm';
+  return t; // chest | abdomen
+}
+function libraryScript(rep, hits) {
+  const c = character, R = Math.random, pick = a => a[Math.floor(R() * a.length)];
+  const kind = incidentKind(hits), low = c.state === 'down' || c.seated || c.fellRunning;
+  c.fellRunning = false;
+  let pool = SCENARIOS.filter(s => s.kinds.includes(kind));
+  if (low && hits.length && ['chest', 'abdomen'].includes(kind)) pool = pool.concat(SCENARIOS.filter(s => s.kinds.includes('down')));
+  const fits = pool.filter(s => s.posture === 'any' || s.posture === (low ? 'down' : 'standing'));
+  if (fits.length) pool = fits;
+  const fresh = pool.filter(s => !recentScenarios.includes(s.id));
+  const sc = pick(fresh.length ? fresh : pool);
+  if (!sc) return null;
+  recentScenarios.push(sc.id); if (recentScenarios.length > 6) recentScenarios.shift();
+  const lead = hits[0], side = lead ? (lead.side || (R() < 0.5 ? 1 : -1)) : (R() < 0.5 ? 1 : -1);
+  const near = side > 0 ? 'L' : 'R', far = near === 'L' ? 'R' : 'L';
+  const lr = v => v === 'near' ? near : v === 'far' ? far : v;
+  // tempo: a heart wound runs to its own clock; fast bleeding hurries the rest, slow bleeding stretches it
+  const eta = rep.estimated_seconds_until_unconscious;
+  let scale = 0.85 + R() * 0.35;
+  if (kind === 'heart' && eta !== null) { const faint = sc.beats.find(b => b[2] === 'faint'); scale = faint ? Math.max(0.6, eta / faint[0]) : 1; }
+  else if (eta !== null && eta < 60) scale *= 0.8;
+  else if (eta === null || eta > 200) scale *= 1.2;
+  const beats = [];
+  for (const [t, dur, action, arg, k, note] of sc.beats) {
+    if (!['faint', 'sit', 'lie_down', 'kneel', 'clutch'].includes(action) && R() < 0.1) continue; // a minor beat drops out
+    const b = { t: t * scale, dur: Math.max(0.5, dur * scale), action, intensity: Math.max(0.2, Math.min(1, k + (R() - 0.5) * 0.3)), note, zoneKind: lead ? ZONE_KIND(lead.w.zone) : null, sideSign: side };
+    if (action === 'look') b.at = arg === 'shooter' && R() < 0.15 ? 'around' : arg;
+    else if (action === 'clutch') b.hand = arg === 'both' ? 'both' : lr(arg);
+    else if (action === 'reach') { const [h, d] = arg.split(':'); b.hand = lr(h); b.dir = d; }
+    else if (action === 'stagger') b.dir = arg;
+    else if (action === 'kneel') b.knee = lr(arg);
+    beats.push(b);
+  }
+  // late phase until well past a minute, unless the heart has already set the end
+  if (kind !== 'heart') {
+    let t = Math.max(...beats.map(b => b.t + b.dur), 0) + 1;
+    const end = 70 + R() * 30;
+    const late = [
+      () => ({ action: 'look', at: pick(['wound', 'shooter', 'up', 'around', 'down']), dur: 2 + R() * 4, intensity: 0.3 + R() * 0.4, note: pick(['Медленно поднимает взгляд', 'Снова смотрит на рану', 'Озирается, ищет помощь']) }),
+      () => ({ action: 'clutch', hand: pick(['both', near]), dur: 6 + R() * 10, intensity: 0.4 + R() * 0.4, note: 'Держит руку на ране' }),
+      () => ({ action: 'gasp', dur: 8 + R() * 10, intensity: 0.4 + R() * 0.5, note: 'Дышит часто и неглубоко' }),
+      () => ({ action: 'tremble', dur: 4 + R() * 8, intensity: 0.3 + R() * 0.4, note: 'Мелкая дрожь' }),
+      () => ({ action: 'freeze', dur: 3 + R() * 6, intensity: 0.5, note: 'Почти не двигается' }),
+      () => ({ action: low || kind === 'spine' ? pick(['curl', 'try_rise']) : pick(['rock', 'double_over']), dur: 3 + R() * 5, intensity: 0.3 + R() * 0.4, note: 'Боль накатывает снова' }),
+    ];
+    while (t < end) { beats.push({ t, zoneKind: lead ? ZONE_KIND(lead.w.zone) : null, sideSign: side, ...pick(late)() }); t += 2 + R() * 4; }
+  }
+  return { beats: beats.sort((a, b) => a.t - b.t), title: sc.title, temperament: sc.temp, id: sc.id };
+}
+
+let sampleFn = null, sampleState = window.claude?.use ? 'pending' : 'none', aiWanted = false, aiOff = false;
+const AI_NOTE = 'По умолчанию сценарий берётся из встроенной библиотеки: 100 сценариев, бесплатно. С галочкой Claude пишет новый сценарий под каждый выстрел и тратит лимит вашего аккаунта.';
+if (sampleState === 'pending') window.claude.use('sample').then(fn => { sampleFn = fn; sampleState = fn ? 'ready' : 'none'; updateAiNote(); }, () => { sampleState = 'none'; updateAiNote(); });
+function updateAiNote() {
+  const box = document.getElementById('aiBox'), note = document.getElementById('aiNote');
+  const ready = sampleState === 'ready' && !aiOff;
+  box.disabled = !ready;
+  box.checked = ready && aiWanted;
+  note.textContent = ready ? AI_NOTE
+    : sampleState === 'pending' ? 'Подключение к Claude…'
+    : aiOff ? 'Claude недоступен в этом просмотре: сценарии берутся из библиотеки.'
+    : 'Сценарии берутся из встроенной библиотеки. Claude доступен, только когда страница открыта на claude.ai.';
+}
+// Reaction mode: stay, flee, or decide by the situation. Flight is the commonest reaction of an unhurt or lightly
+// wounded person; a torso wound sends fewer people running, and a broken leg or pelvis stops it outright.
+let reactMode = 'auto';
+const FLEE_CHANCE = { near: 0.6, arm: 0.55, 'head-graze': 0.4, heart: 0.35, chest: 0.35, abdomen: 0.3, leg: 0.3, 'pelvis-soft': 0.25, neck: 0.15, multi: 0.15 };
+function wantsFlee(hits) {
+  if (character.run && character.run.mode === 'go') return true; // already running: the new script carries on with it
+  if (reactMode === 'stay' || character.run || !canRun()) return false;
+  return reactMode === 'flee' || Math.random() < (FLEE_CHANCE[incidentKind(hits)] ?? 0);
+}
+// the flight comes first; the chosen scenario plays on from wherever the run ends
+function fleeScript(lib, hits) {
+  const R = Math.random, pick = a => a[Math.floor(R() * a.length)];
+  const lead = hits[0], side = lead ? (lead.side || 1) : (R() < 0.5 ? 1 : -1);
+  const zk = lead ? ZONE_KIND(lead.w.zone) : null;
+  const meta = { zoneKind: zk, sideSign: side };
+  const onTheRun = character.run && character.run.mode === 'go';
+  const go = onTheRun ? 0 : 0.25 + R() * 0.35, run = onTheRun ? 2 + R() * 3 : 3.5 + R() * 4;
+  const beats = onTheRun ? [
+    { ...meta, t: 0, dur: run, action: 'flee', intensity: 0.8, note: lead
+      ? 'Попадание на бегу: тело дёргается, шаг сбивается, но он бежит дальше, зажимая рану'
+      : 'Пуля проходит рядом: пригибается на бегу и ускоряется' },
+  ] : [
+    { ...meta, t: 0, dur: 0.6, action: 'look', at: 'shooter', intensity: 0.9, note: 'Засекает, откуда стреляют' },
+    { ...meta, t: go, dur: run, action: 'flee', dir: pick(['left', 'right', 'back']), intensity: 0.6 + R() * 0.4,
+      note: lead ? 'Бежит прочь, несмотря на рану, на бегу оглядывается: адреналин глушит боль' : 'Бросается прочь от стрелка, на бегу оглядывается' },
+  ];
+  const after = go + run + 1.4;
+  for (const b of lib?.beats || []) if (b.action !== 'stagger' && b.action !== 'flee') beats.push({ ...b, t: b.t + after });
+  return beats.sort((a, b) => a.t - b.t);
+}
+function composeAfterShot(hits, nearMiss) {
+  const rep = incidentReport(hits, nearMiss);
+  if (!rep.conscious) { stopScript(); renderScript(null, 'Без сознания: поведения нет.'); return; }
+  const flee = wantsFlee(hits);
+  rep.runs_away = flee;
+  if (character.run) character.run.owner = null; // the old script lets go of the run without stopping it
+  const lib = libraryScript(rep, hits);
+  if (flee) startScript(fleeScript(lib, hits), { source: lib ? 'lib' : 'proc', title: 'Убегает' + (lib ? ' · ' + lib.title : ''), temperament: lib?.temperament || 'испуганный', id: lib ? lib.id : '' });
+  else if (lib) startScript(lib.beats, { source: 'lib', title: lib.title, temperament: lib.temperament, id: lib.id });
+  else startScript(proceduralBeats(rep, hits), { source: 'proc', title: hits.length ? 'Процедурный сценарий' : 'Испуг', temperament: '' });
+  if (!sampleFn || !aiWanted || aiOff) return;
+  const ctl = new AbortController();
+  script.ctl = ctl; script.pending = true;
+  renderScript(script);
+  sampleFn.json(composePrompt(rep), { modelTier: 'quick', cache: false, signal: ctl.signal }).then(data => {
+    if (ctl.signal.aborted || !character.conscious) return;
+    const beats = sanitizeBeats(data, hits);
+    if (beats.length < 3) throw { code: 'invalid_json' };
+    startScript(beats, { source: 'ai', title: String(data.title || 'Сценарий Claude').slice(0, 80), temperament: String(data.temperament || '').slice(0, 60) });
+    log('info', 'Сценарий', `Claude: «${script.title}», ${beats.length} действий на ${Math.round(Math.max(...beats.map(b => b.t + b.dur)))} с.`);
+  }).catch(e => {
+    if (e?.code === 'cancelled') return;
+    if (['not_granted', 'sampling_disabled', 'not_declared', 'capability_disabled', 'capability_removed'].includes(e?.code)) { aiOff = true; updateAiNote(); }
+    if (script && script.ctl === ctl) { script.pending = false; renderScript(script); }
+    log('info', 'Сценарий', e?.code === 'rate_limited' ? 'Claude просит паузу: этот выстрел идёт по сценарию из библиотеки.' : 'Claude не ответил: работает сценарий из библиотеки.');
+  });
+}
+
+function renderScript(sc, message, badge) {
+  const list = document.getElementById('scrList'), b = document.getElementById('scrBadge'), title = document.getElementById('scrTitle');
+  const cap = document.getElementById('caption');
+  if (!sc) {
+    list.replaceChildren(); cap.hidden = true;
+    b.dataset.src = 'none'; b.textContent = 'нет';
+    title.textContent = message || 'Выстрелите: после каждого выстрела поведение сочиняется заново.';
+    return;
+  }
+  const src = badge || (sc.pending ? 'wait' : sc.source);
+  b.dataset.src = src === 'wait' ? 'wait' : src;
+  b.textContent = src === 'ai' ? 'Claude' : src === 'wait' ? 'Claude думает…' : src === 'lib' ? 'библиотека · ' + sc.id : 'процедурный';
+  title.textContent = sc.title + (sc.temperament ? ` · ${sc.temperament}` : '');
+  list.replaceChildren(...sc.beats.map(x => {
+    const li = document.createElement('li');
+    li.className = x.state === 'wait' ? '' : x.state;
+    const tm = document.createElement('time'); tm.textContent = x.t.toFixed(1) + ' с';
+    const d = document.createElement('div');
+    const k = document.createElement('b'); k.textContent = ACTION_RU[x.action];
+    d.append(k, document.createTextNode(x.note || ''));
+    li.append(tm, d);
+    return li;
+  }));
+  const running = sc.beats.filter(x => x.state === 'run' && x.note);
+  cap.hidden = !running.length;
+  if (running.length) document.getElementById('captionText').textContent = running.at(-1).note;
+  // scroll only the list itself: scrollIntoView would also scroll the app around the embedded page
+  const cur = list.querySelector('.run');
+  if (cur && (cur.offsetTop < list.scrollTop || cur.offsetTop + cur.offsetHeight > list.scrollTop + list.clientHeight))
+    list.scrollTop = cur.offsetTop - 8;
+}
+
+function collapse(fast) {
+  clearBoosts(ALL());
+  character.conscious = false;
+  character.seated = false; character.noLift = true;
+  character.balanceTarget = 0; character.balanceRate = fast ? 40 : 2.2;
+  for (const l of layers) if (l.hold === Infinity) l.hold = 0;
+  if (fast) tone(ALL(), 0, 40);
+  else {
+    tone([...LEG('L'), ...LEG('R')], 0.03, 4);
+    tone(['abdomen', 'chest', 'head'], 0.05, 2.2);
+    tone([...ARM('L'), ...ARM('R')], 0.03, 3);
+  }
+}
+
+function react(zone, side, hitDir, w) {
+  const c = character;
+  const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(toQ(byName.chest.body.rotation(), new THREE.Quaternion()));
+  const fromFront = hitDir.dot(fwd) < 0;
+  if (!c.conscious) return { text: 'Тело уже без мышечного контроля: только пассивное движение от импульса.' };
+  if (c.state === 'ok') setState('wounded');
+  if (zone === 'head') {
+    if (w.brain || w.cervical) {
+      collapse(true);
+      return { text: w.brain
+        ? 'Поражён мозг: мгновенная потеря мышечного контроля. Тело оседает под собственным весом; куда оно упадёт, решает поза, а не пуля.'
+        : 'Перебит спинной мозг в шее: мгновенный паралич всего тела, тело оседает.' };
+    }
+    flinch(jitter(0.8, 0.2), side, fromFront); startle(0.8, side);
+    if (w.organs.length) return { text: 'Ранение шеи без повреждения спинного мозга: человек в сознании, главная угроза — кровотечение.' };
+    return { text: 'Касательное ранение: пуля прошла по черепу, не задев мозг. Человек оглушён, но в сознании.' };
+  }
+  if ((zone === 'chest' || zone === 'abdomen') && w.spine) {
+    capTone([...LEG('L'), ...LEG('R')], 0);
+    tone([...LEG('L'), ...LEG('R')], 0, 40);
+    c.balanceTarget = 0; c.balanceRate = 40;
+    flinch(jitter(0.6, 0.25), side, fromFront);
+    return { text: 'Задет позвоночник: ноги парализованы мгновенно, тело падает. Сознание сохраняется, руки работают.' };
+  }
+  if (zone === 'chest' || zone === 'abdomen') {
+    c.torsoHits++;
+    flinch(jitter(0.9, 0.2), side, fromFront);
+    // hands go to the wound: shoulder flexion, inward rotation and adduction bring the forearms across the belly
+    const arm = (S, k) => { const s = S === 'L' ? 1 : -1; return [-0.65 * k, -0.85 * s * k, -0.3 * s * k]; };
+    const near = side >= 0 ? 'L' : 'R', far = near === 'L' ? 'R' : 'L';
+    at(jitter(0.25, 0.4), () => c.conscious && addVaried({
+      ['uArm' + near]: arm(near, 1), ['fArm' + near]: [-2.0, 0, 0],
+      ['uArm' + far]: arm(far, 0.75), ['fArm' + far]: [-1.8, 0, 0],
+      chest: [0.2, 0, 0], head: [0.25, 0, 0],
+    }, { peak: 1, attack: 0.35, hold: Infinity, release: 0.6, tag: 'clutch' }, 0.2));
+    return { text: w.arrest
+      ? 'Рефлекторное сгибание, рука тянется к ране. Несколько секунд человек ещё стоит и двигается: мозгу хватает кислорода.'
+      : 'Рефлекторное сгибание, рука тянется к ране. Устоит ли человек, решает кровопотеря, а не удар.' };
+  }
+  if (zone === 'pelvis' && !w.bone) {
+    flinch(jitter(0.6, 0.25), side, fromFront);
+    return { text: 'Кости таза целы: человек может стоять, хотя ходить больно.' };
+  }
+  if (zone === 'pelvis') {
+    brakeRun();
+    flinch(jitter(0.6, 0.25), side, fromFront);
+    tone([...LEG('L'), ...LEG('R')], 0.1, 8);
+    c.balanceTarget = Math.min(c.balanceTarget, 0.12); c.balanceRate = 4; c.noLift = true;
+    addLayer({ thighL: [-0.7, 0, 0], thighR: [-0.7, 0, 0], shinL: [1.3, 0, 0], shinR: [1.3, 0, 0] }, { attack: 0.3, hold: Infinity, tag: 'sag' });
+    at(1.5, () => { if (c.state !== 'down') { c.balanceTarget = 0; } });
+    return { text: 'Перелом таза: это опора для обеих ног. Ноги не держат вес, тело падает сразу, без отброса.' };
+  }
+  if (zone.startsWith('thigh') || zone.startsWith('shin') || zone.startsWith('foot')) {
+    const running = c.run && c.run.mode === 'go';
+    brakeRun();
+    const S = zone.slice(-1), H = S === 'L' ? 'R' : 'L';
+    flinch(jitter(0.4, 0.3), side, fromFront);
+    tone(LEG(S), 0.12, 10);
+    c.balanceTarget = Math.min(c.balanceTarget, 0.6); c.balanceRate = 3;
+    if (c.kneel) return { text: 'Ещё одно попадание в ногу: тело остаётся на колене.' };
+    if (w.bone && running) { // at a run there is no lowering onto a knee: the leg folds and momentum throws the body forward
+      capTone(LEG(S), 0.05);
+      tone(LEG(S), 0.05, 10);
+      c.balanceTarget = 0; c.balanceRate = 2.5; c.noLift = true;
+      return { text: 'Перелом на бегу: нога подламывается, и тело по инерции летит вперёд на землю.' };
+    }
+    if (w.bone) {
+      c.kneel = S;
+      capTone(LEG(S), 0.05);
+      tone(LEG(S), 0.05, 10);
+      at(0.8, () => { if (c.state === 'wounded') setState('kneel'); });
+      addLayer({
+        ['thigh' + S]: [0.05, 0, 0], ['shin' + S]: [1.45, 0, 0],
+        ['thigh' + H]: [-1.35, 0, 0], ['shin' + H]: [1.45, 0, 0], chest: [0.15, 0, 0],
+      }, { attack: 0.7, hold: Infinity, tag: 'kneel' });
+      return { text: 'Перелом: нога не держит вес. Тело опускается на колено раненой ноги и удерживает корпус.' };
+    }
+    const buckle = addLayer({ ['thigh' + S]: [-0.35, 0, 0], ['shin' + S]: [1.3, 0, 0] }, { attack: 0.25, hold: Infinity, tag: 'buckle' });
+    at(1.8, () => { if (c.conscious && c.state !== 'down' && !c.seated) { tone(LEG(S), 0.45, 2); buckle.hold = buckle.age - buckle.attack; buckle.release = 0.8; } });
+    return { text: 'Кость цела: нога подкашивается, вес уходит на другую, потом раненая нога снова опирается, но слабо.' };
+  }
+  if (zone.startsWith('uArm') || zone.startsWith('fArm')) {
+    const S = zone.slice(-1);
+    if (w.bone) capTone(ARM(S), 0.03);
+    tone(ARM(S), w.bone ? 0.03 : 0.35, 12);
+    flinch(jitter(0.35, 0.3), side, fromFront);
+    addLayer({ chest: [0.1, S === 'L' ? 0.3 : -0.3, 0], head: [0, S === 'L' ? 0.5 : -0.5, 0] }, { attack: 0.1, hold: 0.4, release: 1 });
+    return { text: w.bone ? 'Перелом: рука повисает, корпус вздрагивает и поворачивается к ране.' : 'Кость цела: рука работает, но слабо. Корпус вздрагивает и поворачивается к ране.' };
+  }
+  return { text: '' };
+}
+
+// ---------- shooting ----------
+let weapon = WEAPONS[0], impulseMult = 1;
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+const effects = [];
+// Hit testing against the skinned model. three.js would pose every triangle's corners again for each ray (and once
+// more for the bounding sphere); instead the skin is posed on the CPU once per shot into a plain copy, and every
+// pellet, and the search for the exit hole, tests that copy.
+const skinProxies = modelMeshes.map(m => {
+  const g = new THREE.BufferGeometry();
+  g.setIndex(m.geometry.index);
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(m.geometry.attributes.position.count * 3), 3));
+  const proxy = new THREE.Mesh(g, m.material);
+  proxy.matrixAutoUpdate = false; proxy.userData.src = m;
+  return proxy;
+});
+const skinV = new THREE.Vector3();
+function poseSkinProxies() {
+  for (const proxy of skinProxies) {
+    const m = proxy.userData.src, arr = proxy.geometry.attributes.position.array, n = arr.length / 3;
+    for (let i = 0; i < n; i++) { m.getVertexPosition(i, skinV); arr[i * 3] = skinV.x; arr[i * 3 + 1] = skinV.y; arr[i * 3 + 2] = skinV.z; }
+    proxy.geometry.computeBoundingSphere();
+    proxy.matrixWorld.copy(m.matrixWorld);
+  }
+}
+// intersections with the model (and anything else given), reported against the real skinned meshes
+function hitModel(rc, extra = []) {
+  const hits = rc.intersectObjects([...skinProxies, ...extra], false);
+  for (const h of hits) if (h.object.userData.src) h.object = h.object.userData.src;
+  return hits;
+}
+
+// pellet direction: uniform over a cone around the aim
+function spreadDir(base, half) {
+  const u = new THREE.Vector3().crossVectors(base, Math.abs(base.y) < 0.9 ? UP_Y : new THREE.Vector3(1, 0, 0)).normalize();
+  const v = new THREE.Vector3().crossVectors(base, u);
+  const a = Math.random() * Math.PI * 2, r = half * Math.sqrt(Math.random());
+  return base.clone().addScaledVector(u, Math.cos(a) * r).addScaledVector(v, Math.sin(a) * r).normalize();
+}
+// how bad a wound is, to pick the reaction that leads when several land at once
+function severity(w) {
+  const t = w.part.n.replace(/[LR]$/, '');
+  if (w.brain || w.cervical) return 100;
+  if (w.spine) return 90;
+  if (w.arrest) return 80;
+  if (t === 'pelvis' && w.bone) return 70;
+  if ((t === 'thigh' || t === 'shin') && w.bone) return 60;
+  if (t === 'chest' || t === 'abdomen') return 50 + Math.min(9, w.rate / 5);
+  if (t === 'head') return 45;
+  return 10 + Math.min(9, w.rate);
+}
+function shoot(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  const ray = raycaster.ray.clone();
+  poseSkinProxies();
+  const muzzle = camera.position.clone().add(new THREE.Vector3(0.12, -0.12, 0).applyQuaternion(camera.quaternion));
+  const n = weapon.pellets || 1;
+  const p = weapon.m * weapon.v * impulseMult; // per projectile
+  const wounds = [];
+  let hit = null, partHit = null, delivered = 0;
+  for (let i = 0; i < n; i++) {
+    const d = n > 1 ? spreadDir(ray.direction, weapon.spread) : ray.direction.clone();
+    raycaster.set(ray.origin, d);
+    const h = hitModel(raycaster, [floor])[0];
+    if (i === 0) hit = h;
+    const end = h ? h.point.clone() : ray.origin.clone().addScaledVector(d, 60);
+    const dir = end.clone().sub(muzzle).normalize();
+    tracer(muzzle, end, n > 1 ? 0.45 : 0.9);
+    if (!h) continue;
+    if (h.object === floor) { if (n > 1) dust(h.point, 3); continue; }
+    const part = partAt(h.point);
+    part.body.applyImpulseAtPoint({ x: dir.x * p, y: dir.y * p, z: dir.z * p }, h.point, true);
+    delivered += p;
+    const w = addWound(part, h, dir);
+    // which side of the body was hit, in the mannequin's own frame (+1 = its left)
+    const local = h.point.clone().sub(vecOf(byName.chest.body.translation()))
+      .applyQuaternion(toQ(byName.chest.body.rotation(), new THREE.Quaternion()).invert());
+    wounds.push({ w, dir, side: Math.abs(local.x) < 0.04 ? 0 : Math.sign(local.x), part });
+  }
+  raycaster.set(ray.origin, ray.direction);
+  if (wounds.length) {
+    // the worst wound leads the reaction; the others still apply their own effects
+    wounds.sort((a, b) => severity(b.w) - severity(a.w));
+    const lead = wounds[0];
+    let text = '';
+    for (const x of wounds) { const res = react(x.part.n, x.side, x.dir, x.w); if (x === lead) text = res.text; }
+    const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(toQ(byName.chest.body.rotation(), new THREE.Quaternion()));
+    for (const x of wounds) x.fromFront = x.dir.dot(fwd) < 0;
+    const totalRate = wounds.reduce((a, x) => a + x.w.rate, 0);
+    const zones = [...new Set(wounds.map(x => x.w.zone))].join(', ');
+    readout(n > 1 ? `${wounds.length} из ${n}: ${zones}` : lead.w.zone, delivered, p / lead.part.body.mass(), delivered / totalMass);
+    if (n > 1) log('hit', `Картечь ${wounds.length}/${n}`, text,
+      `Попали в: ${wounds.map(x => `${x.w.zone} (${x.w.name})`).join('; ')}. Кровотечение ~${fmtRate(totalRate)}. Δv тела ${(delivered / totalMass * 100).toFixed(1)} см/с`);
+    else log('hit', lead.w.zone, text, `Канал${lead.w.perforating ? ' сквозной' : ', пуля осталась в теле'}: ${lead.w.name}. Кровотечение ~${fmtRate(lead.w.rate)}. Δv тела ${(delivered / totalMass * 100).toFixed(1)} см/с`);
+    if (wounds.some(x => x.w.arrest) && character.conscious) log('info', 'Кровообращение', `Сердце или аорта: давление падает сразу, сознание уйдёт примерно через ${(character.arrestAt - character.physT).toFixed(0)} с.`);
+    runHit(wounds);
+    if (delivered / totalMass > 0.4 && character.balanceTarget > 0) { // only a movie-sized push can knock the body off balance
+      character.balanceTarget = 0; character.balanceRate = 30;
+      tone([...LEG('L'), ...LEG('R')], 0.3, 10);
+      log('info', 'Сбит с ног', 'Такой толчок выбивает из равновесия. Настоящая пуля этого не делает.');
+    }
+    composeAfterShot(wounds);
+    emit('shot', { weapon: weapon.id, hit: true, kind: incidentKind(wounds), zones: [...new Set(wounds.map(x => x.w.zone))],
+      organs: [...new Set(wounds.flatMap(x => x.w.organs.map(o => o.name)))], nearMissCm: null });
+    return;
+  }
+  const pAll = p * n;
+
+  // near miss: closest approach of the bullet path to head / chest / pelvis
+  const travel = hit ? hit.distance : 60;
+  let best = Infinity, bestPt = null;
+  for (const n of ['head', 'chest', 'pelvis']) {
+    const c = vecOf(byName[n].body.translation());
+    const t = c.clone().sub(ray.origin).dot(ray.direction);
+    if (t < 0 || t > travel + 0.3) continue;
+    const d = ray.at(t, new THREE.Vector3()).distanceTo(c);
+    if (d < best) { best = d; bestPt = c; }
+  }
+  if (hit && hit.object === floor) dust(hit.point);
+  const pelvisPos = vecOf(byName.pelvis.body.translation());
+  const floorDist = hit && hit.object === floor ? Math.hypot(hit.point.x - pelvisPos.x, hit.point.z - pelvisPos.z) : Infinity;
+  readout('промах', pAll, 0, 0);
+  const side = sideOfShot(ray);
+  if (best < 0.9) runHit([]);
+  if (best < 0.9 || floorDist < 1.5) composeAfterShot([], best < 0.9 ? Math.round(best * 100) : Math.round(floorDist * 100));
+  if (best < 0.9) {
+    startle(1 - best / 0.9, side);
+    log('near', `Пролёт ${Math.round(best * 100)} см`, character.conscious ? 'Рефлекс испуга: голова втягивается и отворачивается, руки к лицу, колени сгибаются.' : 'Реакции нет: тело без сознания.');
+  } else if (floorDist < 1.5) {
+    startle(0.5 * (1 - floorDist / 1.5), side);
+    log('near', `Пол в ${floorDist.toFixed(1)} м`, character.conscious ? 'Удар в пол рядом: короткое вздрагивание.' : 'Реакции нет.');
+  } else log('info', 'Промах', 'Слишком далеко, реакции нет.');
+  emit('shot', { weapon: weapon.id, hit: false, kind: 'near', zones: [], organs: [], nearMissCm: best < 0.9 ? Math.round(best * 100) : null });
+}
+function sideOfShot(ray) {
+  // Which side of the mannequin did the bullet pass on (+1 = its left)?
+  const chest = byName.chest.body;
+  const c = vecOf(chest.translation());
+  const t = c.clone().sub(ray.origin).dot(ray.direction);
+  const local = ray.at(t, new THREE.Vector3()).sub(c).applyQuaternion(toQ(chest.rotation(), new THREE.Quaternion()).invert());
+  return local.x >= 0 ? 1 : -1;
+}
+const vecOf = v => new THREE.Vector3(v.x, v.y, v.z);
+
+function tracer(a, b, alpha = 0.9) {
+  const g = new THREE.BufferGeometry().setFromPoints([a, b]);
+  const mat = tracerMat.clone(); mat.opacity = alpha;
+  const line = new THREE.Line(g, mat);
+  scene.add(line);
+  effects.push({ obj: line, life: 0.35, age: 0, update(e, k) { e.obj.material.opacity = alpha * (1 - k); }, done() { g.dispose(); mat.dispose(); } });
+}
+function dust(pt, count = 10) {
+  const geo = new THREE.IcosahedronGeometry(0.02, 0);
+  const mat = new THREE.MeshBasicMaterial({ color: cssVar('--scene-grid'), transparent: true });
+  let left = count;
+  const done = () => { if (--left === 0) { geo.dispose(); mat.dispose(); } };
+  for (let i = 0; i < count; i++) {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.copy(pt);
+    const v = new THREE.Vector3((Math.random() - 0.5) * 1.2, 0.6 + Math.random() * 1.2, (Math.random() - 0.5) * 1.2);
+    scene.add(m);
+    effects.push({ obj: m, life: 0.6, age: 0, update(e, k, dt) { v.y -= 6 * dt; e.obj.position.addScaledVector(v, dt); mat.opacity = 1 - k; }, done });
+  }
+}
+
+// ---------- blood loss ----------
+// ---------- anatomy ----------
+// Organs in each segment's own frame (rest pose: the mannequin faces +Z, its left is +X).
+// An organ is an ellipsoid (c, r) or a capsule (a, b, r). rate: bleeding in ml/s (order of magnitude),
+// ext: share of that blood that leaves the body, clot: time constant (s) over which it slows by itself.
+const ORGAN_COLOR = { heart: '#a3122a', lung: '#e3a0a8', liver: '#7a3b1e', spleen: '#6b2d5c', kidney: '#a14c3c', artery: '#d32030', vein: '#3b4fa3', bone: '#e6dcc2', nerve: '#f0cf62', brain: '#e8b7ae', bowel: '#d9a37b', bladder: '#d8bf5c' };
+const TISSUE = { head: ['кожа и кость черепа', [1, 3]], chest: ['грудная стенка', [0.5, 1.5]], abdomen: ['брюшная стенка', [0.5, 2]], pelvis: ['мягкие ткани таза', [0.5, 2]], thigh: ['мышцы бедра', [0.8, 2.5]], shin: ['мягкие ткани голени', [0.4, 1.2]], foot: ['мягкие ткани стопы', [0.3, 0.8]], uArm: ['мышцы плеча', [0.5, 1.5]], fArm: ['мягкие ткани предплечья', [0.3, 1]] };
+function organsFor(p) {
+  const S = p.S || [1, 1, 1];
+  return organLayout(p).map(o => {
+    if (o.c) { o.c.multiply(new THREE.Vector3(...S)); o.r = o.r.map((r, i) => r * S[i]); }
+    else { o.a.multiply(new THREE.Vector3(...S)); o.b.multiply(new THREE.Vector3(...S)); o.r *= Math.min(S[0], S[2]); }
+    return o;
+  });
+}
+function organLayout(p) {
+  const s = p.n.endsWith('L') ? 1 : -1; // +1 on the mannequin's left
+  const v = a => new THREE.Vector3(...a);
+  const E = (name, type, c, r, x) => ({ name, type, c: v(c), r, ...x });
+  const C = (name, type, a, b, r, x) => ({ name, type, a: v(a), b: v(b), r, ...x });
+  const side = (L, R) => s > 0 ? L : R;
+  switch (p.n.replace(/[LR]$/, '')) {
+    case 'head': return [
+      E('головной мозг', 'brain', [0, 0.012, -0.005], [0.08, 0.075, 0.088], { cns: 'brain', rate: [2, 5], ext: 0.6 }),
+      C('спинной мозг, шея', 'nerve', [0, -0.07, -0.035], [0, -0.19, -0.035], 0.012, { cns: 'cervical', rate: [0.5, 1], ext: 0.5 }),
+      C('левая сонная артерия', 'artery', [0.025, -0.07, 0.015], [0.025, -0.19, 0.015], 0.008, { rate: [30, 50], ext: 0.9 }),
+      C('правая сонная артерия', 'artery', [-0.025, -0.07, 0.015], [-0.025, -0.19, 0.015], 0.008, { rate: [30, 50], ext: 0.9 }),
+      C('левая яремная вена', 'vein', [0.04, -0.07, 0], [0.04, -0.19, 0], 0.008, { rate: [8, 15], ext: 0.9 }),
+      C('правая яремная вена', 'vein', [-0.04, -0.07, 0], [-0.04, -0.19, 0], 0.008, { rate: [8, 15], ext: 0.9 }),
+    ];
+    case 'chest': return [
+      E('сердце', 'heart', [0.03, -0.03, 0.035], [0.05, 0.06, 0.045], { arrest: true, rate: [80, 140], ext: 0.3 }),
+      C('грудная аорта', 'artery', [0.0, 0.07, 0.0], [-0.005, -0.13, -0.07], 0.016, { arrest: true, rate: [80, 140], ext: 0.2 }),
+      E('левое лёгкое', 'lung', [0.1, 0.01, -0.005], [0.07, 0.1, 0.09], { rate: [4, 12], ext: 0.2 }),
+      E('правое лёгкое', 'lung', [-0.095, 0.01, -0.005], [0.075, 0.1, 0.09], { rate: [4, 12], ext: 0.2 }),
+      C('грудной отдел позвоночника', 'bone', [0, 0.13, -0.1], [0, -0.13, -0.1], 0.022, { cns: 'spine', rate: [0.5, 1.5], ext: 0.3 }),
+    ];
+    case 'abdomen': return [
+      E('печень', 'liver', [-0.05, 0.07, 0.02], [0.08, 0.05, 0.07], { rate: [15, 35], ext: 0.15 }),
+      E('селезёнка', 'spleen', [0.07, 0.07, -0.03], [0.035, 0.04, 0.035], { rate: [10, 25], ext: 0.1 }),
+      E('левая почка', 'kidney', [0.055, 0, -0.07], [0.025, 0.04, 0.025], { rate: [5, 15], ext: 0.1 }),
+      E('правая почка', 'kidney', [-0.055, -0.01, -0.07], [0.025, 0.04, 0.025], { rate: [5, 15], ext: 0.1 }),
+      C('брюшная аорта', 'artery', [0.012, 0.16, -0.055], [0.012, -0.14, -0.055], 0.013, { rate: [40, 80], ext: 0.1 }),
+      C('нижняя полая вена', 'vein', [-0.016, 0.16, -0.05], [-0.016, -0.14, -0.05], 0.013, { rate: [20, 40], ext: 0.1 }),
+      C('поясничный отдел позвоночника', 'bone', [0, 0.16, -0.095], [0, -0.16, -0.095], 0.024, { cns: 'spine', rate: [0.5, 1.5], ext: 0.3 }),
+      E('кишечник', 'bowel', [0, -0.03, 0.04], [0.1, 0.08, 0.07], { rate: [1, 4], ext: 0.2, clot: 300 }),
+    ];
+    case 'pelvis': return [
+      E('левая подвздошная кость', 'bone', [0.12, 0.04, -0.02], [0.04, 0.07, 0.08], { bone: true, rate: [1, 3], ext: 0.5, clot: 300 }),
+      E('правая подвздошная кость', 'bone', [-0.12, 0.04, -0.02], [0.04, 0.07, 0.08], { bone: true, rate: [1, 3], ext: 0.5, clot: 300 }),
+      E('крестец', 'bone', [0, 0, -0.09], [0.05, 0.07, 0.03], { bone: true, rate: [1, 3], ext: 0.4, clot: 300 }),
+      C('левая подвздошная артерия', 'artery', [0.01, 0.09, -0.05], [0.09, -0.08, 0.04], 0.011, { rate: [15, 30], ext: 0.3 }),
+      C('правая подвздошная артерия', 'artery', [-0.01, 0.09, -0.05], [-0.09, -0.08, 0.04], 0.011, { rate: [15, 30], ext: 0.3 }),
+      E('мочевой пузырь', 'bladder', [0, -0.05, 0.06], [0.035, 0.035, 0.035], { rate: [1, 3], ext: 0.2, clot: 300 }),
+    ];
+    case 'thigh': return [
+      C('бедренная кость', 'bone', [0, 0.18, 0], [0, -0.19, 0], 0.017, { bone: true, rate: [1, 3], ext: 0.9, clot: 300 }),
+      C('бедренная артерия', 'artery', [-0.025 * s, 0.17, 0.035], [-0.035 * s, -0.12, -0.01], 0.011, { rate: [15, 25], ext: 0.95 }),
+      C('подколенная артерия', 'artery', [-0.035 * s, -0.12, -0.01], [0, -0.19, -0.03], 0.009, { rate: [8, 15], ext: 0.95 }),
+    ];
+    case 'shin': return [
+      C('большеберцовая кость', 'bone', [0, 0.19, 0.015], [0, -0.19, 0.015], 0.014, { bone: true, rate: [0.5, 1.5], ext: 0.9, clot: 200 }),
+      C('большеберцовая артерия', 'artery', [0, 0.18, -0.02], [0, -0.15, -0.02], 0.007, { rate: [3, 6], ext: 0.95 }),
+    ];
+    case 'foot': return [
+      E('кости стопы', 'bone', [0, 0, 0], [0.04, 0.025, 0.1], { bone: true, rate: [0.3, 0.8], ext: 0.9, clot: 120 }),
+    ];
+    case 'uArm': return [
+      C('плечевая кость', 'bone', [0, 0.15, 0], [0, -0.15, 0], 0.012, { bone: true, rate: [0.5, 1.5], ext: 0.9, clot: 200 }),
+      C('плечевая артерия', 'artery', [-0.025 * s, 0.14, 0.012], [-0.02 * s, -0.16, 0.02], 0.007, { rate: [6, 12], ext: 0.95 }),
+    ];
+    case 'fArm': return [
+      C('кости предплечья', 'bone', [0, 0.21, 0], [0, -0.02, 0], 0.012, { bone: true, rate: [0.3, 1], ext: 0.9, clot: 200 }),
+      C(side('артерии левого предплечья', 'артерии правого предплечья'), 'artery', [0, 0.2, 0.02], [0, -0.02, 0.025], 0.006, { rate: [3, 6], ext: 0.95 }),
+      E('кости кисти', 'bone', [0, -0.12, 0.01], [0.018, 0.06, 0.04], { bone: true, rate: [0.3, 0.8], ext: 0.9, clot: 120 }),
+    ];
+  }
+  return [];
+}
+function organMesh(o) {
+  const mat = new THREE.MeshStandardMaterial({ color: ORGAN_COLOR[o.type], roughness: 0.55, flatShading: true });
+  let m;
+  if (o.c) { m = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 1), mat); m.scale.set(...o.r); m.position.copy(o.c); }
+  else {
+    const len = o.a.distanceTo(o.b);
+    m = new THREE.Mesh(new THREE.CapsuleGeometry(o.r, len, 2, 6), mat);
+    m.position.copy(o.a).add(o.b).multiplyScalar(0.5);
+    m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), o.b.clone().sub(o.a).normalize());
+  }
+  m.layers.set(1); // x-ray layer: rendered only in x-ray mode and never hit by aiming rays
+  return m;
+}
+
+// geometry helpers for the wound track
+function segPointDist(a, b, p) {
+  const ab = b.clone().sub(a), t = Math.max(0, Math.min(1, p.clone().sub(a).dot(ab) / Math.max(1e-9, ab.lengthSq())));
+  return a.clone().addScaledVector(ab, t).distanceTo(p);
+}
+function segSegDist(p1, q1, p2, q2) {
+  // closest distance between two segments (Ericson, Real-Time Collision Detection 5.1.9)
+  const d1 = q1.clone().sub(p1), d2 = q2.clone().sub(p2), r = p1.clone().sub(p2);
+  const a = d1.dot(d1), e = d2.dot(d2), f = d2.dot(r);
+  let sN, tN;
+  if (a < 1e-9 && e < 1e-9) return p1.distanceTo(p2);
+  if (a < 1e-9) { sN = 0; tN = Math.max(0, Math.min(1, f / e)); }
+  else {
+    const c = d1.dot(r);
+    if (e < 1e-9) { tN = 0; sN = Math.max(0, Math.min(1, -c / a)); }
+    else {
+      const b = d1.dot(d2), den = a * e - b * b;
+      sN = den > 1e-9 ? Math.max(0, Math.min(1, (b * f - c * e) / den)) : 0;
+      tN = (b * sN + f) / e;
+      if (tN < 0) { tN = 0; sN = Math.max(0, Math.min(1, -c / a)); }
+      else if (tN > 1) { tN = 1; sN = Math.max(0, Math.min(1, (b - c) / a)); }
+    }
+  }
+  return p1.clone().addScaledVector(d1, sN).distanceTo(p2.clone().addScaledVector(d2, tN));
+}
+function trackHits(o, A, B, reach) {
+  if (o.c) {
+    const k = new THREE.Vector3(o.r[0] + reach, o.r[1] + reach, o.r[2] + reach);
+    return segPointDist(A.clone().sub(o.c).divide(k), B.clone().sub(o.c).divide(k), new THREE.Vector3()) <= 1;
+  }
+  return segSegDist(A, B, o.a, o.b) <= o.r + reach;
+}
+// Wound track inside one segment: from the entry point to the exit, or as deep as the bullet goes.
+function woundTrack(part, entry, dir) {
+  const far = entry.clone().addScaledVector(dir, 1);
+  const back = new THREE.Raycaster(far, dir.clone().negate(), 0, 1).intersectObject(part.mesh, false)[0];
+  const through = back ? entry.distanceTo(back.point) : 0.1;
+  const depth = Math.min(through, weapon.pen);
+  const exit = entry.clone().addScaledVector(dir, depth);
+  part.mesh.updateMatrixWorld();
+  const entryLocal = part.mesh.worldToLocal(entry.clone()), exitLocal = part.mesh.worldToLocal(exit.clone());
+  const toAxis = part.axisQ ? part.axisQ.clone().invert() : new THREE.Quaternion();
+  const A = entryLocal.clone().applyQuaternion(toAxis), B = exitLocal.clone().applyQuaternion(toAxis);
+  return { A, B, entryLocal, exit, perforating: through <= weapon.pen, organs: part.organs.filter(o => trackHits(o, A, B, weapon.reach)) };
+}
+const BLOOD_VOLUME = 70 * BODY_MASS; // ~70 ml of blood per kg
+const fmtRate = r => r >= 1 ? `${r.toFixed(r < 10 ? 1 : 0)} мл/с` : `${Math.round(r * 60)} мл/мин`;
+const rnd = ([lo, hi]) => lo + Math.random() * (hi - lo);
+let physMult = 1, showBlood = true, xray = false;
+const bloodGroup = new THREE.Group();
+scene.add(bloodGroup);
+const drops = [], pools = [];
+const UP_Y = new THREE.Vector3(0, 1, 0);
+const dropGeo = new THREE.IcosahedronGeometry(1, 1), poolGeo = new THREE.CircleGeometry(1, 12).rotateX(-Math.PI / 2);
+const channelMat = new THREE.LineBasicMaterial({ color: 0xffd23f, depthTest: false });
+
+const HOLE = { pistol: [0.0045, 0.008], rifle: [0.0035, 0.018], buck: [0.0045, 0.006], slug: [0.009, 0.015] }; // entry and exit radius, m
+function addWound(part, hit, dir) {
+  const c = character;
+  const type = part.n.replace(/[LR]$/, '');
+  const track = woundTrack(part, hit.point, dir);
+  const [tissueName, tissueRate] = TISSUE[type];
+  const comps = [{ rate: rnd(tissueRate), ext: 0.9, clot: 90 }];
+  for (const o of track.organs) {
+    comps.push({ rate: rnd(o.rate), ext: o.ext, clot: o.clot });
+    if (o.mesh) o.mesh.material.emissive.set(0x5a0000);
+  }
+  const has = f => track.organs.some(f);
+  const local = track.entryLocal;
+  const n = hit.face ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld) : dir.clone().negate();
+  const nLocal = n.applyQuaternion(part.mesh.getWorldQuaternion(new THREE.Quaternion()).invert());
+  const w = {
+    part, local, nLocal, comps, organs: track.organs, perforating: track.perforating,
+    name: track.organs.length ? track.organs.map(o => o.name).join(', ') : tissueName,
+    zone: type === 'head' && local.y < -0.085 ? 'шея' : ZONE_LABEL[part.n],
+    arrest: has(o => o.arrest), brain: has(o => o.cns === 'brain'), cervical: has(o => o.cns === 'cervical'),
+    spine: has(o => o.cns === 'spine'), bone: has(o => o.bone),
+    rate: comps.reduce((a, k) => a + k.rate, 0), now: 0, ext: 0.9, t0: c.physT, lost: 0, extLost: 0, pending: 0,
+  };
+  // the wound track is seen in x-ray; entry and exit are painted on the skin
+  const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([track.A, track.B]), channelMat);
+  line.userData.marker = true; line.layers.set(1); line.renderOrder = 10; part.organRoot.add(line);
+  const [rIn, rOut] = HOLE[weapon.id];
+  addWoundSlot(w, hit.object, hit.object.skeleton ? domBone(hit) : 0, hit.point, rIn);
+  if (track.perforating) {
+    // find where the track leaves the skin of the same segment
+    const from = track.exit.clone().addScaledVector(dir, 0.3);
+    const outHit = hitModel(new THREE.Raycaster(from, dir.clone().negate(), 0, 0.6))
+      .find(h => partOfHit(h) === part.n && h.point.distanceTo(track.exit) < 0.12);
+    if (outHit) addWoundSlot(w, outHit.object, domBone(outHit), outHit.point, rOut);
+  }
+  c.wounds.push(w);
+  if (w.arrest && c.arrestAt === null) c.arrestAt = c.physT + 8 + Math.random() * 7;
+  spatter(hit.point, dir);
+  if (track.perforating) spatter(track.exit, dir);
+  return w;
+}
+
+function domBone(hit) { return hit.object.userData.dom[hit.face.a]; }
+// the segment is the hitbox nearest to the hit point; skin weights alone put the lower ribs in the abdomen
+function partAt(point) {
+  let best = null, bd = Infinity;
+  const v = new THREE.Vector3();
+  for (const p of parts) {
+    p.mesh.worldToLocal(v.copy(point));
+    if (p.axisQ) v.applyQuaternion(p.axisQ.clone().invert());
+    let d;
+    if (p.shape === 'ball') d = v.length() - p.r;
+    else if (p.shape === 'box') d = Math.max(Math.abs(v.x) - p.hx, Math.abs(v.y) - p.hy, Math.abs(v.z) - p.hz);
+    else if (p.shape === 'capX') d = Math.hypot(v.x - Math.max(-p.h, Math.min(p.h, v.x)), v.y, v.z) - p.r;
+    else d = Math.hypot(v.x, v.y - Math.max(-p.h, Math.min(p.h, v.y)), v.z) - p.r;
+    if (d < bd) { bd = d; best = p; }
+  }
+  return best;
+}
+function partOfHit(hit) { return partAt(hit.point).n; }
+
+function physiology(dt) {
+  const c = character;
+  c.physT += dt;
+  const f = c.lost / BLOOD_VOLUME;
+  // falling blood pressure slows every bleed; a stopped heart slows it a lot more
+  const pressure = Math.max(0.25, 1 - 1.6 * Math.max(0, f - 0.15)) * (c.arrestAt !== null && c.physT > c.arrestAt ? 0.15 : 1);
+  let total = 0;
+  for (const w of c.wounds) {
+    let wr = 0, we = 0;
+    for (const k of w.comps) {
+      const r = k.rate * pressure * (k.clot ? Math.exp(-(c.physT - w.t0) / k.clot) : 1);
+      wr += r; we += r * k.ext;
+    }
+    w.now = wr; w.ext = wr > 0 ? we / wr : 0.9;
+    const ml = w.now * dt;
+    total += w.now; c.lost += ml; w.lost += ml; w.extLost += ml * w.ext; w.pending += ml * w.ext;
+  }
+  c.bleedRate = total;
+  c.vigor = f < 0.15 ? 1 : Math.max(0.55, 1 - (f - 0.15) / 0.15 * 0.45);
+  if (c.sway) {
+    const a = Math.min(1, (f - 0.15) / 0.2), t = simTime;
+    c.sway.pose.chest = [0.06 * a * Math.sin(t * 1.1), 0, 0.07 * a * Math.sin(t * 0.7)];
+    c.sway.pose.abdomen = [0.04 * a * Math.sin(t * 1.1 + 0.6), 0, 0.05 * a * Math.sin(t * 0.7 + 0.4)];
+    c.sway.pose.head = [0.08 * a * Math.sin(t * 0.9), 0, 0];
+  }
+  const pct = Math.round(f * 100);
+  if (f >= 0.15 && c.stage < 1) {
+    c.stage = 1;
+    log('blood', 'Класс II', c.conscious && c.state !== 'down' ? `Потеряно ${pct}% крови: пульс за 100, слабость, тревога. Тело начинает покачиваться.` : `Потеряно ${pct}% крови.`);
+    if (c.conscious && c.state !== 'down') c.sway = addLayer({}, { attack: 2, hold: Infinity, release: 0.5, tag: 'sway' });
+  }
+  if (f >= 0.30 && c.stage < 2) {
+    c.stage = 2;
+    log('blood', 'Класс III', c.conscious && c.state !== 'down' ? `Потеряно ${pct}%: давление падает, ноги не держат. Человек опускается на землю.` : `Потеряно ${pct}%: давление падает.`);
+    if (c.conscious && c.state !== 'down') {
+      tone([...LEG('L'), ...LEG('R')], 0.25, 1.2);
+      c.balanceTarget = Math.min(c.balanceTarget, 0.2); c.balanceRate = 0.8;
+      addLayer({ thighL: [-0.5, 0, 0], thighR: [-0.5, 0, 0], shinL: [1.1, 0, 0], shinR: [1.1, 0, 0], chest: [0.3, 0, 0] }, { attack: 1.2, hold: Infinity, tag: 'faint' });
+      at(2.5, () => { if (c.state !== 'down') c.balanceTarget = 0; });
+    }
+  }
+  if (f >= 0.38 && c.stage < 3) {
+    c.stage = 3;
+    log('blood', 'Класс IV', c.conscious ? `Потеряно ${pct}%: потеря сознания.` : `Потеряно ${pct}%.`);
+    if (c.conscious) collapse(false);
+  }
+  if (f >= 0.5 && c.stage < 4) {
+    c.stage = 4;
+    log('blood', 'Критично', 'Больше половины объёма крови: без немедленной помощи это смерть.');
+  }
+  if (c.arrestAt !== null && c.physT >= c.arrestAt && !c.arrestLogged) {
+    c.arrestLogged = true;
+    if (c.conscious) { log('blood', 'Нет перфузии', 'Мозг без кровотока: потеря сознания.'); collapse(false); }
+  }
+}
+
+function heartRate() {
+  const c = character, f = c.lost / BLOOD_VOLUME;
+  if ((c.arrestAt !== null && c.physT >= c.arrestAt) || f >= 0.55) return 0;
+  if (f < 0.15) return 75 + f / 0.15 * 22;
+  if (f < 0.3) return 97 + (f - 0.15) / 0.15 * 23;
+  if (f < 0.4) return 120 + (f - 0.3) / 0.1 * 20;
+  return Math.min(165, 140 + (f - 0.4) / 0.1 * 15);
+}
+
+function updateBloodVisuals(dt) {
+  const c = character;
+  const hr = heartRate(), beat = hr ? Math.sin(c.physT * Math.PI * 2 * hr / 60) : -1;
+  const q = new THREE.Quaternion();
+  for (const w of c.wounds) {
+    if (!dt) continue;
+    // one drop carries 0.3–5 ml so a heavy bleed stays at a few dozen drops per second
+    const dropMl = Math.min(5, Math.max(0.3, w.now * w.ext / 20));
+    let guard = 0;
+    while (w.pending >= dropMl && guard++ < 6) {
+      w.pending -= dropMl;
+      w.part.mesh.getWorldQuaternion(q);
+      const pos = w.local.clone(); w.part.mesh.localToWorld(pos);
+      const nrm = w.nLocal.clone().applyQuaternion(q);
+      // an artery spurts in time with the pulse; anything else runs down and drips
+      const arterial = w.now * w.ext > 3;
+      const v = nrm.clone().multiplyScalar(arterial ? 0.4 + 1.6 * Math.max(0, beat) * Math.min(1, w.now / 15) : 0.03);
+      const jitter = arterial ? 0.15 : 0.04;
+      v.x += (Math.random() - 0.5) * jitter; v.z += (Math.random() - 0.5) * jitter;
+      spawnDrop(pos.addScaledVector(nrm, 0.01), v, dropMl);
+    }
+    if (w.pending > dropMl * 6) w.pending = dropMl * 6;
+  }
+  if (!dt) return;
+  for (let i = drops.length - 1; i >= 0; i--) {
+    const d = drops[i];
+    d.v.y -= 9.81 * dt;
+    d.mesh.position.addScaledVector(d.v, dt);
+    const sp = d.v.length(), r = d.mesh.userData.r;
+    d.mesh.scale.set(r, r * (1 + Math.min(3, sp * 1.5)), r);
+    if (sp > 1e-3) d.mesh.quaternion.setFromUnitVectors(UP_Y, tv.copy(d.v).divideScalar(sp));
+    if (d.mesh.position.y <= 0.004) { deposit(d.mesh.position, d.ml); bloodGroup.remove(d.mesh); drops.splice(i, 1); }
+  }
+}
+function spawnDrop(pos, v, ml) {
+  if (drops.length > 400) return deposit(pos.setY(0), ml);
+  const mesh = new THREE.Mesh(dropGeo, bloodMat);
+  mesh.userData.r = Math.min(0.006, Math.max(0.0025, Math.cbrt(ml * 1e-6 * 3 / (4 * Math.PI)) * 0.6));
+  mesh.scale.setScalar(mesh.userData.r);
+  mesh.position.copy(pos);
+  bloodGroup.add(mesh);
+  drops.push({ mesh, v, ml });
+}
+function deposit(pt, ml) {
+  // a pool about 3 mm deep: 1 l covers a circle of roughly 0.33 m radius
+  let best = null, bd = Infinity;
+  for (const pl of pools) {
+    const d = Math.hypot(pl.x - pt.x, pl.z - pt.z);
+    if (d < Math.max(pl.r, 0.03) + 0.03 && d < bd) { best = pl; bd = d; }
+  }
+  if (!best && pools.length > 300) { for (const pl of pools) { const d = Math.hypot(pl.x - pt.x, pl.z - pt.z); if (d < bd) { best = pl; bd = d; } } }
+  if (!best) {
+    best = { x: pt.x, z: pt.z, ml: 0, r: 0, mesh: new THREE.Mesh(poolGeo, poolMat) };
+    best.mesh.position.set(pt.x, 0.002 + pools.length * 0.00002, pt.z);
+    best.mesh.receiveShadow = true;
+    bloodGroup.add(best.mesh); pools.push(best);
+  }
+  // the pool creeps toward where new blood lands
+  const k = ml / (best.ml + ml);
+  best.x += (pt.x - best.x) * k; best.z += (pt.z - best.z) * k;
+  best.mesh.position.x = best.x; best.mesh.position.z = best.z;
+  best.ml += ml;
+  best.r = Math.sqrt(best.ml * 1e-6 / 0.003 / Math.PI);
+  best.mesh.scale.set(best.r, 1, best.r);
+}
+function spatter(point, dir) {
+  // fine droplets thrown along the bullet path (exit side) and a few back toward the shooter
+  for (let i = 0; i < 8; i++) {
+    const back = i < 2;
+    const v = dir.clone().multiplyScalar(back ? -(0.3 + Math.random() * 0.5) : 0.8 + Math.random() * 1.6);
+    v.x += (Math.random() - 0.5) * 0.6; v.y += Math.random() * 0.4; v.z += (Math.random() - 0.5) * 0.6;
+    spawnDrop(point.clone().addScaledVector(dir, back ? -0.01 : 0.03), v, 0.08 + Math.random() * 0.15);
+  }
+}
+function clearBlood() {
+  for (const d of drops) bloodGroup.remove(d.mesh);
+  for (const pl of pools) bloodGroup.remove(pl.mesh);
+  drops.length = 0; pools.length = 0;
+}
+function setXray(on) {
+  xray = on;
+  if (on) camera.layers.enable(1); else camera.layers.disable(1);
+  for (const m of [surfaceMat, jointMat]) { m.transparent = on; m.opacity = on ? 0.2 : 1; m.depthWrite = !on; m.needsUpdate = true; }
+  document.getElementById('xrayBox').checked = on;
+}
+function setBloodVisible(v) {
+  showBlood = v;
+  bloodGroup.visible = v;
+  woundU.uBloodOn.value = v ? 1 : 0;
+}
+
+const vEl = id => document.getElementById(id);
+// text and styles written every frame are set only when they change: each write makes the browser lay the page out
+// again, and the pointer handlers then wait for that
+function setText(el, t) { if (typeof el === 'string') el = vEl(el); if (el._t !== t) { el._t = t; el.textContent = t; } }
+function bloodReadout() {
+  const c = character, f = c.lost / BLOOD_VOLUME;
+  const bw = Math.min(100, f / 0.5 * 100).toFixed(1) + '%', bb = vEl('bbFill');
+  if (bb._w !== bw) { bb._w = bw; bb.style.width = bw; }
+  const T = {};
+  T.vLost = `${Math.round(c.lost)} мл · ${(f * 100).toFixed(1)}%`;
+  T.vRate = c.bleedRate > 0.01 ? `${fmtRate(c.bleedRate)} · ${Math.round(c.bleedRate * 60)} мл/мин` : '—';
+  const hr = heartRate();
+  T.vHr = hr ? `${Math.round(hr)} уд/мин` : 'нет пульса';
+  T.vClass = f < 0.15 ? 'I' : f < 0.3 ? 'II' : f < 0.4 ? 'III' : 'IV';
+  let eta = '—';
+  if (c.conscious) {
+    if (c.arrestAt !== null) eta = `≈ ${Math.max(0, c.arrestAt - c.physT).toFixed(0)} с`;
+    else if (c.bleedRate > 0.05) {
+      const s = (0.38 * BLOOD_VOLUME - c.lost) / c.bleedRate;
+      eta = s > 3600 ? 'больше часа' : s > 90 ? `≈ ${Math.round(s / 60)} мин` : `≈ ${Math.round(s)} с`;
+    }
+  } else if (c.wounds.length || c.state === 'down') eta = 'без сознания';
+  T.vEta = eta;
+  T.bloodChip = `кровопотеря: ${Math.round(c.lost)} мл`;
+  for (const k in T) setText(k, T[k]);
+  const list = vEl('wounds'), key = c.wounds.map(w => w.zone + w.name + fmtRate(w.now || w.rate)).join('|');
+  if (list._key !== key) {
+    list._key = key;
+    list.replaceChildren(...c.wounds.map(w => {
+      const li = document.createElement('li');
+      if (w.rate >= 3) li.className = 'art';
+      const a = document.createElement('span'); a.textContent = `${w.zone}: ${w.name}`;
+      const b = document.createElement('span'); b.textContent = fmtRate(w.now || w.rate);
+      li.append(a, b);
+      return li;
+    }));
+  }
+}
+
+// ---------- replay ----------
+const history = [];
+const HISTORY_FRAMES = 300; // 5 s at 60 Hz
+let stepCount = 0, replay = null;
+function record() {
+  const f = new Float32Array(parts.length * 7);
+  parts.forEach((p, i) => {
+    const t = p.body.translation(), q = p.body.rotation();
+    f.set([t.x, t.y, t.z, q.x, q.y, q.z, q.w], i * 7);
+  });
+  history.push(f);
+  if (history.length > HISTORY_FRAMES) history.shift();
+}
+function applyFrame(f) {
+  parts.forEach((p, i) => { p.mesh.position.set(f[i * 7], f[i * 7 + 1], f[i * 7 + 2]); p.mesh.quaternion.set(f[i * 7 + 3], f[i * 7 + 4], f[i * 7 + 5], f[i * 7 + 6]); });
+}
+
+// ---------- simulation loop ----------
+function step() {
+  runScript();
+  muscles(DT);
+  runAnim(DT);
+  world.step();
+  simTime += DT;
+  for (const l of layers) l.age += DT;
+  for (let i = layers.length - 1; i >= 0; i--) if (layers[i].age > layers[i].attack + layers[i].hold + layers[i].release) layers.splice(i, 1);
+  for (let i = events.length - 1; i >= 0; i--) if (events[i].t <= simTime) { const e = events.splice(i, 1)[0]; e.fn(); }
+  physiology(DT * physMult);
+  updateLife();
+  const pelvisT = byName.pelvis.body.translation();
+  if (!Number.isFinite(pelvisT.x + pelvisT.y + pelvisT.z)) { // the solver blew up: start over instead of freezing the page
+    buildWorld();
+    log('info', 'Сброс', 'Физика потеряла устойчивость, манекен поставлен заново.');
+    return;
+  }
+  // a sitter whose pelvis has toppled over is lying: the seated balance would keep fighting the ground.
+  // Bending forward from the waist does not count, the pelvis stays upright for that
+  if (character.seated) {
+    const q = byName.pelvis.body.rotation(), upY = 1 - 2 * (q.x * q.x + q.z * q.z);
+    character.tipped = upY < 0.42 ? (character.tipped || 0) + DT : 0;
+    if (character.tipped > 0.5) { character.seated = false; character.noLift = true; }
+  }
+  if (character.seated && character.conscious && byName.pelvis.body.translation().y < 0.45) { if (character.state !== 'sit') setState('sit'); }
+  else if (character.state !== 'down' && byName.pelvis.body.translation().y < (character.kneel && character.conscious ? 0.3 : 0.45)) {
+    setState('down');
+    // the uprighting torque goes quickly: with the head already on the ground it would push the hips up and roll the body over
+    character.balanceTarget = 0; character.balanceRate = Math.max(character.balanceRate, 6); character.noLift = true;
+    if (character.conscious) { // conscious but on the ground: muscles relax instead of holding the standing pose
+      for (const p of parts) { p.baseTone = Math.min(p.baseTone, LEGS.includes(p.n) ? 0.02 : 0.06); p.toneRate = 4; p.toneTarget = effTone(p); }
+      clearBoosts(ALL());
+      // the held poses fade slowly: an abrupt release straightens the legs under the body and lifts it back up
+      for (const l of layers) if (l.hold === Infinity && l.tag !== 'life') fadeOut(l, l.tag === 'ai-torso' || l.tag === 'ai-body' ? 1 : 2.5);
+    }
+    character.kneel = null;
+  }
+  if (++stepCount % 2 === 0) record();
+}
+function syncMeshes() {
+  for (const p of parts) {
+    const t = p.body.translation(), q = p.body.rotation();
+    p.mesh.position.set(t.x, t.y, t.z);
+    p.mesh.quaternion.set(q.x, q.y, q.z, q.w);
+  }
+}
+
+let timeScale = 1, acc = 0, last = performance.now();
+// Quality follows the device: a GPU that cannot hold the frame rate gets fewer pixels, then no shadows; once it runs
+// smoothly for a while, pixels come back. 'high' and 'low' fix the setting by hand.
+const PR_MAX = Math.min(devicePixelRatio, INTEGRATED_GL ? 1.25 : 2), PR_MIN = 0.6;
+let quality = 'auto', pixelRatio = renderer.getPixelRatio(), slowT = 0, smoothT = 0, fpsN = 0, fpsT = 0;
+function setShadows(on) {
+  if (renderer.shadowMap.enabled === on) return;
+  renderer.shadowMap.enabled = on;
+  scene.traverse(o => { if (o.material) for (const m of [].concat(o.material)) m.needsUpdate = true; });
+}
+function setPixelRatio(pr) { pixelRatio = pr; renderer.setPixelRatio(pr); resize(); }
+function setQuality(q) {
+  quality = q; slowT = 0; smoothT = 0;
+  if (q === 'high') { setPixelRatio(PR_MAX); setShadows(true); }
+  if (q === 'low') { setPixelRatio(Math.min(PR_MAX, 0.75)); setShadows(false); }
+}
+function adaptQuality(dt) { // dt: real time since the last frame, not clamped
+  fpsN++; fpsT += dt;
+  if (fpsT >= 1) { showGfx(fpsN / fpsT); fpsN = 0; fpsT = 0; }
+  if (quality !== 'auto') return;
+  slowT = dt > 1 / 45 ? slowT + dt : Math.max(0, slowT - dt * 0.5);
+  smoothT = dt < 1 / 55 ? smoothT + dt : 0;
+  if (slowT > 1.5) {
+    slowT = 0; smoothT = 0;
+    if (pixelRatio > PR_MIN + 0.01) setPixelRatio(Math.max(PR_MIN, pixelRatio - 0.25));
+    else setShadows(false);
+  } else if (smoothT > 10) {
+    smoothT = 0;
+    if (pixelRatio < PR_MAX - 0.01) setPixelRatio(Math.min(PR_MAX, pixelRatio + 0.25));
+    else if (!SOFTWARE_GL) setShadows(true);
+  }
+}
+const gfxNote = document.getElementById('gfxNote');
+function showGfx(fps) {
+  const gpu = GPU_NAME.replace(/^ANGLE \((.*)\)$/, '$1').replace(/,? ?(Direct3D|OpenGL|Vulkan|D3D)[^,]*$/i, '') || 'неизвестно';
+  const gpuShort = gpu.length > 60 ? gpu.slice(0, 58) + '…' : gpu;
+  gfxNote.textContent = `Графика: ${Math.round(fps)} к/с · масштаб ${pixelRatio.toFixed(2)} · тени ${renderer.shadowMap.enabled ? 'вкл' : 'выкл'} · ${gpuShort}` +
+    (SOFTWARE_GL ? '. Браузер рисует без видеокарты (программный рендер), поэтому всё медленно: включите аппаратное ускорение в настройках браузера и перезапустите его (проверить: vivaldi://gpu или chrome://gpu).'
+      : INTEGRATED_GL ? '. Это встроенная видеокарта. Если в ноутбуке есть дискретная (NVIDIA, AMD), назначьте её браузеру: Параметры Windows → Система → Дисплей → Графика → браузер → «Высокая производительность», затем перезапустите браузер.' : '');
+}
+function frame(now) {
+  const dtRaw = (now - last) / 1000, dtReal = Math.min(0.05, dtRaw);
+  last = now;
+  if (!document.hidden && dtRaw < 1) adaptQuality(dtRaw);
+  if (replay) {
+    replay.i += dtReal * 60 * 0.25;
+    if (replay.i >= replay.frames.length - 1) { replay = null; document.getElementById('replayBadge').hidden = true; syncMeshes(); }
+    else applyFrame(replay.frames[Math.floor(replay.i)]);
+  } else {
+    acc += dtReal * timeScale;
+    let n = 0;
+    while (acc >= DT && n < 8) { step(); acc -= DT; n++; }
+    if (n === 8) acc = 0;
+    syncMeshes();
+  }
+  updateBloodVisuals(replay ? 0 : dtReal * timeScale);
+  updateWoundUniforms();
+  bloodReadout();
+  for (let i = effects.length - 1; i >= 0; i--) {
+    const e = effects[i]; e.age += dtReal;
+    const k = Math.min(1, e.age / e.life);
+    e.update(e, k, dtReal);
+    if (k >= 1) { scene.remove(e.obj); effects.splice(i, 1); e.done?.(); }
+  }
+  poseRig();
+  const pl = byName.pelvis.mesh.position;
+  // the shadow box travels with the body, so a runner keeps a shadow
+  if (Number.isFinite(pl.x + pl.z)) { // in half-metre steps: a box sliding with every sway would make shadow edges shimmer
+    const gx = Math.round(pl.x * 2) / 2, gz = Math.round(pl.z * 2) / 2;
+    sun.target.position.set(gx, 0, gz); sun.position.set(gx + 3, 6, gz + 4);
+  }
+  controls.update();
+  const dist = camera.position.distanceTo(vecOf(byName.chest.body.translation()));
+  setText(distText, `дистанция: ${dist.toFixed(1)} м`);
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+const distText = document.getElementById('distChip');
+
+function resize() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(stage);
+
+// ---------- UI ----------
+const logEl = document.getElementById('log');
+function log(kind, tag, text, extra) {
+  const li = document.createElement('li');
+  li.className = kind;
+  const time = document.createElement('time'); time.textContent = simTime.toFixed(2) + ' с';
+  const body = document.createElement('div');
+  const t = document.createElement('span'); t.className = 'tag'; t.textContent = tag;
+  body.append(t, document.createTextNode(text));
+  if (extra) { const x = document.createElement('div'); x.className = 'ex'; x.textContent = extra; body.append(x); }
+  li.append(time, body);
+  logEl.prepend(li);
+  while (logEl.children.length > 30) logEl.lastChild.remove();
+}
+function readout(zone, p, dvSeg, dvBody) {
+  document.getElementById('rZone').textContent = zone;
+  document.getElementById('rImp').textContent = p.toFixed(1) + ' Н·с';
+  document.getElementById('rSeg').textContent = dvSeg ? (dvSeg < 1 ? (dvSeg * 100).toFixed(0) + ' см/с' : dvSeg.toFixed(1) + ' м/с') : '—';
+  document.getElementById('rBody').textContent = dvBody ? (dvBody < 1 ? (dvBody * 100).toFixed(1) + ' см/с' : dvBody.toFixed(2) + ' м/с') : '—';
+}
+
+const wEl = document.getElementById('weapons');
+WEAPONS.forEach((w, i) => {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'weapon'; b.id = 'w-' + w.id;
+  b.setAttribute('aria-pressed', i === 0);
+  const n = w.pellets || 1;
+  b.innerHTML = `<b>${w.name}</b><span class="p">${(w.m * w.v * n).toFixed(1)} Н·с</span><span class="spec">${n > 1 ? n + ' × ' : ''}${(w.m * 1000).toLocaleString('ru')} г × ${w.v} м/с</span>`;
+  b.onclick = () => { weapon = w; wEl.querySelectorAll('.weapon').forEach(x => x.setAttribute('aria-pressed', x === b)); };
+  wEl.append(b);
+});
+function segment(ids, onPick) {
+  ids.forEach(id => document.getElementById(id).onclick = () => {
+    ids.forEach(x => document.getElementById(x).setAttribute('aria-pressed', x === id));
+    onPick(id);
+  });
+}
+segment(['impReal', 'impMovie'], id => {
+  impulseMult = id === 'impMovie' ? 30 : 1;
+  document.getElementById('impNote').textContent = impulseMult === 1
+    ? 'Физически верный импульс p = m·v. Тело почти не сдвигается.'
+    : 'Импульс ×30, как в кино. Так пуля не работает: стрелка отбросило бы так же.';
+});
+const setTime = id => { timeScale = { t1: 1, t025: 0.25, t0: 0 }[id]; };
+segment(['t1', 't025', 't0'], setTime);
+segment(['qAuto', 'qHigh', 'qLow'], id => setQuality({ qAuto: 'auto', qHigh: 'high', qLow: 'low' }[id]));
+segment(['rAuto', 'rFlee', 'rStay'], id => { reactMode = { rAuto: 'auto', rFlee: 'flee', rStay: 'stay' }[id]; });
+segment(['ph1', 'ph10'], id => { physMult = id === 'ph10' ? 10 : 1; });
+document.getElementById('showBlood').addEventListener('change', e => setBloodVisible(e.target.checked));
+document.getElementById('xrayBox').addEventListener('change', e => setXray(e.target.checked));
+document.getElementById('aiBox').addEventListener('change', e => { aiWanted = e.target.checked; });
+updateAiNote();
+function pickTime(id) { document.getElementById(id).click(); }
+function startReplay() {
+  if (history.length < 10) return;
+  replay = { frames: history.slice(), i: 0 };
+  document.getElementById('replayBadge').hidden = false;
+}
+function reset() {
+  replay = null; document.getElementById('replayBadge').hidden = true;
+  buildWorld();
+  log('info', 'Сброс', 'Манекен снова стоит.');
+  emit('reset');
+}
+document.getElementById('replayBtn').onclick = startReplay;
+document.getElementById('resetBtn').onclick = reset;
+addEventListener('keydown', e => {
+  if (e.target.closest && e.target.closest('input, textarea')) return;
+  if (e.code === 'Space') { e.preventDefault(); pickTime(timeScale === 0 ? 't1' : 't0'); }
+  if (e.code === 'KeyR') reset();
+  if (e.code === 'KeyP') startReplay();
+  if (e.code === 'KeyX') setXray(!xray);
+});
+
+// click = shot, drag = orbit
+let down = null;
+canvas.addEventListener('pointerdown', e => { down = e.button === 0 && !e.shiftKey ? { x: e.clientX, y: e.clientY } : null; }); // only a plain left click shoots
+canvas.addEventListener('pointerup', e => {
+  if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 6 && !replay) shoot(e.clientX, e.clientY);
+  down = null;
+});
+const aimChip = document.getElementById('aimChip');
+let hovered = null;
+// the aim readout under the cursor: at most once a frame, and not while the camera is being dragged
+let hoverAt = null;
+canvas.addEventListener('pointermove', e => {
+  if (e.buttons) { hoverAt = null; return; }
+  if (!hoverAt) requestAnimationFrame(updateHover);
+  hoverAt = { x: e.offsetX, y: e.offsetY };
+});
+function updateHover() {
+  if (!hoverAt) return;
+  ndc.set((hoverAt.x / canvas.clientWidth) * 2 - 1, -(hoverAt.y / canvas.clientHeight) * 2 + 1);
+  hoverAt = null;
+  raycaster.setFromCamera(ndc, camera);
+  const h = raycaster.intersectObjects(parts.map(p => p.mesh), false)[0];
+  const part = h ? h.object.userData.part : null;
+  hovered = part;
+  let text = '—';
+  if (part) {
+    const t = woundTrack(byName[part], h.point, raycaster.ray.direction.clone());
+    text = ZONE_LABEL[part] + (t.organs.length ? ' → ' + t.organs.map(o => o.name).join(', ') : '');
+  }
+  setText(aimChip, 'прицел: ' + text);
+}
+
+applyTheme();
+buildWorld();
+resize();
+document.getElementById('loading').remove();
+log('info', 'Готово', 'Манекен стоит в 4 м от камеры. Выстрел идёт из точки, где находится камера.');
+// compile the shaders of tracers, dust, blood and pools now rather than in the frame of the first shot; the
+// warm-up materials stay alive so their programs are kept for the clones made later
+{
+  const warm = [new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0.01, 0)]), tracerMat),
+    new THREE.Mesh(new THREE.IcosahedronGeometry(0.01, 0), new THREE.MeshBasicMaterial({ transparent: true })),
+    new THREE.Mesh(new THREE.IcosahedronGeometry(0.01, 0), bloodMat), new THREE.Mesh(new THREE.CircleGeometry(0.01, 6), poolMat)];
+  for (const o of warm) { o.position.set(0, -5, 0); scene.add(o); }
+  renderer.compile(scene, camera);
+  for (const o of warm) scene.remove(o);
+}
+emit('ready');
+// test hook: ?debug exposes the simulation to automated tests
+if (new URLSearchParams(location.search).has('debug')) window.__sim = { byName: () => byName, parts: () => parts, shoot, character: () => character, step, setTime, layers, camera, controls, renderer, scene, setPhys: v => { physMult = v; }, pools: () => pools, drops: () => drops, setXray, woundSlots, script: () => script };
+requestAnimationFrame(frame);
