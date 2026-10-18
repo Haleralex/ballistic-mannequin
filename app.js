@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { emit } from './bus.js';
+import { emit, sim } from './bus.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import RAPIER from '@dimforge/rapier3d-compat';
@@ -449,7 +449,7 @@ function runAnim(dt) {
 }
 
 function poseRig() {
-  // during a run the clip itself poses the skeleton
+  // during a run the clip itself poses the skeleton (the 5-second picture replay poses it from its recorded frames)
   if (!replay && character.run && character.run.w >= 1 && !character.run.phys) return;
   for (const d of DRIVE) {
     const m = byName[d.part].mesh;
@@ -1203,7 +1203,7 @@ function sanitizeBeats(raw, hits) {
   const list = Array.isArray(raw?.beats) ? raw.beats : [];
   const out = [];
   for (const r of list.slice(0, 60)) {
-    if (!r || !ACTIONS[r.action]) continue;
+    if (!r || !Object.hasOwn(ACTIONS, r.action)) continue;
     const num = (v, lo, hi, d) => Number.isFinite(+v) ? Math.max(lo, Math.min(hi, +v)) : d;
     const b = { action: r.action, t: num(r.t, 0, 180, 0), dur: num(r.dur, 0.5, 15, 2), intensity: num(r.intensity, 0.2, 1, 0.7), note: String(r.note || '').slice(0, 120) };
     for (const k of ['at', 'hand', 'dir', 'knee']) if (ENUMS[k].includes(r[k])) b[k] = r[k];
@@ -1393,7 +1393,7 @@ function composeAfterShot(hits, nearMiss) {
   if (flee) startScript(fleeScript(lib, hits), { source: lib ? 'lib' : 'proc', title: 'Убегает' + (lib ? ' · ' + lib.title : ''), temperament: lib?.temperament || 'испуганный', id: lib ? lib.id : '' });
   else if (lib) startScript(lib.beats, { source: 'lib', title: lib.title, temperament: lib.temperament, id: lib.id });
   else startScript(proceduralBeats(rep, hits), { source: 'proc', title: hits.length ? 'Процедурный сценарий' : 'Испуг', temperament: '' });
-  if (!sampleFn || !aiWanted || aiOff) return;
+  if (!sampleFn || !aiWanted || aiOff || playback) return; // a case playing back holds its Claude scenarios already
   const ctl = new AbortController();
   script.ctl = ctl; script.pending = true;
   renderScript(script);
@@ -1401,7 +1401,10 @@ function composeAfterShot(hits, nearMiss) {
     if (ctl.signal.aborted || !character.conscious) return;
     const beats = sanitizeBeats(data, hits);
     if (beats.length < 3) throw { code: 'invalid_json' };
-    startScript(beats, { source: 'ai', title: String(data.title || 'Сценарий Claude').slice(0, 80), temperament: String(data.temperament || '').slice(0, 60) });
+    // Claude's answer cannot be asked for again on replay: the case keeps the beats, at the step they take over
+    const ev = { type: 'script', source: 'ai', title: String(data.title || 'Сценарий Claude').slice(0, 80), temperament: String(data.temperament || '').slice(0, 60), beats: JSON.parse(JSON.stringify(beats)) };
+    logInput(ev);
+    playScript(ev);
     log('info', 'Сценарий', `Claude: «${script.title}», ${beats.length} действий на ${Math.round(Math.max(...beats.map(b => b.t + b.dur)))} с.`);
   }).catch(e => {
     if (e?.code === 'cancelled') return;
@@ -1605,7 +1608,8 @@ function severity(w) {
   if (t === 'head') return 45;
   return 10 + Math.min(9, w.rate);
 }
-// a click: the ray from the camera through that pixel becomes the shot, rounded the way a case stores it
+// a click: the ray from the camera through that pixel becomes the shot. It is recorded as a ray, rounded the way the
+// case stores it, so the shot played back is exactly the shot taken
 function shoot(clientX, clientY) {
   const r = canvas.getBoundingClientRect();
   ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
@@ -1613,7 +1617,9 @@ function shoot(clientX, clientY) {
   fire(raycaster.ray.origin.toArray(), raycaster.ray.direction.toArray());
 }
 function fire(origin, dir) {
+  if (playback || seeking) return; // a case is playing back: the viewer watches, orbits, or takes over first
   const o = origin.map(v => +(+v).toFixed(6)), d = dir.map(v => +(+v).toFixed(6));
+  logInput({ type: 'shot', origin: o, dir: d });
   shootRay(new THREE.Vector3(...o), new THREE.Vector3(...d));
 }
 // everything a shot does, from a ray in world metres (origin, unit direction); never reads the camera
@@ -1674,8 +1680,10 @@ function shootRay(origin, direction) {
       log('info', 'Сбит с ног', 'Такой толчок выбивает из равновесия. Настоящая пуля этого не делает.');
     }
     composeAfterShot(wounds);
-    emit('shot', { weapon: weapon.id, hit: true, kind: incidentKind(wounds), zones: [...new Set(wounds.map(x => x.w.zone))],
-      organs: [...new Set(wounds.flatMap(x => x.w.organs.map(o => o.name)))], nearMissCm: null });
+    const info = { weapon: weapon.id, hit: true, kind: incidentKind(wounds), zones: [...new Set(wounds.map(x => x.w.zone))],
+      organs: [...new Set(wounds.flatMap(x => x.w.organs.map(o => o.name)))], nearMissCm: null };
+    noteShot(info);
+    emit('shot', info);
     return;
   }
   const pAll = p * n;
@@ -1704,7 +1712,9 @@ function shootRay(origin, direction) {
     startle(0.5 * (1 - floorDist / 1.5), side);
     log('near', `Пол в ${floorDist.toFixed(1)} м`, character.conscious ? 'Удар в пол рядом: короткое вздрагивание.' : 'Реакции нет.');
   } else log('info', 'Промах', 'Слишком далеко, реакции нет.');
-  emit('shot', { weapon: weapon.id, hit: false, kind: 'near', zones: [], organs: [], nearMissCm: best < 0.9 ? Math.round(best * 100) : null });
+  const info = { weapon: weapon.id, hit: false, kind: 'near', zones: [], organs: [], nearMissCm: best < 0.9 ? Math.round(best * 100) : null };
+  noteShot(info);
+  emit('shot', info);
 }
 function sideOfShot(ray) {
   // Which side of the mannequin did the bullet pass on (+1 = its left)?
@@ -2159,6 +2169,210 @@ function record() {
 function applyFrame(f) {
   parts.forEach((p, i) => { p.mesh.position.set(f[i * 7], f[i * 7 + 1], f[i * 7 + 2]); p.mesh.quaternion.set(f[i * 7 + 3], f[i * 7 + 4], f[i * 7 + 5], f[i * 7 + 6]); });
 }
+// the picture replay poses the skeleton from old frames; afterwards the bones go back to what the simulation left
+function endReplay() {
+  if (!replay) return;
+  for (const [b, q, p] of replay.bones) { b.quaternion.copy(q); b.position.copy(p); }
+  replay = null; document.getElementById('replayBadge').hidden = true;
+  syncMeshes();
+}
+
+// ---------- the case: seed, inputs by physics step, playback ----------
+// A case (docs/contracts/case-v1.md) is the seed and every input stamped with the physics step before which it
+// applies: step 0 is the first step after a reset, an input with step n is applied after n steps have run. Inputs
+// are settings, shots as rays, and scenarios written by Claude, which cannot be asked for again. Library and
+// procedural scenarios are drawn again from the seed and are not recorded. Real time never enters: the frame loop
+// only decides how many steps to run.
+const CHECK_EVERY = 1200, MAX_STEPS = 120 * 180, MAX_EVENTS = 200, MAX_BYTES = 64 * 1024;
+const BUILD = document.querySelector('meta[name=build]')?.content || 'dev';
+let caseSeed = 0, stepNo = 0, caseLog = [], caseChecks = [], caseShots = [];
+let playback = null; // a loaded case playing back: { c, i: index of the next input, ended }
+let seeking = 0, seekGen = 0; // the running seek's number, 0 when none
+const press = (ids, on) => ids.forEach(x => document.getElementById(x).setAttribute('aria-pressed', x === on));
+const IMP_NOTE = { real: 'Физически верный импульс p = m·v. Тело почти не сдвигается.', movie: 'Импульс ×30, как в кино. Так пуля не работает: стрелка отбросило бы так же.' };
+// what a setting event can say, and how it is applied (the buttons show it too)
+const SETTINGS = {
+  weapon: { values: WEAPONS.map(w => w.id), get: () => weapon.id,
+    set(v) { weapon = WEAPONS.find(w => w.id === v); press(WEAPONS.map(w => 'w-' + w.id), 'w-' + v); } },
+  impulse: { values: ['real', 'movie'], get: () => impulseMult === 1 ? 'real' : 'movie',
+    set(v) { impulseMult = v === 'movie' ? 30 : 1; press(['impReal', 'impMovie'], v === 'movie' ? 'impMovie' : 'impReal'); document.getElementById('impNote').textContent = IMP_NOTE[v]; } },
+  react: { values: ['auto', 'flee', 'stay'], get: () => reactMode,
+    set(v) { reactMode = v; press(['rAuto', 'rFlee', 'rStay'], { auto: 'rAuto', flee: 'rFlee', stay: 'rStay' }[v]); } },
+  bleed: { values: [1, 10], get: () => physMult, // the blood-loss speed-up
+    set(v) { physMult = v; press(['ph1', 'ph10'], v === 10 ? 'ph10' : 'ph1'); } },
+};
+const SETTINGS0 = { weapon: 'pistol', impulse: 'real', react: 'auto', bleed: 1 }; // what a case without settings plays with
+// a setting changed by the viewer; while a case plays back its own settings hold and the buttons go back to them
+function userSetting(key, v) {
+  const S = SETTINGS[key];
+  if (playback || seeking || !S.values.includes(v)) { S.set(S.get()); return; }
+  if (S.get() === v) return;
+  S.set(v);
+  logInput({ type: 'setting', key, value: v });
+}
+function logInput(e) {
+  if (playback) return; // a case playing back already holds its inputs
+  // a setting changed again within the same step, with nothing but settings since, keeps only its last value
+  if (e.type === 'setting') for (let i = caseLog.length - 1; i >= 0 && caseLog[i].step === stepNo && caseLog[i].type === 'setting'; i--)
+    if (caseLog[i].key === e.key) { caseLog[i].value = e.value; return; }
+  caseLog.push({ step: stepNo, ...e });
+}
+// a reset with a seed: step 0 of a new case
+function startCase(seed) {
+  caseSeed = seed >>> 0; rand = mulberry32(caseSeed);
+  stepNo = 0; caseLog = []; caseChecks = []; caseShots = [];
+  shooter.set(...SHOOTER0);
+  recentScenarios.length = 0; beatUid = 0; // the library avoids recent scenarios: "recent" starts again with the case
+  buildWorld();
+  for (const k in SETTINGS) logInput({ type: 'setting', key: k, value: SETTINGS[k].get() }); // the settings in force at step 0
+}
+// one physics step with everything the case needs around it: the step count, the state hashes, and the inputs of a
+// case playing back. Every step goes through here, in real time or fast-forward.
+function simStep() {
+  if (replay) endReplay(); // the 5-second picture replay is only a picture
+  step();
+  stepNo++;
+  if (stepNo % CHECK_EVERY === 0) {
+    const hash = stateHash();
+    caseChecks.push({ step: stepNo, hash });
+    const want = playback?.c.check?.find(k => k.step === stepNo);
+    if (want && want.hash !== hash && !playback.diverged) {
+      playback.diverged = stepNo;
+      console.warn(`case: the replay differs from the recording at step ${stepNo} (built by ${playback.c.build}, this is ${BUILD})`);
+    }
+  }
+  // the activation metric: a scenario watched for 10 s of simulated time
+  if (script && !script.watched && simTime - script.t0 >= 10) { script.watched = true; emit('reaction-watched', { id: script.id || null, seconds: 10 }); }
+  if (playback) playDue();
+}
+// apply the inputs of the case playing back that are due at this step, and notice its end
+function playDue() {
+  const pb = playback, ev = pb.c.events;
+  while (playback === pb && pb.i < ev.length && ev[pb.i].step <= stepNo) applyInput(ev[pb.i++]);
+  if (playback === pb && !pb.ended && stepNo >= pb.c.steps) { pb.ended = true; emit('replay-end'); }
+}
+function applyInput(e) {
+  if (e.type === 'setting') SETTINGS[e.key].set(e.value);
+  else if (e.type === 'shot') shootRay(new THREE.Vector3(...e.origin), new THREE.Vector3(...e.dir));
+  else if (e.type === 'script') playScript(e);
+}
+// a scenario from a script event: the same beats, checked again, whether it was just written or comes from a case
+function playScript(e) {
+  startScript(cleanBeats(e.beats), { source: 'ai', title: String(e.title || 'Сценарий Claude').slice(0, 80), temperament: String(e.temperament || '').slice(0, 60) });
+}
+const ZONE_KINDS = ['head', 'chest', 'abdomen', 'pelvis', 'leg', 'arm'];
+function cleanBeats(list) {
+  const num = (v, lo, hi, d) => Number.isFinite(+v) ? Math.max(lo, Math.min(hi, +v)) : d;
+  return (Array.isArray(list) ? list : []).slice(0, 60).filter(r => r && Object.hasOwn(ACTIONS, r.action)).map(r => {
+    const b = { action: r.action, t: num(r.t, 0, 180, 0), dur: num(r.dur, 0.5, 15, 2), intensity: num(r.intensity, 0.2, 1, 0.7), note: String(r.note || '').slice(0, 120) };
+    for (const k of ['at', 'hand', 'dir', 'knee']) if (ENUMS[k].includes(r[k])) b[k] = r[k];
+    if (ZONE_KINDS.includes(r.zoneKind)) b.zoneKind = r.zoneKind;
+    if ([-1, 0, 1].includes(r.sideSign)) b.sideSign = r.sideSign;
+    return b;
+  }).sort((a, b) => a.t - b.t);
+}
+// State hash (case-v1.md, rule 4): FNV-1a over the positions and rotations of the 14 bodies rounded to 1e-4, the
+// character's state, the blood lost rounded to 0.1 ml, and the running beats, each named "<index in the
+// scenario>:<action>". 8 hex characters.
+function stateHash() {
+  let h = 0x811c9dc5;
+  const add = s => { for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); } };
+  for (const p of parts) {
+    const t = p.body.translation(), q = p.body.rotation();
+    add([t.x, t.y, t.z, q.x, q.y, q.z, q.w].map(v => Math.round(v * 1e4)).join(',') + ';');
+  }
+  add('|' + character.state + '|' + Math.round(character.lost * 10) + '|');
+  if (script) add(script.beats.flatMap((b, i) => b.state === 'run' ? [i + ':' + b.action] : []).join(','));
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+// what the case is about, from its last hit (or its last shot if nothing hit): for titles and search only
+const WEAPON_RU = { pistol: 'пистолет', rifle: 'винтовка', buck: 'картечь', slug: 'пуля 12 калибра' };
+function noteShot(info) {
+  const what = info.organs[0] || info.zones[0];
+  const title = (what ? what[0].toUpperCase() + what.slice(1) : 'Пролёт') + ', ' + WEAPON_RU[info.weapon];
+  caseShots.push({ step: stepNo, hit: info.hit, meta: { title, weapon: info.weapon, kind: info.kind, zones: [...info.zones], organs: [...info.organs] } });
+}
+// The case of everything since the last reset. Kept within the format's limits: past 180 s, 200 inputs or 64 KB it
+// ends at the step of the first input that does not fit (a shorter case that still replays exactly).
+function getCase() {
+  if (playback) return JSON.parse(JSON.stringify(playback.c));
+  let steps = stepNo, events = caseLog, cut = false;
+  const cutAt = s => { steps = s; events = events.filter(e => e.step < s); cut = true; };
+  if (steps > MAX_STEPS) cutAt(MAX_STEPS);
+  if (events.length > MAX_EVENTS) cutAt(events[MAX_EVENTS].step);
+  for (;;) {
+    const shots = caseShots.filter(x => x.step < steps || (x.step === steps && !cut));
+    const meta = (shots.findLast(x => x.hit) || shots.at(-1))?.meta || { title: 'Без выстрела', weapon: weapon.id, kind: 'none', zones: [], organs: [] };
+    const c = { v: 1, seed: caseSeed, build: BUILD, steps, events, check: caseChecks.filter(k => k.step <= steps), meta };
+    const json = JSON.stringify(c);
+    if (new TextEncoder().encode(json).length <= MAX_BYTES || !events.length) return JSON.parse(json);
+    cutAt(events.at(-1).step);
+  }
+}
+// a case from outside (a link, the server): checked against the format before anything runs it
+function checkCase(raw) {
+  const bad = why => { throw new Error('Не удалось открыть повтор: ' + why + '.'); };
+  if (!raw || typeof raw !== 'object') bad('это не запись реакции');
+  if (raw.v !== 1) bad('запись сделана в другом формате, этот симулятор его не знает');
+  const c = JSON.parse(JSON.stringify(raw));
+  const int = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
+  if (!int(c.seed, 0, 0xffffffff)) bad('в записи нет зерна случайных чисел');
+  if (!int(c.steps, 0, MAX_STEPS)) bad('длительность записи вне пределов');
+  if (!Array.isArray(c.events) || c.events.length > MAX_EVENTS) bad('в записи нет списка действий или он слишком длинный');
+  const vec = a => Array.isArray(a) && a.length === 3 && a.every(Number.isFinite);
+  let prev = 0;
+  for (const e of c.events) {
+    if (!e || !int(e.step, prev, c.steps)) bad('действия записи не по порядку шагов');
+    prev = e.step;
+    if (e.type === 'setting') { if (!Object.hasOwn(SETTINGS, e.key) || !SETTINGS[e.key].values.includes(e.value)) bad('неизвестная настройка'); }
+    else if (e.type === 'shot') { if (!vec(e.origin) || !vec(e.dir) || Math.hypot(...e.dir) < 0.5) bad('выстрел записан неверно'); }
+    else if (e.type === 'script') { if (!Array.isArray(e.beats)) bad('сценарий записан неверно'); }
+    else bad('неизвестное действие в записи');
+  }
+  if (c.check !== undefined && !Array.isArray(c.check)) bad('контрольные суммы записаны неверно');
+  return c;
+}
+// reset with the case's seed and play its inputs back: the step-0 inputs now, the rest as the frame loop gets there
+function playFromStart(c) {
+  stopSeek(); endReplay();
+  playback = { c, i: 0, ended: false };
+  for (const k in SETTINGS0) SETTINGS[k].set(SETTINGS0[k]);
+  startCase(c.seed);
+  acc = 0;
+}
+async function loadCase(raw) {
+  const c = checkCase(raw);
+  playFromStart(c);
+  emit('case-loaded', { case: JSON.parse(JSON.stringify(c)) });
+  playDue();
+}
+// jump to a step: replay from 0 as fast as possible without drawing (in slices, so the page stays responsive),
+// then play on in real time. Without a loaded case it rewinds the session itself, which then plays back.
+async function seek(to) {
+  const c = playback ? playback.c : getCase();
+  to = Math.max(0, Math.min(c.steps, Math.floor(+to) || 0));
+  playFromStart(c);
+  playDue();
+  const gen = seeking = ++seekGen;
+  let t0 = performance.now(); // only to slice the work, never read by the simulation
+  while (stepNo < to) {
+    simStep();
+    if (performance.now() - t0 > 30) {
+      await new Promise(r => setTimeout(r));
+      if (seeking !== gen) return; // another seek, a load or a reset took over
+      t0 = performance.now();
+    }
+  }
+  seeking = 0; acc = 0;
+}
+function stopSeek() { seeking = 0; }
+// the viewer carries on from here: the inputs played so far stay in the case, new ones are recorded on top
+function takeOver() {
+  if (!playback) return;
+  stopSeek();
+  caseLog = JSON.parse(JSON.stringify(playback.c.events.slice(0, playback.i)));
+  playback = null; acc = 0;
+}
 
 // ---------- simulation loop ----------
 function step() {
@@ -2257,12 +2471,15 @@ function frame(now) {
   if (!document.hidden && dtRaw < 1) adaptQuality(dtRaw);
   if (replay) {
     replay.i += dtReal * 60 * 0.25;
-    if (replay.i >= replay.frames.length - 1) { replay = null; document.getElementById('replayBadge').hidden = true; syncMeshes(); }
-    else applyFrame(replay.frames[Math.floor(replay.i)]);
-  } else {
+    if (replay.i >= replay.frames.length - 1) endReplay();
+    else { applyFrame(replay.frames[Math.floor(replay.i)]); poseRig(); }
+  } else if (!seeking) { // real time only decides how many fixed steps run; a seek runs them itself
     acc += dtReal * timeScale;
     let n = 0;
-    while (acc >= DT && n < 8) { step(); acc -= DT; n++; }
+    while (acc >= DT && n < 8) {
+      if (playback?.ended) { acc = 0; break; } // the case is over: it holds its last step until the viewer takes over
+      simStep(); acc -= DT; n++;
+    }
     if (n === 8) acc = 0;
     syncMeshes();
   }
@@ -2275,7 +2492,6 @@ function frame(now) {
     e.update(e, k, dtReal);
     if (k >= 1) { scene.remove(e.obj); effects.splice(i, 1); e.done?.(); }
   }
-  poseRig();
   const pl = byName.pelvis.mesh.position;
   // the shadow box travels with the body, so a runner keeps a shadow
   if (Number.isFinite(pl.x + pl.z)) { // in half-metre steps: a box sliding with every sway would make shadow edges shimmer
@@ -2325,7 +2541,7 @@ WEAPONS.forEach((w, i) => {
   b.setAttribute('aria-pressed', i === 0);
   const n = w.pellets || 1;
   b.innerHTML = `<b>${w.name}</b><span class="p">${(w.m * w.v * n).toFixed(1)} Н·с</span><span class="spec">${n > 1 ? n + ' × ' : ''}${(w.m * 1000).toLocaleString('ru')} г × ${w.v} м/с</span>`;
-  b.onclick = () => { weapon = w; wEl.querySelectorAll('.weapon').forEach(x => x.setAttribute('aria-pressed', x === b)); };
+  b.onclick = () => userSetting('weapon', w.id);
   wEl.append(b);
 });
 function segment(ids, onPick) {
@@ -2334,17 +2550,12 @@ function segment(ids, onPick) {
     onPick(id);
   });
 }
-segment(['impReal', 'impMovie'], id => {
-  impulseMult = id === 'impMovie' ? 30 : 1;
-  document.getElementById('impNote').textContent = impulseMult === 1
-    ? 'Физически верный импульс p = m·v. Тело почти не сдвигается.'
-    : 'Импульс ×30, как в кино. Так пуля не работает: стрелка отбросило бы так же.';
-});
+segment(['impReal', 'impMovie'], id => userSetting('impulse', id === 'impMovie' ? 'movie' : 'real'));
 const setTime = id => { timeScale = { t1: 1, t025: 0.25, t0: 0 }[id]; };
 segment(['t1', 't025', 't0'], setTime);
 segment(['qAuto', 'qHigh', 'qLow'], id => setQuality({ qAuto: 'auto', qHigh: 'high', qLow: 'low' }[id]));
-segment(['rAuto', 'rFlee', 'rStay'], id => { reactMode = { rAuto: 'auto', rFlee: 'flee', rStay: 'stay' }[id]; });
-segment(['ph1', 'ph10'], id => { physMult = id === 'ph10' ? 10 : 1; });
+segment(['rAuto', 'rFlee', 'rStay'], id => userSetting('react', { rAuto: 'auto', rFlee: 'flee', rStay: 'stay' }[id]));
+segment(['ph1', 'ph10'], id => userSetting('bleed', id === 'ph10' ? 10 : 1));
 document.getElementById('showBlood').addEventListener('change', e => setBloodVisible(e.target.checked));
 document.getElementById('xrayBox').addEventListener('change', e => setXray(e.target.checked));
 document.getElementById('aiBox').addEventListener('change', e => { aiWanted = e.target.checked; });
@@ -2352,13 +2563,12 @@ updateAiNote();
 function pickTime(id) { document.getElementById(id).click(); }
 function startReplay() {
   if (history.length < 10) return;
-  replay = { frames: history.slice(), i: 0 };
+  replay = { frames: history.slice(), i: 0, bones: restLocal.map(([b]) => [b, b.quaternion.clone(), b.position.clone()]) };
   document.getElementById('replayBadge').hidden = false;
 }
 function reset() {
-  replay = null; document.getElementById('replayBadge').hidden = true;
-  shooter.set(...SHOOTER0);
-  buildWorld();
+  stopSeek(); playback = null; endReplay();
+  startCase(newSeed());
   log('info', 'Сброс', 'Манекен снова стоит.');
   emit('reset');
 }
@@ -2405,7 +2615,7 @@ function updateHover() {
 }
 
 applyTheme();
-buildWorld();
+startCase(newSeed());
 resize();
 document.getElementById('loading').remove();
 log('info', 'Готово', 'Манекен стоит в 4 м от камеры. Выстрел идёт из точки, где находится камера.');
@@ -2419,7 +2629,19 @@ log('info', 'Готово', 'Манекен стоит в 4 м от камеры
   renderer.compile(scene, camera);
   for (const o of warm) scene.remove(o);
 }
+// the simulator's API for the features around it (docs/contracts/sim-api.md)
+Object.assign(sim, {
+  getCase, loadCase, takeOver, seek, stateHash, canvas,
+  setBlood(on) { setBloodVisible(!!on); document.getElementById('showBlood').checked = !!on; },
+});
+Object.defineProperties(sim, {
+  step: { get: () => stepNo, enumerable: true },
+  replaying: { get: () => !!playback, enumerable: true },
+});
 emit('ready');
-// test hook: ?debug exposes the simulation to automated tests
-if (new URLSearchParams(location.search).has('debug')) window.__sim = { byName: () => byName, parts: () => parts, shoot, character: () => character, step, setTime, layers, camera, controls, renderer, scene, setPhys: v => { physMult = v; }, pools: () => pools, drops: () => drops, setXray, woundSlots, script: () => script };
+// test hook: ?debug exposes the simulation to automated tests. step() runs one physics step the way the frame loop
+// does (inputs of a case playing back included); fire(origin, dir) is a recorded shot along a ray; reset(seed) starts
+// a case with that seed; setting(key, value) is a setting changed by the viewer.
+if (new URLSearchParams(location.search).has('debug')) window.__sim = { byName: () => byName, parts: () => parts, shoot, character: () => character, step: simStep, setTime, layers, camera, controls, renderer, scene, setPhys: v => userSetting('bleed', v), pools: () => pools, drops: () => drops, setXray, woundSlots, script: () => script,
+  sim, fire, setting: userSetting, reset: seed => { stopSeek(); playback = null; endReplay(); startCase(seed ?? newSeed()); }, checks: () => caseChecks.slice(), seed: () => caseSeed };
 requestAnimationFrame(frame);
