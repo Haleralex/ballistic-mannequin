@@ -15,3 +15,6 @@ export function emit(name, data) {
     try { fn(data); } catch (e) { console.error(`bus: handler for "${name}" failed`, e); } // a broken listener must not stop the simulation
   }
 }
+
+// The simulator's API for those features, filled in by app.js (docs/contracts/sim-api.md).
+export const sim = {};
