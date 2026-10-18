@@ -14,7 +14,7 @@
 
   "forwardPorts": [8080],
   "portsAttributes": {
-    "8080": { "label": "Симулятор и API (make dev)", "onAutoForward": "notify" },
+    "8080": { "label": "Симулятор и API", "onAutoForward": "notify", "protocol": "http" },
     "5432": { "label": "Postgres", "onAutoForward": "silent" }
   },
 
