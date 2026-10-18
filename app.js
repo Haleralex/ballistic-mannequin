@@ -1447,12 +1447,16 @@ function renderScript(sc, message, badge) {
 }
 
 function collapse(fast) {
+  const c = character;
+  // already sitting, kneeling or lying: the body slumps where it is. Releasing the posture at once with the legs
+  // still toned would straighten them and lift the body before it went limp
+  const low = c.seated || c.kneel || c.state === 'down' || c.state === 'sit' || c.state === 'kneel';
   clearBoosts(ALL());
-  character.conscious = false;
-  character.seated = false; character.noLift = true;
-  character.balanceTarget = 0; character.balanceRate = fast ? 40 : 2.2;
-  for (const l of layers) if (l.hold === Infinity) l.hold = 0;
-  if (fast) tone(ALL(), 0, 40);
+  c.conscious = false;
+  c.seated = false; c.noLift = true;
+  c.balanceTarget = 0; c.balanceRate = fast || low ? 40 : 2.2;
+  for (const l of layers) if (l.hold === Infinity) { if (low) fadeOut(l, 2.5); else l.hold = 0; }
+  if (fast || low) tone(ALL(), 0, 40);
   else {
     tone([...LEG('L'), ...LEG('R')], 0.03, 4);
     tone(['abdomen', 'chest', 'head'], 0.05, 2.2);
