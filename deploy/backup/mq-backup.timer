@@ -1,0 +1,12 @@
+# Starts mq-backup.service every night at about 03:30 server time. Persistent=true catches up a run
+# missed while the server was off. List: systemctl list-timers mq-backup.timer
+[Unit]
+Description=ballistic-mannequin: nightly Postgres backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
