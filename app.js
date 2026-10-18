@@ -113,7 +113,7 @@ const SOFTWARE_GL = /swiftshader|llvmpipe|softpipe|software|basic render/i.test(
 // Integrated Intel graphics: multisampling is slow there (Chromium itself says so), so no MSAA, plain PCF shadows and
 // a smaller shadow map. Laptops often run the browser on these even when a discrete GPU sits next to them.
 const INTEGRATED_GL = /intel/i.test(GPU_NAME) && !/arc/i.test(GPU_NAME);
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: !SOFTWARE_GL && !INTEGRATED_GL, powerPreference: 'high-performance' });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: !SOFTWARE_GL, powerPreference: 'high-performance' });
 renderer.setPixelRatio(SOFTWARE_GL ? 0.75 : Math.min(devicePixelRatio, INTEGRATED_GL ? 1.25 : 2));
 renderer.shadowMap.enabled = !SOFTWARE_GL;
 renderer.shadowMap.type = INTEGRATED_GL ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
@@ -1348,6 +1348,7 @@ function updateAiNote() {
   const ready = sampleState === 'ready' && !aiOff;
   box.disabled = !ready;
   box.checked = ready && aiWanted;
+  box.closest('label').hidden = !ready; // outside claude.ai there is nothing to tick
   note.textContent = ready ? AI_NOTE
     : sampleState === 'pending' ? 'Подключение к Claude…'
     : aiOff ? 'Claude недоступен в этом просмотре: сценарии берутся из библиотеки.'
@@ -2170,15 +2171,27 @@ function record() {
   history.push(f);
   if (history.length > HISTORY_FRAMES) history.shift();
 }
-function applyFrame(f) {
-  parts.forEach((p, i) => { p.mesh.position.set(f[i * 7], f[i * 7 + 1], f[i * 7 + 2]); p.mesh.quaternion.set(f[i * 7 + 3], f[i * 7 + 4], f[i * 7 + 5], f[i * 7 + 6]); });
+const fq = new THREE.Quaternion();
+// pose from frame a, blended k of the way to frame b (a slow replay falls between recorded frames)
+function applyFrame(a, b = a, k = 0) {
+  parts.forEach((p, i) => {
+    const o = i * 7;
+    p.mesh.position.set(a[o], a[o + 1], a[o + 2]);
+    p.mesh.quaternion.set(a[o + 3], a[o + 4], a[o + 5], a[o + 6]);
+    if (k > 0) {
+      p.mesh.position.lerp(fq.set(b[o], b[o + 1], b[o + 2], 0), k);
+      p.mesh.quaternion.slerp(fq.set(b[o + 3], b[o + 4], b[o + 5], b[o + 6]), k);
+    }
+  });
 }
 // the picture replay poses the skeleton from old frames; afterwards the bones go back to what the simulation left
 function endReplay() {
   if (!replay) return;
   for (const [b, q, p] of replay.bones) { b.quaternion.copy(q); b.position.copy(p); }
+  const back = replay.timeBefore;
   replay = null; document.getElementById('replayBadge').hidden = true;
   syncMeshes();
+  pickTime(back); // the simulation goes on at the speed it had before the replay
 }
 
 // ---------- the case: seed, inputs by physics step, playback ----------
@@ -2451,14 +2464,18 @@ function adaptQuality(dt) { // dt: real time since the last frame, not clamped
   if (quality !== 'auto') return;
   slowT = dt > 1 / 45 ? slowT + dt : Math.max(0, slowT - dt * 0.5);
   smoothT = dt < 1 / 55 ? smoothT + dt : 0;
+  // below one pixel per screen pixel the edges turn to steps, so shadows go first and the scale drops under 1 last
+  const PR_ONE = Math.min(1, PR_MAX);
   if (slowT > 1.5) {
     slowT = 0; smoothT = 0;
-    if (pixelRatio > PR_MIN + 0.01) setPixelRatio(Math.max(PR_MIN, pixelRatio - 0.25));
-    else setShadows(false);
+    if (pixelRatio > PR_ONE + 0.01) setPixelRatio(Math.max(PR_ONE, pixelRatio - 0.25));
+    else if (renderer.shadowMap.enabled) setShadows(false);
+    else if (pixelRatio > PR_MIN + 0.01) setPixelRatio(Math.max(PR_MIN, pixelRatio - 0.2));
   } else if (smoothT > 10) {
     smoothT = 0;
-    if (pixelRatio < PR_MAX - 0.01) setPixelRatio(Math.min(PR_MAX, pixelRatio + 0.25));
-    else if (!SOFTWARE_GL) setShadows(true);
+    if (pixelRatio < PR_ONE - 0.01) setPixelRatio(Math.min(PR_ONE, pixelRatio + 0.2));
+    else if (!renderer.shadowMap.enabled && !SOFTWARE_GL) setShadows(true);
+    else if (pixelRatio < PR_MAX - 0.01) setPixelRatio(Math.min(PR_MAX, pixelRatio + 0.25));
   }
 }
 const gfxNote = document.getElementById('gfxNote');
@@ -2474,9 +2491,9 @@ function frame(now) {
   last = now;
   if (!document.hidden && dtRaw < 1) adaptQuality(dtRaw);
   if (replay) {
-    replay.i += dtReal * 60 * 0.25;
+    replay.i += dtReal * 60 * timeScale; // the Time buttons and Space set the replay speed too
     if (replay.i >= replay.frames.length - 1) endReplay();
-    else { applyFrame(replay.frames[Math.floor(replay.i)]); poseRig(); }
+    else { const j = Math.floor(replay.i); applyFrame(replay.frames[j], replay.frames[j + 1], replay.i - j); poseRig(); }
   } else if (!seeking) { // real time only decides how many fixed steps run; a seek runs them itself
     acc += dtReal * timeScale;
     let n = 0;
@@ -2555,7 +2572,11 @@ function segment(ids, onPick) {
   });
 }
 segment(['impReal', 'impMovie'], id => userSetting('impulse', id === 'impMovie' ? 'movie' : 'real'));
-const setTime = id => { timeScale = { t1: 1, t025: 0.25, t0: 0 }[id]; };
+const TIME_IDS = { t1: 1, t025: 0.25, t0: 0 };
+const setTime = id => {
+  timeScale = TIME_IDS[id];
+  document.getElementById('replayBadge').textContent = 'ПОВТОР ' + (timeScale ? '×' + timeScale : '· пауза');
+};
 segment(['t1', 't025', 't0'], setTime);
 segment(['qAuto', 'qHigh', 'qLow'], id => setQuality({ qAuto: 'auto', qHigh: 'high', qLow: 'low' }[id]));
 segment(['rAuto', 'rFlee', 'rStay'], id => userSetting('react', { rAuto: 'auto', rFlee: 'flee', rStay: 'stay' }[id]));
@@ -2567,8 +2588,11 @@ updateAiNote();
 function pickTime(id) { document.getElementById(id).click(); }
 function startReplay() {
   if (history.length < 10) return;
-  replay = { frames: history.slice(), i: 0, bones: restLocal.map(([b]) => [b, b.quaternion.clone(), b.position.clone()]) };
+  const timeBefore = Object.keys(TIME_IDS).find(id => document.getElementById(id).getAttribute('aria-pressed') === 'true') || 't1';
+  if (replay) { endReplay(); return; } // P again, or the button again, stops the replay
+  replay = { frames: history.slice(), i: 0, timeBefore, bones: restLocal.map(([b]) => [b, b.quaternion.clone(), b.position.clone()]) };
   document.getElementById('replayBadge').hidden = false;
+  pickTime('t025'); // starts slow; 1× on the Time buttons plays it at normal speed
 }
 function reset() {
   stopSeek(); playback = null; endReplay();
