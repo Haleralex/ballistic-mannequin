@@ -1,6 +1,6 @@
 // GitHub Codespaces / VS Code dev container: Go 1.24, Node 22, Postgres 16 as a sidecar service.
 // The app container shares the network of the postgres service, so the defaults of docs/contracts/layout.md work
-// unchanged (Postgres on localhost:5432, the API on 8080). Start the API with `make dev`.
+// unchanged (Postgres on localhost:5432, the API on 8080). The API starts by itself (.devcontainer/start-api.sh, log /tmp/mq-api.log).
 // Guide for testers (Russian): docs/ops.md, "Codespaces".
 {
   "name": "ballistic-mannequin",
@@ -29,6 +29,8 @@
   },
 
   "postCreateCommand": "bash .devcontainer/post-create.sh",
+  // the API starts with the codespace; its log is /tmp/mq-api.log
+  "postStartCommand": "bash .devcontainer/start-api.sh",
 
   "customizations": {
     "vscode": {

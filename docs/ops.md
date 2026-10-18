@@ -71,8 +71,11 @@ make db-down      # остановить Postgres (данные остаются
 
 1. На странице репозитория: **Code → Codespaces → Create codespace on main** (машина 2-core хватает).
    Первая сборка занимает несколько минут: ставятся зависимости тестов и Chromium (`.devcontainer/post-create.sh`).
-2. В терминале codespace: `make dev`. Postgres уже запущен рядом (сервис `postgres` из
-   `.devcontainer/compose.yml`, база доступна на `localhost:5432`), команда запускает API на порту 8080.
+2. API запускается сам при каждом старте codespace (`.devcontainer/start-api.sh`, лог — `/tmp/mq-api.log`).
+   Первый запуск компилирует сервер, это до минуты; пока он не поднялся, адрес порта отвечает **502**.
+   Проверить: `curl localhost:8080/healthz`. Если не отвечает — `tail -50 /tmp/mq-api.log`, запустить вручную:
+   `bash .devcontainer/start-api.sh` (или `make dev` на переднем плане). Postgres уже запущен рядом (сервис
+   `postgres` из `.devcontainer/compose.yml`, `localhost:5432`).
 3. Вкладка **Ports** (рядом с Terminal): строка *8080 — Симулятор и API*. Правый клик → **Port Visibility →
    Public**. То же из консоли: `gh codespace ports visibility 8080:public -c <имя-codespace>`
    (имя: `gh codespace list`).
