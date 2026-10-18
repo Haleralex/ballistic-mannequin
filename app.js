@@ -14,6 +14,20 @@ const BAL_LIN_K = 2500, BAL_LIN_D = 500; // N/m and N·s/m keeping the pelvis ab
 const STRENGTH = {      // joint stiffness at full tone, N·m/rad
   abdomen: 1400, chest: 1000, head: 160, uArm: 160, fArm: 90, thigh: 1600, shin: 1600, foot: 700,
 };
+// Range of motion of the ball joints, rad, per axis of the joint frame (the world axes in the rest pose), written for
+// the left side; the right side mirrors Z. X: + bends the spine and the head forward, + swings a limb backward.
+// Y: twist about the long axis. Z: + tilts toward the mannequin's left, i.e. lifts the left arm or leg sideways.
+// Adult ranges from the AAOS tables, a little wider: a limp body is stopped by ligaments just past the active range.
+const ROM = {
+  abdomen: [[-0.45, 0.9], [-0.3, 0.3], [-0.45, 0.45]],  // lumbar spine and the lower thorax
+  chest: [[-0.35, 0.6], [-0.6, 0.6], [-0.4, 0.4]],      // thoracic spine
+  head: [[-1, 0.95], [-1.3, 1.3], [-0.75, 0.75]],       // neck
+  uArm: [[-3, 1], [-1.4, 1.4], [-0.7, 2.9]],            // shoulder
+  thigh: [[-2.1, 0.55], [-0.7, 0.7], [-0.45, 0.8]],     // hip
+};
+// Ligaments, joint capsules and resting muscle keep some stiffness when the muscles are off: a limp body still
+// does not fold like a sack. A share of the full-tone stiffness, pulling toward the relaxed pose.
+const PASSIVE = 0.03;
 const WEAPONS = [
   // pen: how deep the bullet goes in tissue, m; reach: extra radius of damage around the track (temporary cavity), m
   { id: 'pistol', name: 'Пистолет 9×19', m: 0.008, v: 360, pen: 0.4, reach: 0.004 },
@@ -79,7 +93,8 @@ function partDefs() {
     limb('fArm' + S, 'uArm' + S, m(RIG.elbow, s), m(RIG.fingertip, s), 0.045, 'farm' + S, [1, 1.05, 1], 1, [-2.5, 0.05]),
     limb('thigh' + S, 'pelvis', m(RIG.hip, s), m(RIG.knee, s), 0.078, 'leg' + S, [1.07, 1.11, 1.07], 0.6),
     limb('shin' + S, 'thigh' + S, m(RIG.knee, s), m(RIG.ankle, s), 0.062, 'leg' + S, [1, 1.03, 1], 0.6, [-0.05, 2.5]),
-    { n: 'foot' + S, p: 'shin' + S, shape: 'box', hx: 0.04, hy: 0.045, hz: 0.125, c: [0.08 * s, 0.045, 0.055], j: m(RIG.ankle, s), g: 'leg' + S, hinge: [-0.8, 0.8], S: [1, 1, 1] },
+    // ankle: about 25° of dorsiflexion (toes up, −) and 50° of plantar flexion (+)
+    { n: 'foot' + S, p: 'shin' + S, shape: 'box', hx: 0.04, hy: 0.045, hz: 0.125, c: [0.08 * s, 0.045, 0.055], j: m(RIG.ankle, s), g: 'leg' + S, hinge: [-0.45, 0.9], S: [1, 1, 1] },
   );
   return defs;
 }
@@ -589,9 +604,16 @@ function buildWorld() {
       let jd;
       if (p.hinge) {
         jd = RAPIER.JointData.revolute(a1, a2, { x: 1, y: 0, z: 0 });
-        jd.limitsEnabled = true; jd.limits = p.hinge;
       } else jd = RAPIER.JointData.spherical(a1, a2);
       p.joint = world.createImpulseJoint(jd, par.body, p.body, true);
+      // limits set on the JointData are ignored for revolute joints (rapier 0.12): they go on the joint itself
+      if (p.hinge) p.joint.setLimits(...p.hinge);
+      p.rom = romOf(p.n);
+      if (p.rom) ANG.forEach((ax, i) => p.joint.rawSet.jointSetLimits(p.joint.handle, ax, ...p.rom[i]));
+      // the relaxed pose, in the same per-axis measure the motors use
+      const r0 = targetQuat(p.n, qT, true);
+      p.relax = p.hinge ? 2 * Math.atan2(r0.x, r0.w) : [r0.x, r0.y, r0.z].map(v => 2 * Math.asin(v));
+      if (p.n.startsWith('foot')) p.relax = 0.35; // a limp foot hangs toes down, about 20°
       p.k = STRENGTH[p.n.replace(/[LR]$/, '')];
       if (p.hinge) p.joint.configureMotorModel(FORCE_BASED);
       else for (const ax of ANG) p.joint.rawSet.jointConfigureMotorModel(p.joint.handle, ax, FORCE_BASED);
@@ -642,10 +664,10 @@ function layerWeight(l) {
   return l.peak * Math.max(0, 1 - (l.age - l.attack - l.hold) / l.release);
 }
 const tmpE = new THREE.Euler(), tmpQ = new THREE.Quaternion();
-function targetQuat(name, out) {
+function targetQuat(name, out, relaxed) {
   const b = BASE[name] || [0, 0, 0];
   let x = b[0], y = b[1], z = b[2];
-  for (const l of layers) {
+  if (!relaxed) for (const l of layers) {
     const v = l.pose[name]; if (!v) continue;
     const w = layerWeight(l);
     x += v[0] * w; y += v[1] * w; z += v[2] * w;
@@ -654,11 +676,18 @@ function targetQuat(name, out) {
     const S = name.slice(-1);
     x -= targetEulerX('thigh' + S) + targetEulerX('shin' + S);
   }
-  // stacked poses must never ask for more than a joint can do: past half a turn the target wraps to the other side
-  const h = byName[name]?.hinge, lim = 2.4;
-  x = h ? Math.max(h[0], Math.min(h[1], x)) : Math.max(-lim, Math.min(lim, x));
-  y = Math.max(-lim, Math.min(lim, y)); z = Math.max(-lim, Math.min(lim, z));
+  // stacked poses must never ask for more than a joint can do
+  const h = byName[name]?.hinge, rom = romOf(name), lim = 2.4, cl = (v, [lo, hi]) => Math.max(lo, Math.min(hi, v));
+  if (h) x = cl(x, h);
+  else if (rom) { x = cl(x, rom[0]); y = cl(y, rom[1]); z = cl(z, rom[2]); }
+  else { x = cl(x, [-lim, lim]); y = cl(y, [-lim, lim]); z = cl(z, [-lim, lim]); }
   return out.setFromEuler(tmpE.set(x, y, z, 'XYZ'));
+}
+// the range of motion of a ball joint, mirrored for the right side; null for hinges and the pelvis
+function romOf(name) {
+  const r = ROM[name.replace(/[LR]$/, '')];
+  if (!r || !/[LR]$/.test(name)) return r || null;
+  return name.endsWith('R') ? [r[0], r[1], [-r[2][1], -r[2][0]]] : r;
 }
 function targetEulerX(name) {
   let x = (BASE[name] || [0])[0];
@@ -680,15 +709,18 @@ function muscles(dt) {
   for (const p of parts) {
     p.tone += (p.toneTarget - p.tone) * Math.min(1, p.toneRate * dt);
     if (!p.p) continue;
-    const k = p.k * p.tone * character.vigor * dip;
-    const d = p.k * (0.12 * p.tone + 0.006); // a little passive damping remains when limp
+    const k = p.k * p.tone * character.vigor * dip, kp = p.k * PASSIVE;
+    const d = p.k * (0.12 * p.tone + 0.012); // ligaments and soft tissue damp a limp joint too
     if (ph) qT.copy(ph.animQ[p.p]).invert().multiply(ph.animQ[p.n]); // stumbling at a run: the muscles chase the clip
     else targetQuat(p.n, qT);
     if (qT.w < 0) qT.set(-qT.x, -qT.y, -qT.z, -qT.w);
-    if (p.hinge) p.joint.configureMotorPosition(2 * Math.atan2(qT.x, qT.w), k, d);
+    // two springs on one axis, the muscle toward its target and the passive tissue toward the relaxed pose, act as
+    // one spring of their summed stiffness toward the weighted mean of the targets
+    const mix = (t, r) => (k * t + kp * r) / (k + kp);
+    if (p.hinge) p.joint.configureMotorPosition(mix(2 * Math.atan2(qT.x, qT.w), p.relax), k + kp, d);
     else {
       const v = [qT.x, qT.y, qT.z];
-      for (let i = 0; i < 3; i++) motorAxis(p.joint, ANG[i], 2 * Math.asin(Math.max(-1, Math.min(1, v[i]))), k, d);
+      for (let i = 0; i < 3; i++) motorAxis(p.joint, ANG[i], mix(2 * Math.asin(Math.max(-1, Math.min(1, v[i]))), p.relax[i]), k + kp, d);
     }
   }
   // Upright assist: a motorized joint between the world and the pelvis stands in for balance reflexes.
