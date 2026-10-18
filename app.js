@@ -828,7 +828,7 @@ function updateLife() {
   const c = character, l = c.life;
   if (!l || !c.conscious) return;
   const f = c.lost / BLOOD_VOLUME, hurt = c.state === 'ok' ? 0 : 1, t = simTime;
-  c.breath += (0.23 + 0.35 * Math.min(1, f / 0.3) + 0.12 * hurt + 0.4 * c.breathBoost) * Math.PI * 2 * DT;
+  c.breath += (Math.max(0.1, circ().rr / 60) + 0.12 * hurt + 0.4 * c.breathBoost) * Math.PI * 2 * DT; // the rate the circulation model breathes at
   const b = Math.sin(c.breath), amp = (1 + 1.5 * Math.min(1, f / 0.3) + 0.8 * hurt) * (1 + 1.5 * c.breathBoost);
   const tr = c.tremble;
   const n = (i, f1, f2) => (Math.sin(t * f1 + c.ph[i]) * 0.6 + Math.sin(t * f2 + c.ph[i] * 1.7) * 0.4) * c.lifeDamp;
@@ -1061,8 +1061,8 @@ const ACTIONS = {
   },
   faint(b) {
     // only physiology decides: the script may ask, the blood and the heart answer
-    const c = character, f = c.lost / BLOOD_VOLUME;
-    if (!(f > 0.25 || (c.arrestAt !== null && c.physT > c.arrestAt - 3))) return null;
+    const c = character, f = c.lost / BLOOD_VOLUME, eta = forecastLOC(3);
+    if (!(f > 0.25 || circ().reserve < 0.5 || eta !== null)) return null;
     collapse(false);
     return {};
   },
@@ -1134,7 +1134,7 @@ function incidentReport(hits, nearMiss) {
   const c = character, f = c.lost / BLOOD_VOLUME;
   // fresh wounds have not bled yet this step: use their starting rates
   const bleed = c.wounds.reduce((sum, w) => sum + (w.now || w.rate), 0);
-  const etaLoc = c.arrestAt !== null ? Math.max(0, c.arrestAt - c.physT) : bleed > 0.05 ? (0.38 * BLOOD_VOLUME - c.lost) / bleed : null;
+  const etaLoc = forecastLOC(); // never cached: the library's tempo reads it, so it must be the same on replay
   const legsBroken = ['L', 'R'].filter(S => (c.cap['thigh' + S] ?? 1) <= 0.05 && (c.cap['thigh' + S] ?? 1) > 0);
   return {
     weapon: weapon.name,
@@ -1287,7 +1287,7 @@ function incidentKind(hits) {
   const w = hits[0].w, t = w.part.n.replace(/[LR]$/, '');
   if (t === 'head') return w.zone === 'шея' ? 'neck' : 'head-graze';
   if (t === 'pelvis') return w.bone ? 'pelvis' : 'pelvis-soft';
-  if (t === 'thigh' || t === 'shin' || t === 'foot') return w.bone ? 'leg-bone' : 'leg';
+  if (t === 'thigh' || t === 'shin' || t === 'foot') return w.bone || w.nerve === 'leg' ? 'leg-bone' : 'leg';
   if (t === 'uArm' || t === 'fArm') return 'arm';
   return t; // chest | abdomen
 }
@@ -1472,14 +1472,19 @@ function react(zone, side, hitDir, w) {
   if (!c.conscious) return { text: 'Тело уже без мышечного контроля: только пассивное движение от импульса.' };
   if (c.state === 'ok') setState('wounded');
   if (zone === 'head') {
-    if (w.brain || w.cervical) {
+    if (w.brain || w.brainstem || w.cervical) {
       collapse(true);
-      return { text: w.brain
+      return { text: w.brainstem
+        ? 'Поражён ствол мозга: мгновенная потеря сознания, дыхание останавливается. Тело оседает сразу.'
+        : w.brain
         ? 'Поражён мозг: мгновенная потеря мышечного контроля. Тело оседает под собственным весом; куда оно упадёт, решает поза, а не пуля.'
         : 'Перебит спинной мозг в шее: мгновенный паралич всего тела, тело оседает.' };
     }
     flinch(jitter(0.8, 0.2), side, fromFront); startle(0.8, side);
-    if (w.organs.length) return { text: 'Ранение шеи без повреждения спинного мозга: человек в сознании, главная угроза — кровотечение.' };
+    if (w.airway) return { text: 'Ранены гортань или трахея: человек в сознании, кашляет кровью, дышать трудно. Голос пропадает.' };
+    if (w.organs.some(o => o.carotid)) return { text: 'Перебита сонная артерия: человек в сознании, но счёт идёт на десятки секунд — давление и приток крови к мозгу падают.' };
+    if (w.organs.length && w.zone === 'шея') return { text: 'Ранение шеи без повреждения спинного мозга: человек в сознании, главная угроза — кровотечение.' };
+    if (w.organs.length) return { text: 'Ранение лица: много крови и боли, но мозг не задет. Человек в сознании.' };
     return { text: 'Касательное ранение: пуля прошла по черепу, не задев мозг. Человек оглушён, но в сознании.' };
   }
   if ((zone === 'chest' || zone === 'abdomen') && w.spine) {
@@ -1525,13 +1530,14 @@ function react(zone, side, hitDir, w) {
     tone(LEG(S), 0.12, 10);
     c.balanceTarget = Math.min(c.balanceTarget, 0.6); c.balanceRate = 3;
     if (c.kneel) return { text: 'Ещё одно попадание в ногу: тело остаётся на колене.' };
-    if (w.bone && running) { // at a run there is no lowering onto a knee: the leg folds and momentum throws the body forward
+    const nerve = !w.bone && w.nerve === 'leg', broken = w.bone || nerve; // a cut sciatic nerve takes the leg like a fracture
+    if (broken && running) { // at a run there is no lowering onto a knee: the leg folds and momentum throws the body forward
       capTone(LEG(S), 0.05);
       tone(LEG(S), 0.05, 10);
       c.balanceTarget = 0; c.balanceRate = 2.5; c.noLift = true;
-      return { text: 'Перелом на бегу: нога подламывается, и тело по инерции летит вперёд на землю.' };
+      return { text: nerve ? 'Перебит седалищный нерв на бегу: нога перестаёт слушаться, и тело по инерции летит вперёд.' : 'Перелом на бегу: нога подламывается, и тело по инерции летит вперёд на землю.' };
     }
-    if (w.bone) {
+    if (broken) {
       c.kneel = S;
       capTone(LEG(S), 0.05);
       tone(LEG(S), 0.05, 10);
@@ -1540,7 +1546,8 @@ function react(zone, side, hitDir, w) {
         ['thigh' + S]: [0.05, 0, 0], ['shin' + S]: [1.45, 0, 0],
         ['thigh' + H]: [-1.35, 0, 0], ['shin' + H]: [1.45, 0, 0], chest: [0.15, 0, 0],
       }, { attack: 0.7, hold: Infinity, tag: 'kneel' });
-      return { text: 'Перелом: нога не держит вес. Тело опускается на колено раненой ноги и удерживает корпус.' };
+      return { text: nerve ? 'Перебит седалищный нерв: мышцы голени и задней поверхности бедра парализованы, нога подламывается. Тело опускается на колено.'
+        : 'Перелом: нога не держит вес. Тело опускается на колено раненой ноги и удерживает корпус.' };
     }
     const buckle = addLayer({ ['thigh' + S]: [-0.35, 0, 0], ['shin' + S]: [1.3, 0, 0] }, { attack: 0.25, hold: Infinity, tag: 'buckle' });
     at(1.8, () => { if (c.conscious && c.state !== 'down' && !c.seated) { tone(LEG(S), 0.45, 2); buckle.hold = buckle.age - buckle.attack; buckle.release = 0.8; } });
@@ -1548,11 +1555,14 @@ function react(zone, side, hitDir, w) {
   }
   if (zone.startsWith('uArm') || zone.startsWith('fArm')) {
     const S = zone.slice(-1);
-    if (w.bone) capTone(ARM(S), 0.03);
-    tone(ARM(S), w.bone ? 0.03 : 0.35, 12);
+    const nerve = !w.bone && w.nerve === 'arm', limp = w.bone || nerve;
+    if (limp) capTone(ARM(S), 0.03);
+    tone(ARM(S), limp ? 0.03 : 0.35, 12);
     flinch(jitter(0.35, 0.3), side, fromFront);
     addLayer({ chest: [0.1, S === 'L' ? 0.3 : -0.3, 0], head: [0, S === 'L' ? 0.5 : -0.5, 0] }, { attack: 0.1, hold: 0.4, release: 1 });
-    return { text: w.bone ? 'Перелом: рука повисает, корпус вздрагивает и поворачивается к ране.' : 'Кость цела: рука работает, но слабо. Корпус вздрагивает и поворачивается к ране.' };
+    return { text: w.bone ? 'Перелом: рука повисает, корпус вздрагивает и поворачивается к ране.'
+      : nerve ? 'Перебиты нервы плеча: кость цела, но рука парализована и повисает. Корпус вздрагивает и поворачивается к ране.'
+      : 'Кость цела: рука работает, но слабо. Корпус вздрагивает и поворачивается к ране.' };
   }
   return { text: '' };
 }
@@ -1604,11 +1614,11 @@ function spreadDir(base, half) {
 // how bad a wound is, to pick the reaction that leads when several land at once
 function severity(w) {
   const t = w.part.n.replace(/[LR]$/, '');
-  if (w.brain || w.cervical) return 100;
+  if (w.brain || w.brainstem || w.cervical) return 100;
   if (w.spine) return 90;
   if (w.arrest) return 80;
   if (t === 'pelvis' && w.bone) return 70;
-  if ((t === 'thigh' || t === 'shin') && w.bone) return 60;
+  if ((t === 'thigh' || t === 'shin') && (w.bone || w.nerve === 'leg')) return 60;
   if (t === 'chest' || t === 'abdomen') return 50 + Math.min(9, w.rate / 5);
   if (t === 'head') return 45;
   return 10 + Math.min(9, w.rate);
@@ -1677,7 +1687,13 @@ function shootRay(origin, direction) {
     if (n > 1) log('hit', `Картечь ${wounds.length}/${n}`, text,
       `Попали в: ${wounds.map(x => `${x.w.zone} (${x.w.name})`).join('; ')}. Кровотечение ~${fmtRate(totalRate)}. Δv тела ${(delivered / totalMass * 100).toFixed(1)} см/с`);
     else log('hit', lead.w.zone, text, `Канал${lead.w.perforating ? ' сквозной' : ', пуля осталась в теле'}: ${lead.w.name}. Кровотечение ~${fmtRate(lead.w.rate)}. Δv тела ${(delivered / totalMass * 100).toFixed(1)} см/с`);
-    if (wounds.some(x => x.w.arrest) && character.conscious) log('info', 'Кровообращение', `Сердце или аорта: давление падает сразу, сознание уйдёт примерно через ${(character.arrestAt - character.physT).toFixed(0)} с.`);
+    if (character.conscious) {
+      const eta = forecastLOC();
+      if (wounds.some(x => x.w.arrest)) log('info', 'Кровообращение', `Сердце или крупный сосуд у сердца: давление падает сразу${eta !== null ? `, сознание уйдёт примерно через ${eta.toFixed(0)} с` : ''}.`);
+      else if (wounds.some(x => x.w.organs.some(o => o.carotid))) log('info', 'Кровообращение', `Сонная артерия: мозг теряет часть притока, кровь бьёт струёй${eta !== null ? `; сознание уйдёт примерно через ${eta.toFixed(0)} с` : ''}.`);
+      if (wounds.some(x => x.w.lung)) log('info', 'Дыхание', 'Ранено лёгкое: воздух и кровь попадают в плевральную полость, лёгкое спадается. Дыхание учащается, кислород в крови падает.');
+      if (wounds.some(x => x.w.airway)) log('info', 'Дыхание', 'Ранены дыхательные пути: кровь затекает в трахею, дышать всё труднее.');
+    }
     runHit(wounds);
     if (delivered / totalMass > 0.4 && character.balanceTarget > 0) { // only a movie-sized push can knock the body off balance
       character.balanceTarget = 0; character.balanceRate = 30;
@@ -1756,9 +1772,13 @@ function dust(pt, count = 10) {
 // ---------- blood loss ----------
 // ---------- anatomy ----------
 // Organs in each segment's own frame (rest pose: the mannequin faces +Z, its left is +X).
-// An organ is an ellipsoid (c, r) or a capsule (a, b, r). rate: bleeding in ml/s (order of magnitude),
-// ext: share of that blood that leaves the body, clot: time constant (s) over which it slows by itself.
-const ORGAN_COLOR = { heart: '#a3122a', lung: '#e3a0a8', liver: '#7a3b1e', spleen: '#6b2d5c', kidney: '#a14c3c', artery: '#d32030', vein: '#3b4fa3', bone: '#e6dcc2', nerve: '#f0cf62', brain: '#e8b7ae', bowel: '#d9a37b', bladder: '#d8bf5c' };
+// An organ is an ellipsoid (c, r) or a capsule (a, b, r). rate: bleeding in ml/s at normal pressure (order of
+// magnitude), ext: share of that blood that leaves the body, clot: time constant (s) over which it slows by itself
+// (none: a large artery does not stop on its own). kind: what pressure drives the bleeding — 'art' arterial,
+// 'ven' venous, 'cap' small vessels of a tissue (arterial pressure), 'mix' a solid organ that bleeds from both sides.
+// pleura: the side of the chest that internal blood fills. shell: a hollow layer (the rib cage) that a track
+// crosses with probability cover.
+const ORGAN_COLOR = { heart: '#a3122a', lung: '#e3a0a8', liver: '#7a3b1e', spleen: '#6b2d5c', kidney: '#a14c3c', artery: '#d32030', vein: '#3b4fa3', bone: '#e6dcc2', nerve: '#f0cf62', brain: '#e8b7ae', brainstem: '#c98a80', bowel: '#d9a37b', bladder: '#d8bf5c', airway: '#9ccbd4', stomach: '#cf8c7c', pancreas: '#dcb36e' };
 const TISSUE = { head: ['кожа и кость черепа', [1, 3]], chest: ['грудная стенка', [0.5, 1.5]], abdomen: ['брюшная стенка', [0.5, 2]], pelvis: ['мягкие ткани таза', [0.5, 2]], thigh: ['мышцы бедра', [0.8, 2.5]], shin: ['мягкие ткани голени', [0.4, 1.2]], foot: ['мягкие ткани стопы', [0.3, 0.8]], uArm: ['мышцы плеча', [0.5, 1.5]], fArm: ['мягкие ткани предплечья', [0.3, 1]] };
 function organsFor(p) {
   const S = p.S || [1, 1, 1];
@@ -1776,58 +1796,88 @@ function organLayout(p) {
   const side = (L, R) => s > 0 ? L : R;
   switch (p.n.replace(/[LR]$/, '')) {
     case 'head': return [
-      E('головной мозг', 'brain', [0, 0.012, -0.005], [0.08, 0.075, 0.088], { cns: 'brain', rate: [2, 5], ext: 0.6 }),
-      C('спинной мозг, шея', 'nerve', [0, -0.07, -0.035], [0, -0.19, -0.035], 0.012, { cns: 'cervical', rate: [0.5, 1], ext: 0.5 }),
-      C('левая сонная артерия', 'artery', [0.025, -0.07, 0.015], [0.025, -0.19, 0.015], 0.008, { rate: [30, 50], ext: 0.9 }),
-      C('правая сонная артерия', 'artery', [-0.025, -0.07, 0.015], [-0.025, -0.19, 0.015], 0.008, { rate: [30, 50], ext: 0.9 }),
-      C('левая яремная вена', 'vein', [0.04, -0.07, 0], [0.04, -0.19, 0], 0.008, { rate: [8, 15], ext: 0.9 }),
-      C('правая яремная вена', 'vein', [-0.04, -0.07, 0], [-0.04, -0.19, 0], 0.008, { rate: [8, 15], ext: 0.9 }),
+      E('большие полушария мозга', 'brain', [0, 0.025, -0.002], [0.078, 0.062, 0.086], { cns: 'brain', rate: [2, 5], ext: 0.6, kind: 'mix', clot: 600 }),
+      E('мозжечок', 'brain', [0, -0.04, -0.06], [0.05, 0.025, 0.03], { cns: 'brain', rate: [1, 3], ext: 0.5, kind: 'mix', clot: 600 }),
+      C('ствол мозга', 'brainstem', [0, -0.012, -0.022], [0, -0.07, -0.035], 0.014, { cns: 'brainstem', rate: [0.5, 2], ext: 0.4, kind: 'mix', clot: 600 }),
+      E('лицевые кости и челюсть', 'bone', [0, -0.045, 0.065], [0.05, 0.04, 0.035], { rate: [2, 5], ext: 0.95, kind: 'cap', clot: 240 }),
+      C('спинной мозг, шея', 'nerve', [0, -0.07, -0.035], [0, -0.19, -0.035], 0.012, { cns: 'cervical', rate: [0.5, 1], ext: 0.5, kind: 'cap', clot: 300 }),
+      C('гортань и трахея', 'airway', [0, -0.085, 0.04], [0, -0.19, 0.03], 0.011, { airway: true, rate: [1, 3], ext: 0.7, kind: 'cap', clot: 180 }),
+      C('пищевод', 'bowel', [0, -0.085, 0.012], [0, -0.19, 0.008], 0.007, { rate: [0.5, 1.5], ext: 0.5, kind: 'cap', clot: 300 }),
+      C('левая сонная артерия', 'artery', [0.025, -0.07, 0.015], [0.025, -0.19, 0.015], 0.008, { carotid: true, rate: [30, 50], ext: 0.9, kind: 'art' }),
+      C('правая сонная артерия', 'artery', [-0.025, -0.07, 0.015], [-0.025, -0.19, 0.015], 0.008, { carotid: true, rate: [30, 50], ext: 0.9, kind: 'art' }),
+      C('левая яремная вена', 'vein', [0.04, -0.07, 0], [0.04, -0.19, 0], 0.008, { rate: [8, 15], ext: 0.9, kind: 'ven', clot: 240 }),
+      C('правая яремная вена', 'vein', [-0.04, -0.07, 0], [-0.04, -0.19, 0], 0.008, { rate: [8, 15], ext: 0.9, kind: 'ven', clot: 240 }),
     ];
     case 'chest': return [
-      E('сердце', 'heart', [0.03, -0.03, 0.035], [0.05, 0.06, 0.045], { arrest: true, rate: [80, 140], ext: 0.3 }),
-      C('грудная аорта', 'artery', [0.0, 0.07, 0.0], [-0.005, -0.13, -0.07], 0.016, { arrest: true, rate: [80, 140], ext: 0.2 }),
-      E('левое лёгкое', 'lung', [0.1, 0.01, -0.005], [0.07, 0.1, 0.09], { rate: [4, 12], ext: 0.2 }),
-      E('правое лёгкое', 'lung', [-0.095, 0.01, -0.005], [0.075, 0.1, 0.09], { rate: [4, 12], ext: 0.2 }),
-      C('грудной отдел позвоночника', 'bone', [0, 0.13, -0.1], [0, -0.13, -0.1], 0.022, { cns: 'spine', rate: [0.5, 1.5], ext: 0.3 }),
+      E('сердце', 'heart', [0.03, -0.03, 0.035], [0.05, 0.06, 0.045], { arrest: true, heart: true, rate: [80, 140], ext: 0.3, kind: 'art', pleura: 'L' }),
+      C('грудная аорта', 'artery', [0.0, 0.07, 0.0], [0.02, -0.13, -0.07], 0.016, { arrest: true, rate: [100, 160], ext: 0.2, kind: 'art', pleura: 'L' }),
+      C('лёгочный ствол', 'artery', [0.015, -0.005, 0.05], [0.0, 0.06, 0.01], 0.013, { arrest: true, rate: [60, 110], ext: 0.2, kind: 'art', pleura: 'L' }),
+      C('верхняя полая вена', 'vein', [-0.03, 0.1, 0.0], [-0.03, 0.0, 0.02], 0.011, { rate: [20, 40], ext: 0.2, kind: 'ven', pleura: 'R' }),
+      C('левая подключичная артерия', 'artery', [0.015, 0.085, -0.01], [0.17, 0.06, -0.025], 0.008, { rate: [20, 35], ext: 0.5, kind: 'art', pleura: 'L' }),
+      C('правая подключичная артерия', 'artery', [-0.015, 0.085, 0.0], [-0.17, 0.06, -0.025], 0.008, { rate: [20, 35], ext: 0.5, kind: 'art', pleura: 'R' }),
+      C('левая подключичная вена', 'vein', [0.03, 0.07, 0.03], [0.17, 0.05, 0.0], 0.009, { rate: [8, 18], ext: 0.6, kind: 'ven', clot: 300, pleura: 'L' }),
+      C('правая подключичная вена', 'vein', [-0.03, 0.07, 0.03], [-0.17, 0.05, 0.0], 0.009, { rate: [8, 18], ext: 0.6, kind: 'ven', clot: 300, pleura: 'R' }),
+      C('трахея и главные бронхи', 'airway', [0, 0.13, -0.02], [0, 0.0, -0.025], 0.011, { airway: true, rate: [1, 3], ext: 0.3, kind: 'cap', clot: 180 }),
+      E('левое лёгкое', 'lung', [0.1, 0.01, -0.005], [0.07, 0.1, 0.09], { lung: 'L', rate: [4, 12], ext: 0.2, kind: 'mix', clot: 240, pleura: 'L' }),
+      E('правое лёгкое', 'lung', [-0.095, 0.01, -0.005], [0.075, 0.1, 0.09], { lung: 'R', rate: [4, 12], ext: 0.2, kind: 'mix', clot: 240, pleura: 'R' }),
+      C('грудной отдел позвоночника', 'bone', [0, 0.13, -0.1], [0, -0.13, -0.1], 0.022, { cns: 'spine', rate: [0.5, 1.5], ext: 0.3, kind: 'cap', clot: 300 }),
+      // a track through the chest wall meets a rib about half the time; the intercostal artery runs along it
+      E('ребро', 'bone', [0, -0.005, -0.005], [0.18, 0.13, 0.115], { shell: 0.02, cover: 0.45, rate: [1, 3], ext: 0.5, kind: 'art', clot: 200 }),
     ];
     case 'abdomen': return [
-      E('печень', 'liver', [-0.05, 0.07, 0.02], [0.08, 0.05, 0.07], { rate: [15, 35], ext: 0.15 }),
-      E('селезёнка', 'spleen', [0.07, 0.07, -0.03], [0.035, 0.04, 0.035], { rate: [10, 25], ext: 0.1 }),
-      E('левая почка', 'kidney', [0.055, 0, -0.07], [0.025, 0.04, 0.025], { rate: [5, 15], ext: 0.1 }),
-      E('правая почка', 'kidney', [-0.055, -0.01, -0.07], [0.025, 0.04, 0.025], { rate: [5, 15], ext: 0.1 }),
-      C('брюшная аорта', 'artery', [0.012, 0.16, -0.055], [0.012, -0.14, -0.055], 0.013, { rate: [40, 80], ext: 0.1 }),
-      C('нижняя полая вена', 'vein', [-0.016, 0.16, -0.05], [-0.016, -0.14, -0.05], 0.013, { rate: [20, 40], ext: 0.1 }),
-      C('поясничный отдел позвоночника', 'bone', [0, 0.16, -0.095], [0, -0.16, -0.095], 0.024, { cns: 'spine', rate: [0.5, 1.5], ext: 0.3 }),
-      E('кишечник', 'bowel', [0, -0.03, 0.04], [0.1, 0.08, 0.07], { rate: [1, 4], ext: 0.2, clot: 300 }),
+      E('печень', 'liver', [-0.05, 0.07, 0.02], [0.08, 0.05, 0.07], { rate: [5, 15], ext: 0.15, kind: 'mix', clot: 500 }),
+      E('селезёнка', 'spleen', [0.07, 0.07, -0.03], [0.035, 0.04, 0.035], { rate: [5, 15], ext: 0.1, kind: 'mix', clot: 400 }),
+      E('желудок', 'stomach', [0.045, 0.075, 0.05], [0.05, 0.04, 0.035], { rate: [2, 6], ext: 0.1, kind: 'cap', clot: 300 }),
+      C('поджелудочная железа', 'pancreas', [-0.04, 0.045, -0.03], [0.07, 0.065, -0.035], 0.014, { rate: [3, 8], ext: 0.05, kind: 'mix', clot: 400 }),
+      E('левая почка', 'kidney', [0.055, 0, -0.07], [0.025, 0.04, 0.025], { rate: [5, 15], ext: 0.1, kind: 'mix', clot: 300 }),
+      E('правая почка', 'kidney', [-0.055, -0.01, -0.07], [0.025, 0.04, 0.025], { rate: [5, 15], ext: 0.1, kind: 'mix', clot: 300 }),
+      C('брюшная аорта', 'artery', [0.012, 0.16, -0.055], [0.012, -0.14, -0.055], 0.013, { rate: [40, 80], ext: 0.1, kind: 'art' }),
+      C('нижняя полая вена', 'vein', [-0.016, 0.16, -0.05], [-0.016, -0.14, -0.05], 0.013, { rate: [20, 40], ext: 0.1, kind: 'ven' }),
+      C('брыжеечные сосуды', 'artery', [0.005, 0.07, -0.045], [-0.01, -0.07, 0.03], 0.007, { rate: [10, 25], ext: 0.05, kind: 'art', clot: 400 }),
+      C('поясничный отдел позвоночника', 'bone', [0, 0.16, -0.095], [0, -0.16, -0.095], 0.024, { cns: 'spine', rate: [0.5, 1.5], ext: 0.3, kind: 'cap', clot: 300 }),
+      E('кишечник', 'bowel', [0, -0.03, 0.04], [0.1, 0.08, 0.07], { rate: [1, 4], ext: 0.2, kind: 'cap', clot: 300 }),
     ];
     case 'pelvis': return [
-      E('левая подвздошная кость', 'bone', [0.12, 0.04, -0.02], [0.04, 0.07, 0.08], { bone: true, rate: [1, 3], ext: 0.5, clot: 300 }),
-      E('правая подвздошная кость', 'bone', [-0.12, 0.04, -0.02], [0.04, 0.07, 0.08], { bone: true, rate: [1, 3], ext: 0.5, clot: 300 }),
-      E('крестец', 'bone', [0, 0, -0.09], [0.05, 0.07, 0.03], { bone: true, rate: [1, 3], ext: 0.4, clot: 300 }),
-      C('левая подвздошная артерия', 'artery', [0.01, 0.09, -0.05], [0.09, -0.08, 0.04], 0.011, { rate: [15, 30], ext: 0.3 }),
-      C('правая подвздошная артерия', 'artery', [-0.01, 0.09, -0.05], [-0.09, -0.08, 0.04], 0.011, { rate: [15, 30], ext: 0.3 }),
-      E('мочевой пузырь', 'bladder', [0, -0.05, 0.06], [0.035, 0.035, 0.035], { rate: [1, 3], ext: 0.2, clot: 300 }),
+      E('левая подвздошная кость', 'bone', [0.12, 0.04, -0.02], [0.04, 0.07, 0.08], { bone: true, rate: [1, 3], ext: 0.5, kind: 'cap', clot: 300 }),
+      E('правая подвздошная кость', 'bone', [-0.12, 0.04, -0.02], [0.04, 0.07, 0.08], { bone: true, rate: [1, 3], ext: 0.5, kind: 'cap', clot: 300 }),
+      E('крестец', 'bone', [0, 0, -0.09], [0.05, 0.07, 0.03], { bone: true, rate: [1, 3], ext: 0.4, kind: 'cap', clot: 300 }),
+      C('левая подвздошная артерия', 'artery', [0.01, 0.09, -0.05], [0.09, -0.08, 0.04], 0.011, { rate: [15, 30], ext: 0.3, kind: 'art' }),
+      C('правая подвздошная артерия', 'artery', [-0.01, 0.09, -0.05], [-0.09, -0.08, 0.04], 0.011, { rate: [15, 30], ext: 0.3, kind: 'art' }),
+      C('левая подвздошная вена', 'vein', [0.0, 0.09, -0.065], [0.08, -0.08, 0.025], 0.012, { rate: [10, 25], ext: 0.3, kind: 'ven', clot: 600 }),
+      C('правая подвздошная вена', 'vein', [-0.02, 0.09, -0.065], [-0.08, -0.08, 0.025], 0.012, { rate: [10, 25], ext: 0.3, kind: 'ven', clot: 600 }),
+      E('мочевой пузырь', 'bladder', [0, -0.05, 0.06], [0.035, 0.035, 0.035], { rate: [1, 3], ext: 0.2, kind: 'cap', clot: 300 }),
+      C('прямая кишка', 'bowel', [0, 0.02, -0.06], [0, -0.08, -0.035], 0.015, { rate: [1, 3], ext: 0.3, kind: 'cap', clot: 300 }),
     ];
     case 'thigh': return [
-      C('бедренная кость', 'bone', [0, 0.18, 0], [0, -0.19, 0], 0.017, { bone: true, rate: [1, 3], ext: 0.9, clot: 300 }),
-      C('бедренная артерия', 'artery', [-0.025 * s, 0.17, 0.035], [-0.035 * s, -0.12, -0.01], 0.011, { rate: [15, 25], ext: 0.95 }),
-      C('подколенная артерия', 'artery', [-0.035 * s, -0.12, -0.01], [0, -0.19, -0.03], 0.009, { rate: [8, 15], ext: 0.95 }),
+      C('бедренная кость', 'bone', [0, 0.18, 0], [0, -0.19, 0], 0.017, { bone: true, rate: [1, 3], ext: 0.9, kind: 'cap', clot: 300 }),
+      C('бедренная артерия', 'artery', [-0.025 * s, 0.17, 0.035], [-0.035 * s, -0.12, -0.01], 0.011, { rate: [15, 25], ext: 0.95, kind: 'art' }),
+      C('бедренная вена', 'vein', [-0.04 * s, 0.17, 0.03], [-0.045 * s, -0.12, -0.02], 0.011, { rate: [6, 12], ext: 0.95, kind: 'ven', clot: 300 }),
+      C('глубокая артерия бедра', 'artery', [-0.02 * s, 0.12, 0.025], [-0.005 * s, -0.08, -0.025], 0.008, { rate: [8, 15], ext: 0.9, kind: 'art', clot: 400 }),
+      C('подколенная артерия', 'artery', [-0.035 * s, -0.12, -0.01], [0, -0.19, -0.03], 0.009, { rate: [8, 15], ext: 0.95, kind: 'art', clot: 400 }),
+      C('седалищный нерв', 'nerve', [0, 0.18, -0.045], [0, -0.15, -0.045], 0.008, { nerve: 'leg', rate: [0.3, 1], ext: 0.9, kind: 'cap', clot: 200 }),
     ];
     case 'shin': return [
-      C('большеберцовая кость', 'bone', [0, 0.19, 0.015], [0, -0.19, 0.015], 0.014, { bone: true, rate: [0.5, 1.5], ext: 0.9, clot: 200 }),
-      C('большеберцовая артерия', 'artery', [0, 0.18, -0.02], [0, -0.15, -0.02], 0.007, { rate: [3, 6], ext: 0.95 }),
+      C('большеберцовая кость', 'bone', [0, 0.19, 0.015], [0, -0.19, 0.015], 0.014, { bone: true, rate: [0.5, 1.5], ext: 0.9, kind: 'cap', clot: 200 }),
+      // the fibula carries little weight: broken alone it does not take the leg away
+      C('малоберцовая кость', 'bone', [0.028 * s, 0.18, -0.005], [0.028 * s, -0.19, -0.005], 0.008, { rate: [0.3, 1], ext: 0.9, kind: 'cap', clot: 200 }),
+      C('передняя большеберцовая артерия', 'artery', [0.012 * s, 0.17, 0], [0.008 * s, -0.17, 0.025], 0.005, { rate: [2, 4], ext: 0.95, kind: 'art', clot: 120 }),
+      C('задняя большеберцовая артерия', 'artery', [-0.01 * s, 0.17, -0.03], [-0.015 * s, -0.17, -0.025], 0.006, { rate: [3, 6], ext: 0.95, kind: 'art', clot: 150 }),
     ];
     case 'foot': return [
-      E('кости стопы', 'bone', [0, 0, 0], [0.04, 0.025, 0.1], { bone: true, rate: [0.3, 0.8], ext: 0.9, clot: 120 }),
+      E('кости стопы', 'bone', [0, 0, 0], [0.04, 0.025, 0.1], { bone: true, rate: [0.3, 0.8], ext: 0.9, kind: 'cap', clot: 120 }),
     ];
     case 'uArm': return [
-      C('плечевая кость', 'bone', [0, 0.15, 0], [0, -0.15, 0], 0.012, { bone: true, rate: [0.5, 1.5], ext: 0.9, clot: 200 }),
-      C('плечевая артерия', 'artery', [-0.025 * s, 0.14, 0.012], [-0.02 * s, -0.16, 0.02], 0.007, { rate: [6, 12], ext: 0.95 }),
+      C('плечевая кость', 'bone', [0, 0.15, 0], [0, -0.15, 0], 0.012, { bone: true, rate: [0.5, 1.5], ext: 0.9, kind: 'cap', clot: 200 }),
+      C('плечевая артерия', 'artery', [-0.025 * s, 0.14, 0.012], [-0.02 * s, -0.16, 0.02], 0.007, { rate: [6, 12], ext: 0.95, kind: 'art', clot: 180 }),
+      C('плечевая вена', 'vein', [-0.032 * s, 0.14, 0.005], [-0.027 * s, -0.16, 0.012], 0.006, { rate: [2, 5], ext: 0.95, kind: 'ven', clot: 200 }),
+      C('нервы плеча: срединный, локтевой, лучевой', 'nerve', [-0.018 * s, 0.14, -0.008], [-0.012 * s, -0.15, -0.004], 0.007, { nerve: 'arm', rate: [0.2, 0.6], ext: 0.9, kind: 'cap', clot: 200 }),
     ];
     case 'fArm': return [
-      C('кости предплечья', 'bone', [0, 0.21, 0], [0, -0.02, 0], 0.012, { bone: true, rate: [0.3, 1], ext: 0.9, clot: 200 }),
-      C(side('артерии левого предплечья', 'артерии правого предплечья'), 'artery', [0, 0.2, 0.02], [0, -0.02, 0.025], 0.006, { rate: [3, 6], ext: 0.95 }),
-      E('кости кисти', 'bone', [0, -0.12, 0.01], [0.018, 0.06, 0.04], { bone: true, rate: [0.3, 0.8], ext: 0.9, clot: 120 }),
+      C('кости предплечья', 'bone', [0, 0.21, 0], [0, -0.02, 0], 0.012, { bone: true, rate: [0.3, 1], ext: 0.9, kind: 'cap', clot: 200 }),
+      // the arm hangs with the thumb forward: the radial artery runs on the front, the ulnar on the back
+      C(side('левая лучевая артерия', 'правая лучевая артерия'), 'artery', [0.004 * s, 0.2, 0.02], [0.004 * s, -0.02, 0.026], 0.005, { rate: [2, 4], ext: 0.95, kind: 'art', clot: 90 }),
+      C(side('левая локтевая артерия', 'правая локтевая артерия'), 'artery', [-0.004 * s, 0.2, -0.016], [-0.004 * s, -0.02, -0.012], 0.005, { rate: [2, 4], ext: 0.95, kind: 'art', clot: 90 }),
+      E('кости кисти', 'bone', [0, -0.12, 0.01], [0.018, 0.06, 0.04], { bone: true, rate: [0.3, 0.8], ext: 0.9, kind: 'cap', clot: 120 }),
     ];
   }
   return [];
@@ -1835,7 +1885,24 @@ function organLayout(p) {
 function organMesh(o) {
   const mat = new THREE.MeshStandardMaterial({ color: ORGAN_COLOR[o.type], roughness: 0.55, flatShading: true });
   let m;
-  if (o.c) { m = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 1), mat); m.scale.set(...o.r); m.position.copy(o.c); }
+  if (o.shell) {
+    // the rib cage is drawn as hoops, one mesh, so the organs inside stay visible in x-ray
+    const pos = [], idx = [], mx = new THREE.Matrix4();
+    for (let i = 0; i < 6; i++) {
+      const y = -0.8 + i * 0.32, k = Math.sqrt(1 - y * y);
+      const g = new THREE.TorusGeometry(1, 0.035, 4, 28).rotateX(Math.PI / 2)
+        .applyMatrix4(mx.makeScale(o.r[0] * k, o.r[1], o.r[2] * k)).translate(o.c.x, o.c.y + y * o.r[1], o.c.z);
+      const base = pos.length / 3;
+      pos.push(...g.attributes.position.array);
+      for (const j of g.index.array) idx.push(base + j);
+      g.dispose();
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setIndex(idx);
+    geo.computeVertexNormals();
+    m = new THREE.Mesh(geo, mat);
+  } else if (o.c) { m = new THREE.Mesh(new THREE.IcosahedronGeometry(1, 1), mat); m.scale.set(...o.r); m.position.copy(o.c); }
   else {
     const len = o.a.distanceTo(o.b);
     m = new THREE.Mesh(new THREE.CapsuleGeometry(o.r, len, 2, 6), mat);
@@ -1874,7 +1941,11 @@ function segSegDist(p1, q1, p2, q2) {
 function trackHits(o, A, B, reach) {
   if (o.c) {
     const k = new THREE.Vector3(o.r[0] + reach, o.r[1] + reach, o.r[2] + reach);
-    return segPointDist(A.clone().sub(o.c).divide(k), B.clone().sub(o.c).divide(k), new THREE.Vector3()) <= 1;
+    const into = segPointDist(A.clone().sub(o.c).divide(k), B.clone().sub(o.c).divide(k), new THREE.Vector3()) <= 1;
+    if (!o.shell || !into) return into;
+    // a shell is crossed unless the whole track lies inside its inner surface
+    const inner = p => p.clone().sub(o.c).divide(new THREE.Vector3(...o.r.map(r => r - o.shell))).lengthSq() < 1;
+    return !(inner(A) && inner(B));
   }
   return segSegDist(A, B, o.a, o.b) <= o.r + reach;
 }
@@ -1908,21 +1979,24 @@ function addWound(part, hit, dir) {
   const type = part.n.replace(/[LR]$/, '');
   const track = woundTrack(part, hit.point, dir);
   const [tissueName, tissueRate] = TISSUE[type];
-  const comps = [{ rate: rnd(tissueRate), ext: 0.9, clot: 90 }];
-  for (const o of track.organs) {
-    comps.push({ rate: rnd(o.rate), ext: o.ext, clot: o.clot });
+  const comps = [{ rate: rnd(tissueRate), ext: 0.9, clot: 90, kind: 'cap', open: 1 }];
+  // a rib lies in the way of some tracks through the chest wall and not of others
+  const organs = track.organs.filter(o => !o.cover || rand() < o.cover);
+  for (const o of organs) {
+    comps.push({ rate: rnd(o.rate), ext: o.ext, clot: o.clot, kind: o.kind, pleura: o.pleura, open: 1, organ: o });
     if (o.mesh) o.mesh.material.emissive.set(0x5a0000);
   }
-  const has = f => track.organs.some(f);
+  const has = f => organs.some(f);
   const local = track.entryLocal;
   const n = hit.face ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld) : dir.clone().negate();
   const nLocal = n.applyQuaternion(part.mesh.getWorldQuaternion(new THREE.Quaternion()).invert());
   const w = {
-    part, local, nLocal, comps, organs: track.organs, perforating: track.perforating,
-    name: track.organs.length ? track.organs.map(o => o.name).join(', ') : tissueName,
+    part, local, nLocal, comps, organs, perforating: track.perforating,
+    name: organs.length ? organs.map(o => o.name).join(', ') : tissueName,
     zone: type === 'head' && local.y < -0.085 ? 'шея' : ZONE_LABEL[part.n],
     arrest: has(o => o.arrest), brain: has(o => o.cns === 'brain'), cervical: has(o => o.cns === 'cervical'),
-    spine: has(o => o.cns === 'spine'), bone: has(o => o.bone),
+    spine: has(o => o.cns === 'spine'), bone: has(o => o.bone), brainstem: has(o => o.cns === 'brainstem'),
+    airway: has(o => o.airway), nerve: organs.find(o => o.nerve)?.nerve || null, lung: has(o => o.lung),
     rate: comps.reduce((a, k) => a + k.rate, 0), now: 0, ext: 0.9, t0: c.physT, lost: 0, extLost: 0, pending: 0,
   };
   // the wound track is seen in x-ray; entry and exit are painted on the skin
@@ -1938,7 +2012,7 @@ function addWound(part, hit, dir) {
     if (outHit) addWoundSlot(w, outHit.object, domBone(outHit), outHit.point, rOut);
   }
   c.wounds.push(w);
-  if (w.arrest && c.arrestAt === null) c.arrestAt = c.physT + 8 + rand() * 7;
+  injure(comps, type);
   spatter(hit.point, dir);
   if (track.perforating) spatter(track.exit, dir);
   return w;
@@ -1963,24 +2037,146 @@ function partAt(point) {
 }
 function partOfHit(hit) { return partAt(hit.point).n; }
 
-function physiology(dt) {
+// ---------- circulation ----------
+// A lumped model of the heart, the vessels, the lungs and the brain, stepped with the physiology clock. The heart
+// pumps what the veins bring back (preload falls as blood is lost); the pressure is that output against the
+// resistance of the body, and an open artery is a low resistance in parallel, so a large one drops the pressure at
+// once. The baroreflex (sympathetic tone s) answers a falling pressure with a faster heart and narrower vessels:
+// that holds the pressure near normal through about a third of the blood volume (ATLS classes I–III), then it
+// fails. The brain keeps working while blood pressure and oxygen let it; a few seconds of too little of both and
+// consciousness goes. Every number here is an order of magnitude for a healthy adult, not a clinical prediction.
+const MAP0 = 93, HR0 = 75, CVP0 = 6, CO0 = 5000 / 60, G0 = CO0 / MAP0; // mmHg, beats/min, mmHg, ml/s, ml/s per mmHg
+// cardiac filling against the share of blood lost (Starling): steep at first, the reflex makes up the difference
+const PRELOAD = [[0, 1], [0.15, 0.68], [0.3, 0.36], [0.4, 0.12], [0.5, 0.085], [0.6, 0.04], [0.7, 0]];
+const ART_SHARE = { art: 1, cap: 1, mix: 0.5, ven: 0 }; // how much of a bleed is driven by arterial pressure
+const LOC_RESERVE = 0.2; // the brain's oxygen reserve below which consciousness goes
+const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+function table(t, x) {
+  if (x <= t[0][0]) return t[0][1];
+  for (let i = 1; i < t.length; i++) if (x <= t[i][0]) return t[i - 1][1] + (t[i][1] - t[i - 1][1]) * (x - t[i - 1][0]) / (t[i][0] - t[i - 1][0]);
+  return t[t.length - 1][1];
+}
+const ease = (dt, tau) => 1 - Math.exp(-dt / tau);
+function circ() {
   const c = character;
+  return c.circ ??= {
+    t: 0, lost: 0, bleed: 0, map: MAP0, hr: HR0, s: 0, cvp: CVP0, co: CO0, spo2: 98, rr: 14,
+    pump: 1, peri: 0, pleura: { L: 0, R: 0 }, ptx: { L: 0, R: 0 }, ptxMax: { L: 0, R: 0 }, tension: { L: false, R: false }, squeeze: 0,
+    airway: 1, airwayHit: false, apnea: false, neuro: 0, carotid: 0,
+    reserve: 1, lowMap: 0, lowSat: 0, arrested: false, arrestT: null, noFlow: 0, said: {},
+  };
+}
+// what a wound does to the circulation beyond bleeding; called once, when the wound is made
+function injure(comps, type) {
+  const m = circ();
+  for (const k of comps) {
+    const o = k.organ;
+    if (!o) continue;
+    if (o.heart) {
+      // a hole in a ventricle loses part of every beat; a small wound with the pericardium intact fills the sac
+      // instead (tamponade), which squeezes the heart until it cannot fill
+      m.pump *= 1 - (0.25 + 0.35 * rand() + (weapon.reach > 0.01 ? 0.15 : 0));
+      if (rand() < (weapon.reach > 0.01 ? 0.25 : 0.55)) { k.peri = true; k.ext = 0.05; k.pleura = null; }
+    }
+    if (o.lung) {
+      m.ptxMax[o.lung] = Math.max(m.ptxMax[o.lung], 0.5 + 0.3 * rand());
+      if (rand() < 0.15) m.tension[o.lung] = true; // the wound works as a valve: air in, none out
+    }
+    if (o.carotid) m.carotid = Math.min(2, m.carotid + 1);
+    if (o.airway) { m.airwayHit = true; m.airway = Math.min(m.airway, 0.55); }
+    if (o.cns === 'brainstem') { m.apnea = true; m.neuro = 1; } // the breathing and vasomotor centres
+    if (o.cns === 'cervical') { if (rand() < 0.6) m.apnea = true; m.neuro = Math.max(m.neuro, 0.7); } // C3–C5 drive the diaphragm
+    if (o.cns === 'spine' && type === 'chest') m.neuro = Math.max(m.neuro, 0.3); // high cord: part of the sympathetic outflow
+  }
+}
+// one step of the model; m and the comps' open and now fields change. Pure apart from them, so the same code runs
+// ahead on copies for the forecast without touching the simulation
+function circStep(m, ks, dt) {
+  m.t += dt;
+  const f = m.lost / BLOOD_VOLUME;
+  // lungs: an open pneumothorax collapses part of the lung over a minute or two, blood in the pleura squeezes it
+  // further; a tension pneumothorax collapses it fully and then pushes on the heart and the great veins
+  for (const S of ['L', 'R']) {
+    m.ptx[S] += ((m.tension[S] ? 1 : m.ptxMax[S]) - m.ptx[S]) * ease(dt, m.tension[S] ? 40 : 90);
+    if (m.tension[S] && m.ptx[S] > 0.85) m.squeeze = Math.min(0.75, m.squeeze + dt / 150);
+  }
+  const lung = S => 1 - Math.min(1, m.ptx[S] + m.pleura[S] / 1500);
+  if (m.airwayHit) m.airway = Math.max(0.3, m.airway - dt * 0.25 / 60); // blood keeps running into the airway
+  const gas = (lung('L') + lung('R')) / 2 * m.airway;
+  // heart and pressure
+  const periOpen = clamp(1 - m.peri / 280, 0, 1); // a full pericardium presses the hole shut, and the heart with it
+  const pre = table(PRELOAD, f) * clamp(1 - (m.peri - 60) / 200, 0, 1) * (1 - m.squeeze);
+  let gLeak = 0;
+  for (const k of ks) gLeak += k.rate * k.open * ART_SHARE[k.kind] * (k.peri ? periOpen : 1) / MAP0;
+  m.co = m.arrested ? 0 : CO0 * pre * m.pump * (1 + 1.067 * m.s * m.pump);
+  const gSys = G0 * (1 - 0.6 * m.s) * (1 + 0.4 * m.neuro);
+  m.map += (m.co / (gSys + gLeak) - m.map) * ease(dt, 1.2);
+  m.s += (clamp((MAP0 - m.map) / 25, 0, 1 - m.neuro) - m.s) * ease(dt, 4);
+  m.hr = m.arrested ? 0 : m.hr + ((HR0 + 80 * m.s) * (1 - 0.35 * m.neuro) - m.hr) * ease(dt, 3);
+  m.cvp = CVP0 * clamp(1 - f / 0.3, 0, 1);
+  // bleeding: arterial with the arterial pressure, venous with the venous one (which goes first), and clotting that
+  // slows once a third of the blood is gone and the clotting factors with it
+  const coag = 1 / (1 + 3 * clamp((f - 0.3) / 0.15, 0, 1));
+  const artDrive = m.map / MAP0, venDrive = Math.max(0.3, (m.cvp + 4) / (CVP0 + 4));
+  m.bleed = 0;
+  for (const k of ks) {
+    const a = ART_SHARE[k.kind];
+    k.now = k.rate * k.open * (a * artDrive + (1 - a) * venDrive) * (k.peri ? periOpen : 1);
+    m.bleed += k.now;
+    const ml = k.now * dt, inner = ml * (1 - k.ext);
+    m.lost += ml;
+    if (k.peri) m.peri += inner; else if (k.pleura) m.pleura[k.pleura] += inner;
+    if (k.clot) k.open *= Math.exp(-dt / k.clot * coag);
+  }
+  // breathing and oxygen: with no breathing the oxygen in the lungs lasts a minute or two, then saturation falls fast
+  const noBreath = m.apnea || (m.arrested && m.t - m.arrestT > 20);
+  if (noBreath) m.spo2 = Math.max(0, m.spo2 - (0.05 + 0.02 * (98 - m.spo2)) * dt);
+  else {
+    const target = 98 - 45 * Math.pow(Math.max(0, 0.9 - gas), 1.3);
+    m.spo2 += (target - m.spo2) * ease(dt, target < m.spo2 ? 25 : 15);
+  }
+  const rrT = noBreath ? 0 : Math.min(48, 14 + 50 * Math.min(f, 0.5) + 0.8 * Math.max(0, 95 - m.spo2) + 12 * (1 - m.airway) + 8 * (2 - lung('L') - lung('R')));
+  m.rr += (rrT - m.rr) * ease(dt, 4);
+  // the brain: blood flow holds down to a pressure of about 60 (autoregulation), then falls with it; a cut carotid
+  // leaves that side to the circle of Willis
+  const cbf = clamp((m.map * (1 - 0.35 * m.carotid) - 25) / 40, 0, 1), oxy = clamp((m.spo2 - 40) / 28, 0, 1);
+  const deficit = Math.max(0, 0.7 - cbf * oxy) / 0.7;
+  m.reserve = deficit > 0 ? Math.max(0, m.reserve - deficit / 10 * dt) : Math.min(1, m.reserve + 0.05 * dt);
+  m.noFlow = cbf < 0.05 ? m.noFlow + dt : 0;
+  // the heart stops when it runs empty, when its own muscle has starved for long at a pressure that cannot perfuse
+  // it, or when there is nothing to breathe
+  m.lowMap = m.map < 18 ? m.lowMap + dt : 0;
+  m.lowSat = m.spo2 < 35 ? m.lowSat + dt : 0;
+  if (!m.arrested && (m.lowMap > (f > 0.45 ? 3 : 45) || m.lowSat > 20)) { m.arrested = true; m.arrestT = m.t; }
+}
+// seconds of physiology time until consciousness goes, from the model run ahead on a copy (null: not within
+// maxT, or already gone). It reads the state and nothing else, so calling it never changes the simulation
+function forecastLOC(maxT = 900) {
+  const c = character;
+  if (!c.conscious) return null;
+  const m = structuredClone({ ...circ(), said: null }), ks = c.wounds.flatMap(w => w.comps.map(k => ({ ...k })));
+  for (let t = 0; t <= maxT; t += 0.25) {
+    if (m.reserve <= LOC_RESERVE) return t;
+    if (!ks.length && !m.apnea && m.reserve >= 1) return null;
+    circStep(m, ks, 0.25);
+  }
+  return null;
+}
+
+function physiology(dt) {
+  const c = character, m = circ();
   c.physT += dt;
-  const f = c.lost / BLOOD_VOLUME;
-  // falling blood pressure slows every bleed; a stopped heart slows it a lot more
-  const pressure = Math.max(0.25, 1 - 1.6 * Math.max(0, f - 0.15)) * (c.arrestAt !== null && c.physT > c.arrestAt ? 0.15 : 1);
-  let total = 0;
+  circStep(m, c.wounds.flatMap(w => w.comps), dt);
+  c.lost = m.lost;
   for (const w of c.wounds) {
     let wr = 0, we = 0;
-    for (const k of w.comps) {
-      const r = k.rate * pressure * (k.clot ? Math.exp(-(c.physT - w.t0) / k.clot) : 1);
-      wr += r; we += r * k.ext;
-    }
+    for (const k of w.comps) { wr += k.now; we += k.now * k.ext; }
     w.now = wr; w.ext = wr > 0 ? we / wr : 0.9;
     const ml = w.now * dt;
-    total += w.now; c.lost += ml; w.lost += ml; w.extLost += ml * w.ext; w.pending += ml * w.ext;
+    w.lost += ml; w.extLost += ml * w.ext; w.pending += ml * w.ext;
   }
-  c.bleedRate = total;
+  c.bleedRate = m.bleed;
+  const f = c.lost / BLOOD_VOLUME;
   c.vigor = f < 0.15 ? 1 : Math.max(0.55, 1 - (f - 0.15) / 0.15 * 0.45);
   if (c.sway) {
     const a = Math.min(1, (f - 0.15) / 0.2), t = simTime;
@@ -1988,44 +2184,55 @@ function physiology(dt) {
     c.sway.pose.abdomen = [0.04 * a * Math.sin(t * 1.1 + 0.6), 0, 0.05 * a * Math.sin(t * 0.7 + 0.4)];
     c.sway.pose.head = [0.08 * a * Math.sin(t * 0.9), 0, 0];
   }
-  const pct = Math.round(f * 100);
+  const pct = Math.round(f * 100), up = c.conscious && c.state !== 'down';
   if (f >= 0.15 && c.stage < 1) {
     c.stage = 1;
-    log('blood', 'Класс II', c.conscious && c.state !== 'down' ? `Потеряно ${pct}% крови: пульс за 100, слабость, тревога. Тело начинает покачиваться.` : `Потеряно ${pct}% крови.`);
-    if (c.conscious && c.state !== 'down') c.sway = addLayer({}, { attack: 2, hold: Infinity, release: 0.5, tag: 'sway' });
+    log('blood', 'Класс II', up ? `Потеряно ${pct}% крови: пульс за 100, слабость, тревога. Тело начинает покачиваться.` : `Потеряно ${pct}% крови.`);
+    if (up) c.sway = addLayer({}, { attack: 2, hold: Infinity, release: 0.5, tag: 'sway' });
   }
-  if (f >= 0.30 && c.stage < 2) {
+  // the legs give way when the blood is a third down, or sooner when the brain is already short of blood (presyncope)
+  const faintish = m.reserve < 0.6;
+  if ((f >= 0.30 || faintish) && c.stage < 2) {
     c.stage = 2;
-    log('blood', 'Класс III', c.conscious && c.state !== 'down' ? `Потеряно ${pct}%: давление падает, ноги не держат. Человек опускается на землю.` : `Потеряно ${pct}%: давление падает.`);
-    if (c.conscious && c.state !== 'down') {
+    if (f >= 0.30) log('blood', 'Класс III', up ? `Потеряно ${pct}%: давление падает, ноги не держат. Человек опускается на землю.` : `Потеряно ${pct}%: давление падает.`);
+    else if (up) log('blood', 'Предобморок', `Давление ${Math.round(m.map)} мм рт. ст., мозгу не хватает крови: темнеет в глазах, ноги подкашиваются.`);
+    if (up) {
       tone([...LEG('L'), ...LEG('R')], 0.25, 1.2);
       c.balanceTarget = Math.min(c.balanceTarget, 0.2); c.balanceRate = 0.8;
       addLayer({ thighL: [-0.5, 0, 0], thighR: [-0.5, 0, 0], shinL: [1.1, 0, 0], shinR: [1.1, 0, 0], chest: [0.3, 0, 0] }, { attack: 1.2, hold: Infinity, tag: 'faint' });
       at(2.5, () => { if (c.state !== 'down') c.balanceTarget = 0; });
     }
   }
-  if (f >= 0.38 && c.stage < 3) {
+  if (f >= 0.40 && c.stage < 3) {
     c.stage = 3;
-    log('blood', 'Класс IV', c.conscious ? `Потеряно ${pct}%: потеря сознания.` : `Потеряно ${pct}%.`);
-    if (c.conscious) collapse(false);
+    log('blood', 'Класс IV', `Потеряно ${pct}%: давление ${Math.round(m.map)} мм рт. ст., компенсация исчерпана.`);
   }
   if (f >= 0.5 && c.stage < 4) {
     c.stage = 4;
     log('blood', 'Критично', 'Больше половины объёма крови: без немедленной помощи это смерть.');
   }
-  if (c.arrestAt !== null && c.physT >= c.arrestAt && !c.arrestLogged) {
-    c.arrestLogged = true;
-    if (c.conscious) { log('blood', 'Нет перфузии', 'Мозг без кровотока: потеря сознания.'); collapse(false); }
+  const say = (key, title, text) => { if (!m.said[key]) { m.said[key] = true; log('blood', title, text); } };
+  if (m.squeeze > 0.05) say('tension', 'Напряжённый пневмоторакс', 'Воздух копится в плевральной полости и сдавливает сердце и крупные вены: давление падает.');
+  if (m.peri > 100 && !m.arrested) say('tamponade', 'Тампонада сердца', `В околосердечной сумке ~${Math.round(m.peri)} мл крови: сердце не может наполниться, давление падает.`);
+  if (c.conscious && m.reserve <= LOC_RESERVE) {
+    say('loc', 'Потеря сознания', m.spo2 < 65 && m.map > 55 ? `Насыщение крови кислородом ${Math.round(m.spo2)}%: мозгу не хватает кислорода.`
+      : m.arrested ? 'Мозг без кровотока: потеря сознания.'
+      : `Давление ${Math.round(m.map)} мм рт. ст.${m.carotid ? ', сонная артерия перебита' : ''}: мозг недополучает крови.`);
+    collapse(false);
   }
+  if (m.arrested) say('arrest', 'Остановка кровообращения', 'Сердце не перекачивает кровь: клиническая смерть. Без реанимации мозг погибает за несколько минут.');
+  if (m.noFlow >= 300) say('brain', 'Необратимые изменения', 'Около пяти минут без кровотока: в мозге начинаются необратимые изменения.');
 }
 
 function heartRate() {
-  const c = character, f = c.lost / BLOOD_VOLUME;
-  if ((c.arrestAt !== null && c.physT >= c.arrestAt) || f >= 0.55) return 0;
-  if (f < 0.15) return 75 + f / 0.15 * 22;
-  if (f < 0.3) return 97 + (f - 0.15) / 0.15 * 23;
-  if (f < 0.4) return 120 + (f - 0.3) / 0.1 * 20;
-  return Math.min(165, 140 + (f - 0.4) / 0.1 * 15);
+  const m = circ();
+  return m.arrested ? 0 : m.hr;
+}
+// systolic and diastolic from the mean: the pulse pressure narrows as the stroke volume falls
+function bloodPressure() {
+  const m = circ(), f = m.lost / BLOOD_VOLUME;
+  const pp = 40 * Math.max(0.25, 1 - 1.5 * f) * Math.min(1, m.map / 60) * Math.min(1, 0.4 + m.pump * 0.6);
+  return [m.map + pp * 2 / 3, m.map - pp / 3];
 }
 
 function updateBloodVisuals(dt) {
@@ -2123,6 +2330,7 @@ const vEl = id => document.getElementById(id);
 // text and styles written every frame are set only when they change: each write makes the browser lay the page out
 // again, and the pointer handlers then wait for that
 function setText(el, t) { if (typeof el === 'string') el = vEl(el); if (el._t !== t) { el._t = t; el.textContent = t; } }
+let etaCache = null;
 function bloodReadout() {
   const c = character, f = c.lost / BLOOD_VOLUME;
   const bw = Math.min(100, f / 0.5 * 100).toFixed(1) + '%', bb = vEl('bbFill');
@@ -2130,16 +2338,20 @@ function bloodReadout() {
   const T = {};
   T.vLost = `${Math.round(c.lost)} мл · ${(f * 100).toFixed(1)}%`;
   T.vRate = c.bleedRate > 0.01 ? `${fmtRate(c.bleedRate)} · ${Math.round(c.bleedRate * 60)} мл/мин` : '—';
-  const hr = heartRate();
+  const hr = heartRate(), m = circ(), [sys, dia] = bloodPressure();
   T.vHr = hr ? `${Math.round(hr)} уд/мин` : 'нет пульса';
+  T.vBp = m.map < 15 ? 'не определяется' : `${Math.round(sys)}/${Math.round(dia)} мм рт. ст.`;
+  T.vSat = m.map < 40 ? 'не определяется' : `${Math.round(m.spo2)}%`; // a pulse oximeter needs a pulse
+  T.vRr = m.rr < 1 ? 'нет дыхания' : `${Math.round(m.rr)} в мин`;
   T.vClass = f < 0.15 ? 'I' : f < 0.3 ? 'II' : f < 0.4 ? 'III' : 'IV';
   let eta = '—';
   if (c.conscious) {
-    if (c.arrestAt !== null) eta = `≈ ${Math.max(0, c.arrestAt - c.physT).toFixed(0)} с`;
-    else if (c.bleedRate > 0.05) {
-      const s = (0.38 * BLOOD_VOLUME - c.lost) / c.bleedRate;
-      eta = s > 3600 ? 'больше часа' : s > 90 ? `≈ ${Math.round(s / 60)} мин` : `≈ ${Math.round(s)} с`;
-    }
+    // the forecast runs the model ahead; it is only shown here, so it may be refreshed on the clock
+    const now = performance.now();
+    if (!etaCache || now - etaCache.at > 500 || etaCache.n !== c.wounds.length) etaCache = { at: now, n: c.wounds.length, v: forecastLOC(3600) };
+    const s = etaCache.v;
+    if (s !== null) eta = s > 90 ? `≈ ${Math.round(s / 60)} мин` : `≈ ${Math.round(s)} с`;
+    else if (c.bleedRate > 0.05) eta = 'больше часа';
   } else if (c.wounds.length || c.state === 'down') eta = 'без сознания';
   T.vEta = eta;
   T.bloodChip = `кровопотеря: ${Math.round(c.lost)} мл`;
@@ -2637,7 +2849,8 @@ function updateHover() {
   let text = '—';
   if (part) {
     const t = woundTrack(byName[part], h.point, raycaster.ray.direction.clone());
-    text = ZONE_LABEL[part] + (t.organs.length ? ' → ' + t.organs.map(o => o.name).join(', ') : '');
+    const organs = t.organs.filter(o => !o.cover); // a rib may or may not be in the way: only the shot decides
+    text = ZONE_LABEL[part] + (organs.length ? ' → ' + organs.map(o => o.name).join(', ') : '');
   }
   setText(aimChip, 'прицел: ' + text);
 }
@@ -2670,6 +2883,6 @@ emit('ready');
 // test hook: ?debug exposes the simulation to automated tests. step() runs one physics step the way the frame loop
 // does (inputs of a case playing back included); fire(origin, dir) is a recorded shot along a ray; reset(seed) starts
 // a case with that seed; setting(key, value) is a setting changed by the viewer.
-if (new URLSearchParams(location.search).has('debug')) window.__sim = { byName: () => byName, parts: () => parts, shoot, character: () => character, step: simStep, setTime, layers, camera, controls, renderer, scene, setPhys: v => userSetting('bleed', v), pools: () => pools, drops: () => drops, setXray, woundSlots, script: () => script,
+if (new URLSearchParams(location.search).has('debug')) window.__sim = { byName: () => byName, parts: () => parts, shoot, character: () => character, step: simStep, setTime, layers, camera, controls, renderer, scene, setPhys: v => userSetting('bleed', v), pools: () => pools, drops: () => drops, setXray, woundSlots, script: () => script, circ: () => circ(), forecastLOC,
   sim, fire, setting: userSetting, reset: seed => { stopSeek(); playback = null; endReplay(); startCase(seed ?? newSeed()); }, checks: () => caseChecks.slice(), seed: () => caseSeed };
 requestAnimationFrame(frame);
