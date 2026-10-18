@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { emit } from './bus.js';
+import { emit, sim } from './bus.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import RAPIER from '@dimforge/rapier3d-compat';
@@ -37,6 +37,20 @@ const FILTER = {
   legR: groups(G_LEGR, G_GROUND | G_ARMS | G_LEGL),
   ground: groups(G_GROUND, 0xffff),
 };
+// Every random draw that can change the bodies, the scenario or the physiology comes from one seeded generator
+// (mulberry32), started again from the case's seed at every reset: the same seed and the same inputs give the same
+// reaction (docs/contracts/case-v1.md). Purely visual randomness (dust, blood droplets) stays on Math.random and
+// never feeds back into the simulation.
+function mulberry32(a) {
+  return () => {
+    a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const newSeed = () => crypto.getRandomValues(new Uint32Array(1))[0];
+let rand = mulberry32(newSeed()); // started again from the case's seed at every reset
 const ZONE_LABEL = {
   head: 'голова', chest: 'грудная клетка', abdomen: 'живот', pelvis: 'таз',
   uArmL: 'левое плечо', fArmL: 'левое предплечье', uArmR: 'правое плечо', fArmR: 'правое предплечье',
@@ -240,7 +254,7 @@ for (const m of modelMeshes) {
 const tq = new THREE.Quaternion(), pq = new THREE.Quaternion(), tv = new THREE.Vector3();
 
 // motion capture for running: the clips that ship with the model
-const mixer = new THREE.AnimationMixer(model);
+let mixer = new THREE.AnimationMixer(model);
 const CLIPS = Object.fromEntries(gltf.animations.map(a => [a.name, a]));
 const CLIP_SPEED = { run: 3.55, walk: 1.5 }; // m/s of ground covered by the planted foot, measured from the clips
 const DRIVEN = new Set(DRIVE.map(d => d.bone));
@@ -252,7 +266,10 @@ const PART_BONE = { pelvis: 'Hips', abdomen: 'Spine1', chest: 'Spine2', head: 'H
 const PART_REST = Object.fromEntries(Object.entries(PART_BONE).map(([n, b]) => [n, {
   bone: rigBones[b], qInv: rigBones[b].getWorldQuaternion(new THREE.Quaternion()).invert(), pos: rigBones[b].getWorldPosition(new THREE.Vector3()) }]));
 function resetRig() {
-  mixer.stopAllAction();
+  // a fresh mixer at every reset: an old one carries its clock, its actions' time scales and the last values it
+  // wrote, and a case must start from the same state as on a freshly opened page
+  mixer.stopAllAction(); mixer.uncacheRoot(model);
+  mixer = new THREE.AnimationMixer(model);
   for (const [b, q, p] of restLocal) { b.quaternion.copy(q); b.position.copy(p); }
   model.position.set(0, 0, 0); model.quaternion.identity(); model.updateMatrixWorld(true);
 }
@@ -299,20 +316,20 @@ function runHit(wounds) {
   if (!wounds.length) return true; // a bullet past the ear: the run goes on
   const kind = incidentKind(wounds), lead = wounds[0];
   const drops = kind === 'multi' ? 0.75 : ['chest', 'abdomen', 'pelvis-soft', 'neck'].includes(kind) ? 0.35 : 0;
-  if (Math.random() < drops) {
+  if (rand() < drops) {
     releaseRun(true);
     c.balanceTarget = 0; c.balanceRate = 2.5; c.noLift = true; c.fellRunning = true;
     return false;
   }
   // the ragdoll takes the hit: dynamic again with the run's velocities, then the bullet's push on the struck part
   const torso = ['chest', 'abdomen', 'pelvis', 'neck'].includes(ZONE_KIND(lead.w.zone));
-  r.phys = { t0: r.t, dur: 0.8 + Math.random() * 0.3, depth: torso ? 0.35 + Math.random() * 0.45 : 0.25 + Math.random() * 0.25 };
+  r.phys = { t0: r.t, dur: 0.8 + rand() * 0.3, depth: torso ? 0.35 + rand() * 0.45 : 0.25 + rand() * 0.25 };
   for (const p of parts) {
     const k = r.kin[p.n];
     p.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
     p.body.setLinvel(k.v, true); p.body.setAngvel(k.w, true);
   }
-  const push = 14 + Math.random() * 10;
+  const push = 14 + rand() * 10;
   for (const x of wounds) x.part.body.applyImpulse({ x: x.dir.x * push, y: 0, z: x.dir.z * push }, true);
   r.v *= 0.6;
   r.vmax = Math.min(r.vmax, runPace(0.6));
@@ -324,7 +341,7 @@ function startRun(vmax, dirH) {
   const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(toQ(pel.rotation(), rq));
   const clip = vmax < 2.4 ? 'walk' : 'run';
   const r = { mode: 'go', t: 0, v: 0, vmax, dirH, heading: Math.atan2(fwd.x, fwd.z), root: { x: pt.x, z: pt.z }, clip, w: 0, idle: null,
-    lookAt: 1.2 + Math.random() * 1.5, snap: {}, kin: {}, animQ: {}, animP: {}, phys: null, blend0: 0 };
+    lookAt: 1.2 + rand() * 1.5, snap: {}, kin: {}, animQ: {}, animP: {}, phys: null, blend0: 0 };
   for (const p of parts) {
     const t = p.body.translation(), q = p.body.rotation();
     r.snap[p.n] = { p: new THREE.Vector3(t.x, t.y, t.z), q: new THREE.Quaternion(q.x, q.y, q.z, q.w) };
@@ -335,7 +352,7 @@ function startRun(vmax, dirH) {
   mixer.stopAllAction();
   r.action = mixer.clipAction(CLIPS[clip]);
   r.action.reset().setEffectiveWeight(1).play();
-  r.action.time = Math.random() * CLIPS[clip].duration;
+  r.action.time = rand() * CLIPS[clip].duration;
   c.run = r;
 }
 // hand the body back to the ragdoll at the pose and with the velocity the clip gave it
@@ -385,7 +402,7 @@ function runAnim(dt) {
   // halfway, a glance back at the shooter over the nearer shoulder
   const lt = (r.t - r.lookAt) / 1.1;
   if (r.mode === 'go' && lt > 0 && lt < 1) {
-    const back = wrapAngle(Math.atan2(camera.position.x - r.root.x, camera.position.z - r.root.z) - r.heading);
+    const back = wrapAngle(Math.atan2(shooter.x - r.root.x, shooter.z - r.root.z) - r.heading);
     const yaw = Math.sign(back || 1) * Math.min(1.5, Math.abs(back)) * Math.sin(lt * Math.PI);
     model.updateMatrixWorld(true);
     turnBone(rigBones.Spine2, yaw * 0.25); model.updateMatrixWorld(true);
@@ -432,7 +449,7 @@ function runAnim(dt) {
 }
 
 function poseRig() {
-  // during a run the clip itself poses the skeleton
+  // during a run the clip itself poses the skeleton (the 5-second picture replay poses it from its recorded frames)
   if (!replay && character.run && character.run.w >= 1 && !character.run.phys) return;
   for (const d of DRIVE) {
     const m = byName[d.part].mesh;
@@ -594,12 +611,12 @@ function buildWorld() {
     vigor: 1, lost: 0, bleedRate: 0, physT: 0, wounds: [], stage: 0, arrestAt: null, sway: null, heading: 0, run: null };
   clearBlood();
   woundSlots.length = 0;
-  character.breath = 0; character.ph = Array.from({ length: 14 }, () => Math.random() * 6.28);
+  character.breath = 0; character.ph = Array.from({ length: 14 }, () => rand() * 6.28);
   character.life = addLayer({}, { attack: 1, hold: Infinity, release: 0.5, tag: 'life' });
   character.cap = {}; character.supportShift = new THREE.Vector3(); character.breathBoost = 0; character.lifeDamp = 1; character.tremble = 0;
   stopScript(); renderScript(null);
   setState('ok');
-  syncMeshes();
+  syncMeshes(); poseRig();
 }
 
 // ---------- pose layers ----------
@@ -755,7 +772,7 @@ function setState(s) {
   document.getElementById('stateText').textContent = { ok: 'стоит', wounded: 'ранен, на ногах', kneel: 'на колене', sit: 'сидит', down: 'упал' }[s];
 }
 
-const jitter = (x, k = 0.3) => x * (1 + (Math.random() * 2 - 1) * k);
+const jitter = (x, k = 0.3) => x * (1 + (rand() * 2 - 1) * k);
 // every reaction is drawn fresh: each joint's offset and the timing vary, so no two look the same
 function addVaried(pose, env, k = 0.3) {
   const out = {};
@@ -776,7 +793,7 @@ function startle(intensity, side) {
   }
   if (k < 0.08) return;
   const away = -side;
-  const variant = Math.random();
+  const variant = rand();
   const legs = { thighL: [-0.35, 0, 0], thighR: [-0.35, 0, 0], shinL: [0.6, 0, 0], shinR: [0.6, 0, 0] };
   let pose;
   if (variant < 0.4) pose = { // arms come up over the head
@@ -854,10 +871,10 @@ function usableHand(h) {
 const canRun = () => { const c = character;
   return c.conscious && c.state !== 'down' && !c.seated && !c.kneel && c.balanceTarget > 0.5 && (c.cap.thighL ?? 1) > 0.5 && (c.cap.thighR ?? 1) > 0.5; };
 const legsWork = () => (character.cap.thighL ?? 1) > 0.1 || (character.cap.thighR ?? 1) > 0.1;
-// direction toward the camera (the shooter) in the chest's frame: yaw and pitch, rad
+// direction toward the shooter in the chest's frame: yaw and pitch, rad
 function shooterAngles() {
   const chest = byName.chest.body, head = vecOf(byName.head.body.translation());
-  const v = camera.position.clone().sub(head).applyQuaternion(toQ(chest.rotation(), new THREE.Quaternion()).invert());
+  const v = shooter.clone().sub(head).applyQuaternion(toQ(chest.rotation(), new THREE.Quaternion()).invert());
   return { yaw: Math.max(-1.3, Math.min(1.3, Math.atan2(v.x, v.z))), pitch: Math.max(-0.6, Math.min(0.6, -Math.atan2(v.y, Math.hypot(v.x, v.z)))) };
 }
 function armPose(kind, S, k = 1) {
@@ -934,7 +951,7 @@ const ACTIONS = {
     const left = new THREE.Vector3(fwd.z, 0, -fwd.x);
     const v = { back: fwd.clone().negate(), forward: fwd, left, right: left.clone().negate() }[b.dir] || fwd.clone().negate();
     b.vec = v.multiplyScalar(0.07 + 0.08 * b.intensity);
-    const S = b.dir === 'left' ? 'L' : b.dir === 'right' ? 'R' : (Math.random() < 0.5 ? 'L' : 'R'), s = S === 'L' ? 1 : -1;
+    const S = b.dir === 'left' ? 'L' : b.dir === 'right' ? 'R' : (rand() < 0.5 ? 'L' : 'R'), s = S === 'L' ? 1 : -1;
     const leg = b.dir === 'back' ? [0.35, 0, 0] : b.dir === 'forward' ? [-0.45, 0, 0] : [-0.15, 0, 0.25 * s];
     const layer = addLayer({ ['thigh' + S]: leg, ['shin' + S]: [0.9, 0, 0] }, { attack: 0.15, hold: Math.min(0.35, b.dur * 0.3), release: 0.3, tag: 'ai-legs' });
     for (const l of layers) if (l.tag === 'buckle') fadeOut(l, 0.4);
@@ -1033,8 +1050,8 @@ const ACTIONS = {
     if (c.run || !canRun()) return null;
     const p = byName.pelvis.body.translation();
     // away from the shooter, angled off to one side the way people run for cover
-    const away = Math.atan2(p.x - camera.position.x, p.z - camera.position.z);
-    const off = b.dir === 'left' ? 0.55 : b.dir === 'right' ? -0.55 : (Math.random() - 0.5) * 0.9;
+    const away = Math.atan2(p.x - shooter.x, p.z - shooter.z);
+    const off = b.dir === 'left' ? 0.55 : b.dir === 'right' ? -0.55 : (rand() - 0.5) * 0.9;
     const vmax = runPace(b.intensity);
     // poses held from before would pull the body back into them once the run hands it back
     for (const l of layers) if (l.tag !== 'life') fadeOut(l, 0.3);
@@ -1138,7 +1155,7 @@ function incidentReport(hits, nearMiss) {
       arm_unusable: ['L', 'R'].filter(S => (c.cap['uArm' + S] ?? 1) <= 0.1),
     },
     earlier_wounds: c.wounds.filter(w => !hits.some(x => x.w === w)).map(w => `${w.zone}: ${w.name}`),
-    temperament_hint: TEMPERAMENTS[Math.floor(Math.random() * TEMPERAMENTS.length)],
+    temperament_hint: TEMPERAMENTS[Math.floor(rand() * TEMPERAMENTS.length)],
   };
 }
 
@@ -1186,7 +1203,7 @@ function sanitizeBeats(raw, hits) {
   const list = Array.isArray(raw?.beats) ? raw.beats : [];
   const out = [];
   for (const r of list.slice(0, 60)) {
-    if (!r || !ACTIONS[r.action]) continue;
+    if (!r || !Object.hasOwn(ACTIONS, r.action)) continue;
     const num = (v, lo, hi, d) => Number.isFinite(+v) ? Math.max(lo, Math.min(hi, +v)) : d;
     const b = { action: r.action, t: num(r.t, 0, 180, 0), dur: num(r.dur, 0.5, 15, 2), intensity: num(r.intensity, 0.2, 1, 0.7), note: String(r.note || '').slice(0, 120) };
     for (const k of ['at', 'hand', 'dir', 'knee']) if (ENUMS[k].includes(r[k])) b[k] = r[k];
@@ -1199,7 +1216,7 @@ function sanitizeBeats(raw, hits) {
 
 // procedural composer: the same vocabulary, drawn from weighted choices
 function proceduralBeats(rep, hits) {
-  const R = Math.random, pick = a => a[Math.floor(R() * a.length)];
+  const R = rand, pick = a => a[Math.floor(R() * a.length)];
   const lead = hits[0], kind = lead ? ZONE_KIND(lead.w.zone) : null, side = lead ? lead.side : 0;
   const beats = [];
   let t = 0.1 + R() * 0.4;
@@ -1275,7 +1292,7 @@ function incidentKind(hits) {
   return t; // chest | abdomen
 }
 function libraryScript(rep, hits) {
-  const c = character, R = Math.random, pick = a => a[Math.floor(R() * a.length)];
+  const c = character, R = rand, pick = a => a[Math.floor(R() * a.length)];
   const kind = incidentKind(hits), low = c.state === 'down' || c.seated || c.fellRunning;
   c.fellRunning = false;
   let pool = SCENARIOS.filter(s => s.kinds.includes(kind));
@@ -1343,11 +1360,11 @@ const FLEE_CHANCE = { near: 0.6, arm: 0.55, 'head-graze': 0.4, heart: 0.35, ches
 function wantsFlee(hits) {
   if (character.run && character.run.mode === 'go') return true; // already running: the new script carries on with it
   if (reactMode === 'stay' || character.run || !canRun()) return false;
-  return reactMode === 'flee' || Math.random() < (FLEE_CHANCE[incidentKind(hits)] ?? 0);
+  return reactMode === 'flee' || rand() < (FLEE_CHANCE[incidentKind(hits)] ?? 0);
 }
 // the flight comes first; the chosen scenario plays on from wherever the run ends
 function fleeScript(lib, hits) {
-  const R = Math.random, pick = a => a[Math.floor(R() * a.length)];
+  const R = rand, pick = a => a[Math.floor(R() * a.length)];
   const lead = hits[0], side = lead ? (lead.side || 1) : (R() < 0.5 ? 1 : -1);
   const zk = lead ? ZONE_KIND(lead.w.zone) : null;
   const meta = { zoneKind: zk, sideSign: side };
@@ -1376,7 +1393,7 @@ function composeAfterShot(hits, nearMiss) {
   if (flee) startScript(fleeScript(lib, hits), { source: lib ? 'lib' : 'proc', title: 'Убегает' + (lib ? ' · ' + lib.title : ''), temperament: lib?.temperament || 'испуганный', id: lib ? lib.id : '' });
   else if (lib) startScript(lib.beats, { source: 'lib', title: lib.title, temperament: lib.temperament, id: lib.id });
   else startScript(proceduralBeats(rep, hits), { source: 'proc', title: hits.length ? 'Процедурный сценарий' : 'Испуг', temperament: '' });
-  if (!sampleFn || !aiWanted || aiOff) return;
+  if (!sampleFn || !aiWanted || aiOff || playback) return; // a case playing back holds its Claude scenarios already
   const ctl = new AbortController();
   script.ctl = ctl; script.pending = true;
   renderScript(script);
@@ -1384,7 +1401,10 @@ function composeAfterShot(hits, nearMiss) {
     if (ctl.signal.aborted || !character.conscious) return;
     const beats = sanitizeBeats(data, hits);
     if (beats.length < 3) throw { code: 'invalid_json' };
-    startScript(beats, { source: 'ai', title: String(data.title || 'Сценарий Claude').slice(0, 80), temperament: String(data.temperament || '').slice(0, 60) });
+    // Claude's answer cannot be asked for again on replay: the case keeps the beats, at the step they take over
+    const ev = { type: 'script', source: 'ai', title: String(data.title || 'Сценарий Claude').slice(0, 80), temperament: String(data.temperament || '').slice(0, 60), beats: JSON.parse(JSON.stringify(beats)) };
+    logInput(ev);
+    playScript(ev);
     log('info', 'Сценарий', `Claude: «${script.title}», ${beats.length} действий на ${Math.round(Math.max(...beats.map(b => b.t + b.dur)))} с.`);
   }).catch(e => {
     if (e?.code === 'cancelled') return;
@@ -1534,7 +1554,12 @@ function react(zone, side, hitDir, w) {
 
 // ---------- shooting ----------
 let weapon = WEAPONS[0], impulseMult = 1;
-const raycaster = new THREE.Raycaster();
+// Where the shooter stands: the origin of the latest shot (before the first one, where the camera starts). The
+// simulation looks, turns and runs relative to this point and never to the camera, which is only the viewer: a
+// replay seen from anywhere else must come out the same.
+const SHOOTER0 = [0.9, 1.45, 4.2];
+const shooter = new THREE.Vector3(...SHOOTER0);
+const raycaster = new THREE.Raycaster(), shotRay = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
 const effects = [];
 // Hit testing against the skinned model. three.js would pose every triangle's corners again for each ray (and once
@@ -1568,7 +1593,7 @@ function hitModel(rc, extra = []) {
 function spreadDir(base, half) {
   const u = new THREE.Vector3().crossVectors(base, Math.abs(base.y) < 0.9 ? UP_Y : new THREE.Vector3(1, 0, 0)).normalize();
   const v = new THREE.Vector3().crossVectors(base, u);
-  const a = Math.random() * Math.PI * 2, r = half * Math.sqrt(Math.random());
+  const a = rand() * Math.PI * 2, r = half * Math.sqrt(rand());
   return base.clone().addScaledVector(u, Math.cos(a) * r).addScaledVector(v, Math.sin(a) * r).normalize();
 }
 // how bad a wound is, to pick the reaction that leads when several land at once
@@ -1583,13 +1608,33 @@ function severity(w) {
   if (t === 'head') return 45;
   return 10 + Math.min(9, w.rate);
 }
+// a click: the ray from the camera through that pixel becomes the shot. It is recorded as a ray, rounded the way the
+// case stores it, so the shot played back is exactly the shot taken
 function shoot(clientX, clientY) {
   const r = canvas.getBoundingClientRect();
   ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
-  const ray = raycaster.ray.clone();
+  fire(raycaster.ray.origin.toArray(), raycaster.ray.direction.toArray());
+}
+function fire(origin, dir) {
+  if (playback || seeking) return; // a case is playing back: the viewer watches, orbits, or takes over first
+  const o = origin.map(v => +(+v).toFixed(6)), d = dir.map(v => +(+v).toFixed(6));
+  logInput({ type: 'shot', origin: o, dir: d });
+  shootRay(new THREE.Vector3(...o), new THREE.Vector3(...d));
+}
+// everything a shot does, from a ray in world metres (origin, unit direction); never reads the camera
+function shootRay(origin, direction) {
+  const ray = new THREE.Ray(origin.clone(), direction.clone().normalize());
+  shooter.copy(origin);
+  // hit testing reads the meshes and the posed skin: bring them to this physics state, whatever was last drawn
+  syncMeshes(); poseRig(); scene.updateMatrixWorld();
   poseSkinProxies();
-  const muzzle = camera.position.clone().add(new THREE.Vector3(0.12, -0.12, 0).applyQuaternion(camera.quaternion));
+  // the muzzle sits a little right of and below the eye, square to the line of fire
+  const right = new THREE.Vector3().crossVectors(ray.direction, UP_Y);
+  if (right.lengthSq() < 1e-8) right.set(1, 0, 0);
+  right.normalize();
+  const muzzle = ray.origin.clone().addScaledVector(right, 0.12).addScaledVector(new THREE.Vector3().crossVectors(right, ray.direction), -0.12);
+  const raycaster = shotRay;
   const n = weapon.pellets || 1;
   const p = weapon.m * weapon.v * impulseMult; // per projectile
   const wounds = [];
@@ -1613,7 +1658,6 @@ function shoot(clientX, clientY) {
       .applyQuaternion(toQ(byName.chest.body.rotation(), new THREE.Quaternion()).invert());
     wounds.push({ w, dir, side: Math.abs(local.x) < 0.04 ? 0 : Math.sign(local.x), part });
   }
-  raycaster.set(ray.origin, ray.direction);
   if (wounds.length) {
     // the worst wound leads the reaction; the others still apply their own effects
     wounds.sort((a, b) => severity(b.w) - severity(a.w));
@@ -1636,8 +1680,10 @@ function shoot(clientX, clientY) {
       log('info', 'Сбит с ног', 'Такой толчок выбивает из равновесия. Настоящая пуля этого не делает.');
     }
     composeAfterShot(wounds);
-    emit('shot', { weapon: weapon.id, hit: true, kind: incidentKind(wounds), zones: [...new Set(wounds.map(x => x.w.zone))],
-      organs: [...new Set(wounds.flatMap(x => x.w.organs.map(o => o.name)))], nearMissCm: null });
+    const info = { weapon: weapon.id, hit: true, kind: incidentKind(wounds), zones: [...new Set(wounds.map(x => x.w.zone))],
+      organs: [...new Set(wounds.flatMap(x => x.w.organs.map(o => o.name)))], nearMissCm: null };
+    noteShot(info);
+    emit('shot', info);
     return;
   }
   const pAll = p * n;
@@ -1666,7 +1712,9 @@ function shoot(clientX, clientY) {
     startle(0.5 * (1 - floorDist / 1.5), side);
     log('near', `Пол в ${floorDist.toFixed(1)} м`, character.conscious ? 'Удар в пол рядом: короткое вздрагивание.' : 'Реакции нет.');
   } else log('info', 'Промах', 'Слишком далеко, реакции нет.');
-  emit('shot', { weapon: weapon.id, hit: false, kind: 'near', zones: [], organs: [], nearMissCm: best < 0.9 ? Math.round(best * 100) : null });
+  const info = { weapon: weapon.id, hit: false, kind: 'near', zones: [], organs: [], nearMissCm: best < 0.9 ? Math.round(best * 100) : null };
+  noteShot(info);
+  emit('shot', info);
 }
 function sideOfShot(ray) {
   // Which side of the mannequin did the bullet pass on (+1 = its left)?
@@ -1685,6 +1733,7 @@ function tracer(a, b, alpha = 0.9) {
   scene.add(line);
   effects.push({ obj: line, life: 0.35, age: 0, update(e, k) { e.obj.material.opacity = alpha * (1 - k); }, done() { g.dispose(); mat.dispose(); } });
 }
+// dust, droplets and tracers are only seen: they use Math.random and nothing in the simulation reads them
 function dust(pt, count = 10) {
   const geo = new THREE.IcosahedronGeometry(0.02, 0);
   const mat = new THREE.MeshBasicMaterial({ color: cssVar('--scene-grid'), transparent: true });
@@ -1839,7 +1888,7 @@ function woundTrack(part, entry, dir) {
 }
 const BLOOD_VOLUME = 70 * BODY_MASS; // ~70 ml of blood per kg
 const fmtRate = r => r >= 1 ? `${r.toFixed(r < 10 ? 1 : 0)} мл/с` : `${Math.round(r * 60)} мл/мин`;
-const rnd = ([lo, hi]) => lo + Math.random() * (hi - lo);
+const rnd = ([lo, hi]) => lo + rand() * (hi - lo);
 let physMult = 1, showBlood = true, xray = false;
 const bloodGroup = new THREE.Group();
 scene.add(bloodGroup);
@@ -1884,7 +1933,7 @@ function addWound(part, hit, dir) {
     if (outHit) addWoundSlot(w, outHit.object, domBone(outHit), outHit.point, rOut);
   }
   c.wounds.push(w);
-  if (w.arrest && c.arrestAt === null) c.arrestAt = c.physT + 8 + Math.random() * 7;
+  if (w.arrest && c.arrestAt === null) c.arrestAt = c.physT + 8 + rand() * 7;
   spatter(hit.point, dir);
   if (track.perforating) spatter(track.exit, dir);
   return w;
@@ -2120,6 +2169,210 @@ function record() {
 function applyFrame(f) {
   parts.forEach((p, i) => { p.mesh.position.set(f[i * 7], f[i * 7 + 1], f[i * 7 + 2]); p.mesh.quaternion.set(f[i * 7 + 3], f[i * 7 + 4], f[i * 7 + 5], f[i * 7 + 6]); });
 }
+// the picture replay poses the skeleton from old frames; afterwards the bones go back to what the simulation left
+function endReplay() {
+  if (!replay) return;
+  for (const [b, q, p] of replay.bones) { b.quaternion.copy(q); b.position.copy(p); }
+  replay = null; document.getElementById('replayBadge').hidden = true;
+  syncMeshes();
+}
+
+// ---------- the case: seed, inputs by physics step, playback ----------
+// A case (docs/contracts/case-v1.md) is the seed and every input stamped with the physics step before which it
+// applies: step 0 is the first step after a reset, an input with step n is applied after n steps have run. Inputs
+// are settings, shots as rays, and scenarios written by Claude, which cannot be asked for again. Library and
+// procedural scenarios are drawn again from the seed and are not recorded. Real time never enters: the frame loop
+// only decides how many steps to run.
+const CHECK_EVERY = 1200, MAX_STEPS = 120 * 180, MAX_EVENTS = 200, MAX_BYTES = 64 * 1024;
+const BUILD = document.querySelector('meta[name=build]')?.content || 'dev';
+let caseSeed = 0, stepNo = 0, caseLog = [], caseChecks = [], caseShots = [];
+let playback = null; // a loaded case playing back: { c, i: index of the next input, ended }
+let seeking = 0, seekGen = 0; // the running seek's number, 0 when none
+const press = (ids, on) => ids.forEach(x => document.getElementById(x).setAttribute('aria-pressed', x === on));
+const IMP_NOTE = { real: 'Физически верный импульс p = m·v. Тело почти не сдвигается.', movie: 'Импульс ×30, как в кино. Так пуля не работает: стрелка отбросило бы так же.' };
+// what a setting event can say, and how it is applied (the buttons show it too)
+const SETTINGS = {
+  weapon: { values: WEAPONS.map(w => w.id), get: () => weapon.id,
+    set(v) { weapon = WEAPONS.find(w => w.id === v); press(WEAPONS.map(w => 'w-' + w.id), 'w-' + v); } },
+  impulse: { values: ['real', 'movie'], get: () => impulseMult === 1 ? 'real' : 'movie',
+    set(v) { impulseMult = v === 'movie' ? 30 : 1; press(['impReal', 'impMovie'], v === 'movie' ? 'impMovie' : 'impReal'); document.getElementById('impNote').textContent = IMP_NOTE[v]; } },
+  react: { values: ['auto', 'flee', 'stay'], get: () => reactMode,
+    set(v) { reactMode = v; press(['rAuto', 'rFlee', 'rStay'], { auto: 'rAuto', flee: 'rFlee', stay: 'rStay' }[v]); } },
+  bleed: { values: [1, 10], get: () => physMult, // the blood-loss speed-up
+    set(v) { physMult = v; press(['ph1', 'ph10'], v === 10 ? 'ph10' : 'ph1'); } },
+};
+const SETTINGS0 = { weapon: 'pistol', impulse: 'real', react: 'auto', bleed: 1 }; // what a case without settings plays with
+// a setting changed by the viewer; while a case plays back its own settings hold and the buttons go back to them
+function userSetting(key, v) {
+  const S = SETTINGS[key];
+  if (playback || seeking || !S.values.includes(v)) { S.set(S.get()); return; }
+  if (S.get() === v) return;
+  S.set(v);
+  logInput({ type: 'setting', key, value: v });
+}
+function logInput(e) {
+  if (playback) return; // a case playing back already holds its inputs
+  // a setting changed again within the same step, with nothing but settings since, keeps only its last value
+  if (e.type === 'setting') for (let i = caseLog.length - 1; i >= 0 && caseLog[i].step === stepNo && caseLog[i].type === 'setting'; i--)
+    if (caseLog[i].key === e.key) { caseLog[i].value = e.value; return; }
+  caseLog.push({ step: stepNo, ...e });
+}
+// a reset with a seed: step 0 of a new case
+function startCase(seed) {
+  caseSeed = seed >>> 0; rand = mulberry32(caseSeed);
+  stepNo = 0; caseLog = []; caseChecks = []; caseShots = [];
+  shooter.set(...SHOOTER0);
+  recentScenarios.length = 0; beatUid = 0; // the library avoids recent scenarios: "recent" starts again with the case
+  buildWorld();
+  for (const k in SETTINGS) logInput({ type: 'setting', key: k, value: SETTINGS[k].get() }); // the settings in force at step 0
+}
+// one physics step with everything the case needs around it: the step count, the state hashes, and the inputs of a
+// case playing back. Every step goes through here, in real time or fast-forward.
+function simStep() {
+  if (replay) endReplay(); // the 5-second picture replay is only a picture
+  step();
+  stepNo++;
+  if (stepNo % CHECK_EVERY === 0) {
+    const hash = stateHash();
+    caseChecks.push({ step: stepNo, hash });
+    const want = playback?.c.check?.find(k => k.step === stepNo);
+    if (want && want.hash !== hash && !playback.diverged) {
+      playback.diverged = stepNo;
+      console.warn(`case: the replay differs from the recording at step ${stepNo} (built by ${playback.c.build}, this is ${BUILD})`);
+    }
+  }
+  // the activation metric: a scenario watched for 10 s of simulated time
+  if (script && !script.watched && simTime - script.t0 >= 10) { script.watched = true; emit('reaction-watched', { id: script.id || null, seconds: 10 }); }
+  if (playback) playDue();
+}
+// apply the inputs of the case playing back that are due at this step, and notice its end
+function playDue() {
+  const pb = playback, ev = pb.c.events;
+  while (playback === pb && pb.i < ev.length && ev[pb.i].step <= stepNo) applyInput(ev[pb.i++]);
+  if (playback === pb && !pb.ended && stepNo >= pb.c.steps) { pb.ended = true; emit('replay-end'); }
+}
+function applyInput(e) {
+  if (e.type === 'setting') SETTINGS[e.key].set(e.value);
+  else if (e.type === 'shot') shootRay(new THREE.Vector3(...e.origin), new THREE.Vector3(...e.dir));
+  else if (e.type === 'script') playScript(e);
+}
+// a scenario from a script event: the same beats, checked again, whether it was just written or comes from a case
+function playScript(e) {
+  startScript(cleanBeats(e.beats), { source: 'ai', title: String(e.title || 'Сценарий Claude').slice(0, 80), temperament: String(e.temperament || '').slice(0, 60) });
+}
+const ZONE_KINDS = ['head', 'chest', 'abdomen', 'pelvis', 'leg', 'arm'];
+function cleanBeats(list) {
+  const num = (v, lo, hi, d) => Number.isFinite(+v) ? Math.max(lo, Math.min(hi, +v)) : d;
+  return (Array.isArray(list) ? list : []).slice(0, 60).filter(r => r && Object.hasOwn(ACTIONS, r.action)).map(r => {
+    const b = { action: r.action, t: num(r.t, 0, 180, 0), dur: num(r.dur, 0.5, 15, 2), intensity: num(r.intensity, 0.2, 1, 0.7), note: String(r.note || '').slice(0, 120) };
+    for (const k of ['at', 'hand', 'dir', 'knee']) if (ENUMS[k].includes(r[k])) b[k] = r[k];
+    if (ZONE_KINDS.includes(r.zoneKind)) b.zoneKind = r.zoneKind;
+    if ([-1, 0, 1].includes(r.sideSign)) b.sideSign = r.sideSign;
+    return b;
+  }).sort((a, b) => a.t - b.t);
+}
+// State hash (case-v1.md, rule 4): FNV-1a over the positions and rotations of the 14 bodies rounded to 1e-4, the
+// character's state, the blood lost rounded to 0.1 ml, and the running beats, each named "<index in the
+// scenario>:<action>". 8 hex characters.
+function stateHash() {
+  let h = 0x811c9dc5;
+  const add = s => { for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); } };
+  for (const p of parts) {
+    const t = p.body.translation(), q = p.body.rotation();
+    add([t.x, t.y, t.z, q.x, q.y, q.z, q.w].map(v => Math.round(v * 1e4)).join(',') + ';');
+  }
+  add('|' + character.state + '|' + Math.round(character.lost * 10) + '|');
+  if (script) add(script.beats.flatMap((b, i) => b.state === 'run' ? [i + ':' + b.action] : []).join(','));
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+// what the case is about, from its last hit (or its last shot if nothing hit): for titles and search only
+const WEAPON_RU = { pistol: 'пистолет', rifle: 'винтовка', buck: 'картечь', slug: 'пуля 12 калибра' };
+function noteShot(info) {
+  const what = info.organs[0] || info.zones[0];
+  const title = (what ? what[0].toUpperCase() + what.slice(1) : 'Пролёт') + ', ' + WEAPON_RU[info.weapon];
+  caseShots.push({ step: stepNo, hit: info.hit, meta: { title, weapon: info.weapon, kind: info.kind, zones: [...info.zones], organs: [...info.organs] } });
+}
+// The case of everything since the last reset. Kept within the format's limits: past 180 s, 200 inputs or 64 KB it
+// ends at the step of the first input that does not fit (a shorter case that still replays exactly).
+function getCase() {
+  if (playback) return JSON.parse(JSON.stringify(playback.c));
+  let steps = stepNo, events = caseLog, cut = false;
+  const cutAt = s => { steps = s; events = events.filter(e => e.step < s); cut = true; };
+  if (steps > MAX_STEPS) cutAt(MAX_STEPS);
+  if (events.length > MAX_EVENTS) cutAt(events[MAX_EVENTS].step);
+  for (;;) {
+    const shots = caseShots.filter(x => x.step < steps || (x.step === steps && !cut));
+    const meta = (shots.findLast(x => x.hit) || shots.at(-1))?.meta || { title: 'Без выстрела', weapon: weapon.id, kind: 'none', zones: [], organs: [] };
+    const c = { v: 1, seed: caseSeed, build: BUILD, steps, events, check: caseChecks.filter(k => k.step <= steps), meta };
+    const json = JSON.stringify(c);
+    if (new TextEncoder().encode(json).length <= MAX_BYTES || !events.length) return JSON.parse(json);
+    cutAt(events.at(-1).step);
+  }
+}
+// a case from outside (a link, the server): checked against the format before anything runs it
+function checkCase(raw) {
+  const bad = why => { throw new Error('Не удалось открыть повтор: ' + why + '.'); };
+  if (!raw || typeof raw !== 'object') bad('это не запись реакции');
+  if (raw.v !== 1) bad('запись сделана в другом формате, этот симулятор его не знает');
+  const c = JSON.parse(JSON.stringify(raw));
+  const int = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
+  if (!int(c.seed, 0, 0xffffffff)) bad('в записи нет зерна случайных чисел');
+  if (!int(c.steps, 0, MAX_STEPS)) bad('длительность записи вне пределов');
+  if (!Array.isArray(c.events) || c.events.length > MAX_EVENTS) bad('в записи нет списка действий или он слишком длинный');
+  const vec = a => Array.isArray(a) && a.length === 3 && a.every(Number.isFinite);
+  let prev = 0;
+  for (const e of c.events) {
+    if (!e || !int(e.step, prev, c.steps)) bad('действия записи не по порядку шагов');
+    prev = e.step;
+    if (e.type === 'setting') { if (!Object.hasOwn(SETTINGS, e.key) || !SETTINGS[e.key].values.includes(e.value)) bad('неизвестная настройка'); }
+    else if (e.type === 'shot') { if (!vec(e.origin) || !vec(e.dir) || Math.hypot(...e.dir) < 0.5) bad('выстрел записан неверно'); }
+    else if (e.type === 'script') { if (!Array.isArray(e.beats)) bad('сценарий записан неверно'); }
+    else bad('неизвестное действие в записи');
+  }
+  if (c.check !== undefined && !Array.isArray(c.check)) bad('контрольные суммы записаны неверно');
+  return c;
+}
+// reset with the case's seed and play its inputs back: the step-0 inputs now, the rest as the frame loop gets there
+function playFromStart(c) {
+  stopSeek(); endReplay();
+  playback = { c, i: 0, ended: false };
+  for (const k in SETTINGS0) SETTINGS[k].set(SETTINGS0[k]);
+  startCase(c.seed);
+  acc = 0;
+}
+async function loadCase(raw) {
+  const c = checkCase(raw);
+  playFromStart(c);
+  emit('case-loaded', { case: JSON.parse(JSON.stringify(c)) });
+  playDue();
+}
+// jump to a step: replay from 0 as fast as possible without drawing (in slices, so the page stays responsive),
+// then play on in real time. Without a loaded case it rewinds the session itself, which then plays back.
+async function seek(to) {
+  const c = playback ? playback.c : getCase();
+  to = Math.max(0, Math.min(c.steps, Math.floor(+to) || 0));
+  playFromStart(c);
+  playDue();
+  const gen = seeking = ++seekGen;
+  let t0 = performance.now(); // only to slice the work, never read by the simulation
+  while (stepNo < to) {
+    simStep();
+    if (performance.now() - t0 > 30) {
+      await new Promise(r => setTimeout(r));
+      if (seeking !== gen) return; // another seek, a load or a reset took over
+      t0 = performance.now();
+    }
+  }
+  seeking = 0; acc = 0;
+}
+function stopSeek() { seeking = 0; }
+// the viewer carries on from here: the inputs played so far stay in the case, new ones are recorded on top
+function takeOver() {
+  if (!playback) return;
+  stopSeek();
+  caseLog = JSON.parse(JSON.stringify(playback.c.events.slice(0, playback.i)));
+  playback = null; acc = 0;
+}
 
 // ---------- simulation loop ----------
 function step() {
@@ -2160,6 +2413,9 @@ function step() {
     character.kneel = null;
   }
   if (++stepCount % 2 === 0) record();
+  // The skeleton is posed here, once per step, and not when a frame is drawn: the run clip, its blending and the hit
+  // testing all start from the bones, so they must be a function of the physics state alone, whatever the frame rate.
+  syncMeshes(); poseRig();
 }
 function syncMeshes() {
   for (const p of parts) {
@@ -2215,12 +2471,15 @@ function frame(now) {
   if (!document.hidden && dtRaw < 1) adaptQuality(dtRaw);
   if (replay) {
     replay.i += dtReal * 60 * 0.25;
-    if (replay.i >= replay.frames.length - 1) { replay = null; document.getElementById('replayBadge').hidden = true; syncMeshes(); }
-    else applyFrame(replay.frames[Math.floor(replay.i)]);
-  } else {
+    if (replay.i >= replay.frames.length - 1) endReplay();
+    else { applyFrame(replay.frames[Math.floor(replay.i)]); poseRig(); }
+  } else if (!seeking) { // real time only decides how many fixed steps run; a seek runs them itself
     acc += dtReal * timeScale;
     let n = 0;
-    while (acc >= DT && n < 8) { step(); acc -= DT; n++; }
+    while (acc >= DT && n < 8) {
+      if (playback?.ended) { acc = 0; break; } // the case is over: it holds its last step until the viewer takes over
+      simStep(); acc -= DT; n++;
+    }
     if (n === 8) acc = 0;
     syncMeshes();
   }
@@ -2233,7 +2492,6 @@ function frame(now) {
     e.update(e, k, dtReal);
     if (k >= 1) { scene.remove(e.obj); effects.splice(i, 1); e.done?.(); }
   }
-  poseRig();
   const pl = byName.pelvis.mesh.position;
   // the shadow box travels with the body, so a runner keeps a shadow
   if (Number.isFinite(pl.x + pl.z)) { // in half-metre steps: a box sliding with every sway would make shadow edges shimmer
@@ -2283,7 +2541,7 @@ WEAPONS.forEach((w, i) => {
   b.setAttribute('aria-pressed', i === 0);
   const n = w.pellets || 1;
   b.innerHTML = `<b>${w.name}</b><span class="p">${(w.m * w.v * n).toFixed(1)} Н·с</span><span class="spec">${n > 1 ? n + ' × ' : ''}${(w.m * 1000).toLocaleString('ru')} г × ${w.v} м/с</span>`;
-  b.onclick = () => { weapon = w; wEl.querySelectorAll('.weapon').forEach(x => x.setAttribute('aria-pressed', x === b)); };
+  b.onclick = () => userSetting('weapon', w.id);
   wEl.append(b);
 });
 function segment(ids, onPick) {
@@ -2292,17 +2550,12 @@ function segment(ids, onPick) {
     onPick(id);
   });
 }
-segment(['impReal', 'impMovie'], id => {
-  impulseMult = id === 'impMovie' ? 30 : 1;
-  document.getElementById('impNote').textContent = impulseMult === 1
-    ? 'Физически верный импульс p = m·v. Тело почти не сдвигается.'
-    : 'Импульс ×30, как в кино. Так пуля не работает: стрелка отбросило бы так же.';
-});
+segment(['impReal', 'impMovie'], id => userSetting('impulse', id === 'impMovie' ? 'movie' : 'real'));
 const setTime = id => { timeScale = { t1: 1, t025: 0.25, t0: 0 }[id]; };
 segment(['t1', 't025', 't0'], setTime);
 segment(['qAuto', 'qHigh', 'qLow'], id => setQuality({ qAuto: 'auto', qHigh: 'high', qLow: 'low' }[id]));
-segment(['rAuto', 'rFlee', 'rStay'], id => { reactMode = { rAuto: 'auto', rFlee: 'flee', rStay: 'stay' }[id]; });
-segment(['ph1', 'ph10'], id => { physMult = id === 'ph10' ? 10 : 1; });
+segment(['rAuto', 'rFlee', 'rStay'], id => userSetting('react', { rAuto: 'auto', rFlee: 'flee', rStay: 'stay' }[id]));
+segment(['ph1', 'ph10'], id => userSetting('bleed', id === 'ph10' ? 10 : 1));
 document.getElementById('showBlood').addEventListener('change', e => setBloodVisible(e.target.checked));
 document.getElementById('xrayBox').addEventListener('change', e => setXray(e.target.checked));
 document.getElementById('aiBox').addEventListener('change', e => { aiWanted = e.target.checked; });
@@ -2310,12 +2563,12 @@ updateAiNote();
 function pickTime(id) { document.getElementById(id).click(); }
 function startReplay() {
   if (history.length < 10) return;
-  replay = { frames: history.slice(), i: 0 };
+  replay = { frames: history.slice(), i: 0, bones: restLocal.map(([b]) => [b, b.quaternion.clone(), b.position.clone()]) };
   document.getElementById('replayBadge').hidden = false;
 }
 function reset() {
-  replay = null; document.getElementById('replayBadge').hidden = true;
-  buildWorld();
+  stopSeek(); playback = null; endReplay();
+  startCase(newSeed());
   log('info', 'Сброс', 'Манекен снова стоит.');
   emit('reset');
 }
@@ -2362,7 +2615,7 @@ function updateHover() {
 }
 
 applyTheme();
-buildWorld();
+startCase(newSeed());
 resize();
 document.getElementById('loading').remove();
 log('info', 'Готово', 'Манекен стоит в 4 м от камеры. Выстрел идёт из точки, где находится камера.');
@@ -2376,7 +2629,19 @@ log('info', 'Готово', 'Манекен стоит в 4 м от камеры
   renderer.compile(scene, camera);
   for (const o of warm) scene.remove(o);
 }
+// the simulator's API for the features around it (docs/contracts/sim-api.md)
+Object.assign(sim, {
+  getCase, loadCase, takeOver, seek, stateHash, canvas,
+  setBlood(on) { setBloodVisible(!!on); document.getElementById('showBlood').checked = !!on; },
+});
+Object.defineProperties(sim, {
+  step: { get: () => stepNo, enumerable: true },
+  replaying: { get: () => !!playback, enumerable: true },
+});
 emit('ready');
-// test hook: ?debug exposes the simulation to automated tests
-if (new URLSearchParams(location.search).has('debug')) window.__sim = { byName: () => byName, parts: () => parts, shoot, character: () => character, step, setTime, layers, camera, controls, renderer, scene, setPhys: v => { physMult = v; }, pools: () => pools, drops: () => drops, setXray, woundSlots, script: () => script };
+// test hook: ?debug exposes the simulation to automated tests. step() runs one physics step the way the frame loop
+// does (inputs of a case playing back included); fire(origin, dir) is a recorded shot along a ray; reset(seed) starts
+// a case with that seed; setting(key, value) is a setting changed by the viewer.
+if (new URLSearchParams(location.search).has('debug')) window.__sim = { byName: () => byName, parts: () => parts, shoot, character: () => character, step: simStep, setTime, layers, camera, controls, renderer, scene, setPhys: v => userSetting('bleed', v), pools: () => pools, drops: () => drops, setXray, woundSlots, script: () => script,
+  sim, fire, setting: userSetting, reset: seed => { stopSeek(); playback = null; endReplay(); startCase(seed ?? newSeed()); }, checks: () => caseChecks.slice(), seed: () => caseSeed };
 requestAnimationFrame(frame);
