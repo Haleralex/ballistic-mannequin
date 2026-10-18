@@ -37,6 +37,20 @@ const FILTER = {
   legR: groups(G_LEGR, G_GROUND | G_ARMS | G_LEGL),
   ground: groups(G_GROUND, 0xffff),
 };
+// Every random draw that can change the bodies, the scenario or the physiology comes from one seeded generator
+// (mulberry32), started again from the case's seed at every reset: the same seed and the same inputs give the same
+// reaction (docs/contracts/case-v1.md). Purely visual randomness (dust, blood droplets) stays on Math.random and
+// never feeds back into the simulation.
+function mulberry32(a) {
+  return () => {
+    a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const newSeed = () => crypto.getRandomValues(new Uint32Array(1))[0];
+let rand = mulberry32(newSeed()); // started again from the case's seed at every reset
 const ZONE_LABEL = {
   head: 'голова', chest: 'грудная клетка', abdomen: 'живот', pelvis: 'таз',
   uArmL: 'левое плечо', fArmL: 'левое предплечье', uArmR: 'правое плечо', fArmR: 'правое предплечье',
@@ -240,7 +254,7 @@ for (const m of modelMeshes) {
 const tq = new THREE.Quaternion(), pq = new THREE.Quaternion(), tv = new THREE.Vector3();
 
 // motion capture for running: the clips that ship with the model
-const mixer = new THREE.AnimationMixer(model);
+let mixer = new THREE.AnimationMixer(model);
 const CLIPS = Object.fromEntries(gltf.animations.map(a => [a.name, a]));
 const CLIP_SPEED = { run: 3.55, walk: 1.5 }; // m/s of ground covered by the planted foot, measured from the clips
 const DRIVEN = new Set(DRIVE.map(d => d.bone));
@@ -252,7 +266,10 @@ const PART_BONE = { pelvis: 'Hips', abdomen: 'Spine1', chest: 'Spine2', head: 'H
 const PART_REST = Object.fromEntries(Object.entries(PART_BONE).map(([n, b]) => [n, {
   bone: rigBones[b], qInv: rigBones[b].getWorldQuaternion(new THREE.Quaternion()).invert(), pos: rigBones[b].getWorldPosition(new THREE.Vector3()) }]));
 function resetRig() {
-  mixer.stopAllAction();
+  // a fresh mixer at every reset: an old one carries its clock, its actions' time scales and the last values it
+  // wrote, and a case must start from the same state as on a freshly opened page
+  mixer.stopAllAction(); mixer.uncacheRoot(model);
+  mixer = new THREE.AnimationMixer(model);
   for (const [b, q, p] of restLocal) { b.quaternion.copy(q); b.position.copy(p); }
   model.position.set(0, 0, 0); model.quaternion.identity(); model.updateMatrixWorld(true);
 }
@@ -299,20 +316,20 @@ function runHit(wounds) {
   if (!wounds.length) return true; // a bullet past the ear: the run goes on
   const kind = incidentKind(wounds), lead = wounds[0];
   const drops = kind === 'multi' ? 0.75 : ['chest', 'abdomen', 'pelvis-soft', 'neck'].includes(kind) ? 0.35 : 0;
-  if (Math.random() < drops) {
+  if (rand() < drops) {
     releaseRun(true);
     c.balanceTarget = 0; c.balanceRate = 2.5; c.noLift = true; c.fellRunning = true;
     return false;
   }
   // the ragdoll takes the hit: dynamic again with the run's velocities, then the bullet's push on the struck part
   const torso = ['chest', 'abdomen', 'pelvis', 'neck'].includes(ZONE_KIND(lead.w.zone));
-  r.phys = { t0: r.t, dur: 0.8 + Math.random() * 0.3, depth: torso ? 0.35 + Math.random() * 0.45 : 0.25 + Math.random() * 0.25 };
+  r.phys = { t0: r.t, dur: 0.8 + rand() * 0.3, depth: torso ? 0.35 + rand() * 0.45 : 0.25 + rand() * 0.25 };
   for (const p of parts) {
     const k = r.kin[p.n];
     p.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
     p.body.setLinvel(k.v, true); p.body.setAngvel(k.w, true);
   }
-  const push = 14 + Math.random() * 10;
+  const push = 14 + rand() * 10;
   for (const x of wounds) x.part.body.applyImpulse({ x: x.dir.x * push, y: 0, z: x.dir.z * push }, true);
   r.v *= 0.6;
   r.vmax = Math.min(r.vmax, runPace(0.6));
@@ -324,7 +341,7 @@ function startRun(vmax, dirH) {
   const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(toQ(pel.rotation(), rq));
   const clip = vmax < 2.4 ? 'walk' : 'run';
   const r = { mode: 'go', t: 0, v: 0, vmax, dirH, heading: Math.atan2(fwd.x, fwd.z), root: { x: pt.x, z: pt.z }, clip, w: 0, idle: null,
-    lookAt: 1.2 + Math.random() * 1.5, snap: {}, kin: {}, animQ: {}, animP: {}, phys: null, blend0: 0 };
+    lookAt: 1.2 + rand() * 1.5, snap: {}, kin: {}, animQ: {}, animP: {}, phys: null, blend0: 0 };
   for (const p of parts) {
     const t = p.body.translation(), q = p.body.rotation();
     r.snap[p.n] = { p: new THREE.Vector3(t.x, t.y, t.z), q: new THREE.Quaternion(q.x, q.y, q.z, q.w) };
@@ -335,7 +352,7 @@ function startRun(vmax, dirH) {
   mixer.stopAllAction();
   r.action = mixer.clipAction(CLIPS[clip]);
   r.action.reset().setEffectiveWeight(1).play();
-  r.action.time = Math.random() * CLIPS[clip].duration;
+  r.action.time = rand() * CLIPS[clip].duration;
   c.run = r;
 }
 // hand the body back to the ragdoll at the pose and with the velocity the clip gave it
@@ -594,12 +611,12 @@ function buildWorld() {
     vigor: 1, lost: 0, bleedRate: 0, physT: 0, wounds: [], stage: 0, arrestAt: null, sway: null, heading: 0, run: null };
   clearBlood();
   woundSlots.length = 0;
-  character.breath = 0; character.ph = Array.from({ length: 14 }, () => Math.random() * 6.28);
+  character.breath = 0; character.ph = Array.from({ length: 14 }, () => rand() * 6.28);
   character.life = addLayer({}, { attack: 1, hold: Infinity, release: 0.5, tag: 'life' });
   character.cap = {}; character.supportShift = new THREE.Vector3(); character.breathBoost = 0; character.lifeDamp = 1; character.tremble = 0;
   stopScript(); renderScript(null);
   setState('ok');
-  syncMeshes();
+  syncMeshes(); poseRig();
 }
 
 // ---------- pose layers ----------
@@ -755,7 +772,7 @@ function setState(s) {
   document.getElementById('stateText').textContent = { ok: 'стоит', wounded: 'ранен, на ногах', kneel: 'на колене', sit: 'сидит', down: 'упал' }[s];
 }
 
-const jitter = (x, k = 0.3) => x * (1 + (Math.random() * 2 - 1) * k);
+const jitter = (x, k = 0.3) => x * (1 + (rand() * 2 - 1) * k);
 // every reaction is drawn fresh: each joint's offset and the timing vary, so no two look the same
 function addVaried(pose, env, k = 0.3) {
   const out = {};
@@ -776,7 +793,7 @@ function startle(intensity, side) {
   }
   if (k < 0.08) return;
   const away = -side;
-  const variant = Math.random();
+  const variant = rand();
   const legs = { thighL: [-0.35, 0, 0], thighR: [-0.35, 0, 0], shinL: [0.6, 0, 0], shinR: [0.6, 0, 0] };
   let pose;
   if (variant < 0.4) pose = { // arms come up over the head
@@ -934,7 +951,7 @@ const ACTIONS = {
     const left = new THREE.Vector3(fwd.z, 0, -fwd.x);
     const v = { back: fwd.clone().negate(), forward: fwd, left, right: left.clone().negate() }[b.dir] || fwd.clone().negate();
     b.vec = v.multiplyScalar(0.07 + 0.08 * b.intensity);
-    const S = b.dir === 'left' ? 'L' : b.dir === 'right' ? 'R' : (Math.random() < 0.5 ? 'L' : 'R'), s = S === 'L' ? 1 : -1;
+    const S = b.dir === 'left' ? 'L' : b.dir === 'right' ? 'R' : (rand() < 0.5 ? 'L' : 'R'), s = S === 'L' ? 1 : -1;
     const leg = b.dir === 'back' ? [0.35, 0, 0] : b.dir === 'forward' ? [-0.45, 0, 0] : [-0.15, 0, 0.25 * s];
     const layer = addLayer({ ['thigh' + S]: leg, ['shin' + S]: [0.9, 0, 0] }, { attack: 0.15, hold: Math.min(0.35, b.dur * 0.3), release: 0.3, tag: 'ai-legs' });
     for (const l of layers) if (l.tag === 'buckle') fadeOut(l, 0.4);
@@ -1034,7 +1051,7 @@ const ACTIONS = {
     const p = byName.pelvis.body.translation();
     // away from the shooter, angled off to one side the way people run for cover
     const away = Math.atan2(p.x - camera.position.x, p.z - camera.position.z);
-    const off = b.dir === 'left' ? 0.55 : b.dir === 'right' ? -0.55 : (Math.random() - 0.5) * 0.9;
+    const off = b.dir === 'left' ? 0.55 : b.dir === 'right' ? -0.55 : (rand() - 0.5) * 0.9;
     const vmax = runPace(b.intensity);
     // poses held from before would pull the body back into them once the run hands it back
     for (const l of layers) if (l.tag !== 'life') fadeOut(l, 0.3);
@@ -1138,7 +1155,7 @@ function incidentReport(hits, nearMiss) {
       arm_unusable: ['L', 'R'].filter(S => (c.cap['uArm' + S] ?? 1) <= 0.1),
     },
     earlier_wounds: c.wounds.filter(w => !hits.some(x => x.w === w)).map(w => `${w.zone}: ${w.name}`),
-    temperament_hint: TEMPERAMENTS[Math.floor(Math.random() * TEMPERAMENTS.length)],
+    temperament_hint: TEMPERAMENTS[Math.floor(rand() * TEMPERAMENTS.length)],
   };
 }
 
@@ -1199,7 +1216,7 @@ function sanitizeBeats(raw, hits) {
 
 // procedural composer: the same vocabulary, drawn from weighted choices
 function proceduralBeats(rep, hits) {
-  const R = Math.random, pick = a => a[Math.floor(R() * a.length)];
+  const R = rand, pick = a => a[Math.floor(R() * a.length)];
   const lead = hits[0], kind = lead ? ZONE_KIND(lead.w.zone) : null, side = lead ? lead.side : 0;
   const beats = [];
   let t = 0.1 + R() * 0.4;
@@ -1275,7 +1292,7 @@ function incidentKind(hits) {
   return t; // chest | abdomen
 }
 function libraryScript(rep, hits) {
-  const c = character, R = Math.random, pick = a => a[Math.floor(R() * a.length)];
+  const c = character, R = rand, pick = a => a[Math.floor(R() * a.length)];
   const kind = incidentKind(hits), low = c.state === 'down' || c.seated || c.fellRunning;
   c.fellRunning = false;
   let pool = SCENARIOS.filter(s => s.kinds.includes(kind));
@@ -1343,11 +1360,11 @@ const FLEE_CHANCE = { near: 0.6, arm: 0.55, 'head-graze': 0.4, heart: 0.35, ches
 function wantsFlee(hits) {
   if (character.run && character.run.mode === 'go') return true; // already running: the new script carries on with it
   if (reactMode === 'stay' || character.run || !canRun()) return false;
-  return reactMode === 'flee' || Math.random() < (FLEE_CHANCE[incidentKind(hits)] ?? 0);
+  return reactMode === 'flee' || rand() < (FLEE_CHANCE[incidentKind(hits)] ?? 0);
 }
 // the flight comes first; the chosen scenario plays on from wherever the run ends
 function fleeScript(lib, hits) {
-  const R = Math.random, pick = a => a[Math.floor(R() * a.length)];
+  const R = rand, pick = a => a[Math.floor(R() * a.length)];
   const lead = hits[0], side = lead ? (lead.side || 1) : (R() < 0.5 ? 1 : -1);
   const zk = lead ? ZONE_KIND(lead.w.zone) : null;
   const meta = { zoneKind: zk, sideSign: side };
@@ -1568,7 +1585,7 @@ function hitModel(rc, extra = []) {
 function spreadDir(base, half) {
   const u = new THREE.Vector3().crossVectors(base, Math.abs(base.y) < 0.9 ? UP_Y : new THREE.Vector3(1, 0, 0)).normalize();
   const v = new THREE.Vector3().crossVectors(base, u);
-  const a = Math.random() * Math.PI * 2, r = half * Math.sqrt(Math.random());
+  const a = rand() * Math.PI * 2, r = half * Math.sqrt(rand());
   return base.clone().addScaledVector(u, Math.cos(a) * r).addScaledVector(v, Math.sin(a) * r).normalize();
 }
 // how bad a wound is, to pick the reaction that leads when several land at once
@@ -1685,6 +1702,7 @@ function tracer(a, b, alpha = 0.9) {
   scene.add(line);
   effects.push({ obj: line, life: 0.35, age: 0, update(e, k) { e.obj.material.opacity = alpha * (1 - k); }, done() { g.dispose(); mat.dispose(); } });
 }
+// dust, droplets and tracers are only seen: they use Math.random and nothing in the simulation reads them
 function dust(pt, count = 10) {
   const geo = new THREE.IcosahedronGeometry(0.02, 0);
   const mat = new THREE.MeshBasicMaterial({ color: cssVar('--scene-grid'), transparent: true });
@@ -1839,7 +1857,7 @@ function woundTrack(part, entry, dir) {
 }
 const BLOOD_VOLUME = 70 * BODY_MASS; // ~70 ml of blood per kg
 const fmtRate = r => r >= 1 ? `${r.toFixed(r < 10 ? 1 : 0)} мл/с` : `${Math.round(r * 60)} мл/мин`;
-const rnd = ([lo, hi]) => lo + Math.random() * (hi - lo);
+const rnd = ([lo, hi]) => lo + rand() * (hi - lo);
 let physMult = 1, showBlood = true, xray = false;
 const bloodGroup = new THREE.Group();
 scene.add(bloodGroup);
@@ -1884,7 +1902,7 @@ function addWound(part, hit, dir) {
     if (outHit) addWoundSlot(w, outHit.object, domBone(outHit), outHit.point, rOut);
   }
   c.wounds.push(w);
-  if (w.arrest && c.arrestAt === null) c.arrestAt = c.physT + 8 + Math.random() * 7;
+  if (w.arrest && c.arrestAt === null) c.arrestAt = c.physT + 8 + rand() * 7;
   spatter(hit.point, dir);
   if (track.perforating) spatter(track.exit, dir);
   return w;
@@ -2160,6 +2178,9 @@ function step() {
     character.kneel = null;
   }
   if (++stepCount % 2 === 0) record();
+  // The skeleton is posed here, once per step, and not when a frame is drawn: the run clip, its blending and the hit
+  // testing all start from the bones, so they must be a function of the physics state alone, whatever the frame rate.
+  syncMeshes(); poseRig();
 }
 function syncMeshes() {
   for (const p of parts) {
