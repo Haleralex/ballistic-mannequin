@@ -117,6 +117,9 @@ func (s *Store) Assign(ctx context.Context, v Visitor, keys []string) (map[strin
 		b.Queue(`INSERT INTO assignments (visitor_id, experiment_key, variant) VALUES ($1, $2, $3)
 			ON CONFLICT (visitor_id, experiment_key) DO NOTHING`, v.ID, e.key, variant)
 	}
+	if len(activeKeys) == 0 { // experiments without variants
+		return out, tx.Commit(ctx)
+	}
 	if err := tx.SendBatch(ctx, b).Close(); err != nil {
 		return nil, fmt.Errorf("store: insert assignments: %w", err)
 	}
