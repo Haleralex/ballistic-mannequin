@@ -1,0 +1,25 @@
+# Nightly Postgres dump, started by mq-backup.timer. Install (paths assume the repo at /opt/ballistic-mannequin):
+#   sudo cp deploy/backup/mq-backup.service deploy/backup/mq-backup.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mq-backup.timer
+# Run now: sudo systemctl start mq-backup.service    Log: journalctl -u mq-backup.service
+[Unit]
+Description=ballistic-mannequin: Postgres backup (pg_dump)
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# root: it talks to the Docker daemon (docker exec into the postgres container)
+User=root
+WorkingDirectory=/opt/ballistic-mannequin
+EnvironmentFile=/opt/ballistic-mannequin/deploy/.env
+ExecStart=/opt/ballistic-mannequin/deploy/backup/backup.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectHome=read-only
+ProtectSystem=full
+TimeoutStartSec=1h

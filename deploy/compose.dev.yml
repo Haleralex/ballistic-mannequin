@@ -1,0 +1,48 @@
+# Local development: Postgres for `make dev` / `make test`.
+#   docker compose -f deploy/compose.dev.yml up -d --wait          # postgres only (make dev runs the API with go run)
+#   docker compose -f deploy/compose.dev.yml --profile api up -d   # also the API from deploy/Dockerfile.api
+# Databases: mq (DATABASE_URL) and mq_test (TEST_DATABASE_URL), user mq / password mq. Development only.
+name: mq-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    user: postgres
+    environment:
+      POSTGRES_USER: mq
+      POSTGRES_PASSWORD: mq
+      POSTGRES_DB: mq
+    ports:
+      # localhost only: a dev password must not be reachable from the network
+      - "127.0.0.1:${MQ_PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init-test-db.sh:/docker-entrypoint-initdb.d/10-test-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mq -d mq"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  api:
+    profiles: ["api"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+      args:
+        BUILD: ${BUILD:-dev}
+    image: mq-api:dev
+    environment:
+      DATABASE_URL: postgres://mq:mq@postgres:5432/mq?sslmode=disable
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      ADMIN_USER: ${ADMIN_USER:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    ports:
+      - "127.0.0.1:${MQ_API_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

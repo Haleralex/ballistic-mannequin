@@ -1,0 +1,26 @@
+# Caddy in front of the Go API on the VPS: TLS (Let's Encrypt, automatic), compression, headers, access log.
+# DOMAIN and ACME_EMAIL come from deploy/.env through compose.prod.yml.
+# DOMAIN=localhost makes Caddy use its own local CA instead of Let's Encrypt (for a test on a laptop: curl -k).
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# Caddy is the edge: it sets X-Forwarded-For to the real client address (client-sent values are not trusted),
+	# the API uses it for per-IP rate limits
+	reverse_proxy api:8080
+
+	log {
+		output stdout
+		format json
+	}
+}

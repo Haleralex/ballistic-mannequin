@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1.7
+# API + static frontend in one image (docs/contracts/layout.md: one Go process serves both on $PORT).
+# Build from the repository root:
+#   docker build -f deploy/Dockerfile.api --build-arg BUILD=$(git rev-parse --short HEAD) -t mq-api .
+# The build context is filtered by the root .dockerignore (an allow-list: server/, the frontend files, the healthcheck).
+
+ARG GO_VERSION=1.24
+
+# --- Go binaries -------------------------------------------------------------------------------------------------
+FROM golang:${GO_VERSION}-alpine AS build
+ENV CGO_ENABLED=0 GOOS=linux GOFLAGS=-trimpath
+WORKDIR /src/server
+# dependencies first, so a code change does not download modules again (go.sum is optional while there are none)
+COPY server/go.* ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY server/ ./
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    go build -ldflags="-s -w" -o /out/api ./cmd/api
+WORKDIR /src/healthcheck
+COPY deploy/healthcheck/ ./
+RUN --mount=type=cache,target=/root/.cache/go-build go build -ldflags="-s -w" -o /out/healthcheck .
+
+# --- static frontend ---------------------------------------------------------------------------------------------
+# Everything the .dockerignore lets through except the Go sources: index.html, app.js, bus.js, scenarios.js, xbot.js,
+# features/, assets/, landing.html (whichever exist).
+FROM alpine:3.22 AS static
+COPY . /src
+RUN set -eu; mkdir /static; cp -a /src/. /static/; rm -rf /static/server /static/deploy; \
+    test -f /static/index.html || { echo "index.html missing from the build context" >&2; exit 1; }; \
+    chmod -R a+rX,go-w /static
+
+# --- runtime -----------------------------------------------------------------------------------------------------
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG BUILD=dev
+ENV PORT=8080 \
+    STATIC_DIR=/srv/static \
+    BUILD=${BUILD}
+LABEL org.opencontainers.image.title="ballistic-mannequin api" \
+      org.opencontainers.image.source="https://github.com/Haleralex/ballistic-mannequin" \
+      org.opencontainers.image.revision="${BUILD}"
+COPY --from=build /out/api /out/healthcheck /app/
+COPY --from=static /static /srv/static
+USER nonroot:nonroot
+EXPOSE 8080
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 CMD ["/app/healthcheck"]
+ENTRYPOINT ["/app/api"]

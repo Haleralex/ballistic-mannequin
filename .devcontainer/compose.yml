@@ -1,0 +1,39 @@
+# Services of the dev container (.devcontainer/devcontainer.json). Not used outside Codespaces / VS Code.
+name: mq-codespace
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../..:/workspaces:cached
+    # the dev container idles; you run `make dev` in its terminal
+    command: sleep infinity
+    # same network namespace as postgres: localhost:5432 is the database, and a port the API opens (8080) is
+    # forwarded by Codespaces from here
+    network_mode: service:postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    user: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mq
+      POSTGRES_PASSWORD: mq
+      POSTGRES_DB: mq
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../deploy/postgres/init-test-db.sh:/docker-entrypoint-initdb.d/10-test-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mq -d mq"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  pgdata:
