@@ -1,0 +1,117 @@
+# Production on the VPS: caddy (TLS) → api (Go, serves the API and the static frontend) → postgres.
+# Settings and secrets: deploy/.env (copy deploy/.env.example). Start: `make up-prod` from the repository root, or
+#   docker compose -f deploy/compose.prod.yml --env-file deploy/.env up -d --build --wait
+# Only Caddy publishes ports (80, 443). Postgres and the API are reachable only inside the compose network.
+# Sized for a 2 vCPU / 2–4 GB VPS.
+name: mq
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-hardening: &hardening
+  restart: unless-stopped
+  logging: *logging
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+
+services:
+  caddy:
+    <<: *hardening
+    build:
+      context: ./caddy
+    image: mq-caddy:latest
+    read_only: true
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in deploy/.env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in deploy/.env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data     # certificates and the ACME account: keep this volume
+      - caddy_config:/config
+    tmpfs:
+      - /tmp
+    healthcheck:
+      # Caddy's admin API answers on localhost inside the container only
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits: { cpus: "0.50", memory: 256M }
+
+  api:
+    <<: *hardening
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+      args:
+        BUILD: ${BUILD:-dev}
+    image: mq-api:${BUILD:-dev}
+    read_only: true
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://mq:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@postgres:5432/mq?sslmode=disable
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      ADMIN_USER: ${ADMIN_USER:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    expose:
+      - "8080"
+    tmpfs:
+      - /tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits: { cpus: "1.00", memory: 512M }
+
+  postgres:
+    <<: *hardening
+    image: postgres:16-alpine
+    user: postgres
+    environment:
+      POSTGRES_USER: mq
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      POSTGRES_DB: mq
+    # no `ports:` on purpose — the database is not reachable from outside the VPS (use `make db-shell-prod`)
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: 128m
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - max_connections=50
+      - -c
+      - log_min_duration_statement=500ms
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mq -d mq"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits: { cpus: "1.00", memory: 1G }
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
