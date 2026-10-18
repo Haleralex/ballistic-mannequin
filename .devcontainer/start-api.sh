@@ -11,11 +11,17 @@ if curl -fsS -o /dev/null http://localhost:8080/healthz 2>/dev/null; then
 fi
 echo "starting the API (log: $LOG)"
 setsid nohup make dev >"$LOG" 2>&1 < /dev/null &
+pid=$!
 
 # the first start compiles the server: wait for it, but never block the codespace for long
 for _ in $(seq 1 90); do
   if curl -fsS -o /dev/null http://localhost:8080/healthz 2>/dev/null; then
     echo "API is up: open the Ports tab, port 8080"; exit 0
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "make dev stopped; the end of $LOG:" >&2
+    tail -n 30 "$LOG" >&2
+    exit 0
   fi
   sleep 2
 done
