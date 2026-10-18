@@ -1,0 +1,41 @@
+// GitHub Codespaces / VS Code dev container: Go 1.24, Node 22, Postgres 16 as a sidecar service.
+// The app container shares the network of the postgres service, so the defaults of docs/contracts/layout.md work
+// unchanged (Postgres on localhost:5432, the API on 8080). Start the API with `make dev`.
+// Guide for testers (Russian): docs/ops.md, "Codespaces".
+{
+  "name": "ballistic-mannequin",
+  "dockerComposeFile": "compose.yml",
+  "service": "app",
+  "runServices": ["app", "postgres"],
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "shutdownAction": "stopCompose",
+
+  "hostRequirements": { "cpus": 2, "memory": "4gb" },
+
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": { "label": "Симулятор и API (make dev)", "onAutoForward": "notify" },
+    "5432": { "label": "Postgres", "onAutoForward": "silent" }
+  },
+
+  "remoteEnv": {
+    "MQ_EXTERNAL_DB": "1",
+    "DATABASE_URL": "postgres://mq:mq@localhost:5432/mq?sslmode=disable",
+    "TEST_DATABASE_URL": "postgres://mq:mq@localhost:5432/mq_test?sslmode=disable",
+    "PGHOST": "localhost",
+    "PGUSER": "mq",
+    "PGPASSWORD": "mq",
+    "PGDATABASE": "mq"
+  },
+
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": ["golang.go"]
+    },
+    "codespaces": {
+      "openFiles": ["docs/ops.md"]
+    }
+  }
+}

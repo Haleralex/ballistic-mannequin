@@ -118,5 +118,5 @@ lint-infra: ## compose config, shellcheck and actionlint over deploy/, .devconta
 	$(DEV_COMPOSE) --profile api config -q
 	DOMAIN=example.ru ACME_EMAIL=a@example.ru POSTGRES_PASSWORD=x docker compose -f deploy/compose.prod.yml --env-file /dev/null config -q
 	docker compose -f .devcontainer/compose.yml config -q
-	shellcheck -x deploy/backup/*.sh deploy/postgres/*.sh
+	shellcheck -x deploy/backup/*.sh deploy/postgres/*.sh .devcontainer/*.sh
 	actionlint
