@@ -1,0 +1,23 @@
+# Allow-list: the image needs only the Go sources, the healthcheck helper and the static frontend.
+# Everything else (.git, docs, tests and their node_modules, deploy/.env with secrets, backups) stays out.
+# A new top-level frontend file or directory has to be added here to reach the image.
+*
+
+!server/
+!deploy/healthcheck/
+
+!index.html
+!landing.html
+!app.js
+!bus.js
+!scenarios.js
+!xbot.js
+!features/
+!assets/
+
+# never, even inside allowed directories
+**/.env
+**/.env.*
+**/node_modules
+**/*_test.go
+**/.DS_Store
