@@ -67,6 +67,8 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       ADMIN_USER: ${ADMIN_USER:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # Caddy is the only way in and overwrites X-Forwarded-For: trust it for client IPs (rate limits, https og: links)
+      TRUST_PROXY: "1"
     expose:
       - "8080"
     tmpfs:
