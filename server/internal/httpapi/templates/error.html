@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{{.Title}}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 0; padding: 3rem 1rem; background: #111; color: #eee; text-align: center; }
+  h1 { font-size: 1.5rem; font-weight: 600; }
+  a { color: #8cf; }
+</style>
+</head>
+<body>
+<h1>{{.Title}}</h1>
+<p>{{.Message}}</p>
+{{if .Home}}<p><a href="/">Открыть симулятор</a></p>{{end}}
+</body>
+</html>
