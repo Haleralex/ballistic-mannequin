@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Эксперименты · админка</title>
+<style>
+  :root { --bg: #fff; --fg: #1a1a1a; --muted: #666; --line: #ddd; --good: #0a7d32; --head: #f5f5f5; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #151515; --fg: #eee; --muted: #999; --line: #333; --good: #4cd17a; --head: #1f1f1f; } }
+  body { font: 14px/1.45 system-ui, sans-serif; margin: 0; padding: 1.5rem 1rem 3rem; background: var(--bg); color: var(--fg); }
+  main { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.1rem; margin: 2rem 0 .25rem; }
+  .muted { color: var(--muted); }
+  .wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; font-variant-numeric: tabular-nums; }
+  th, td { border-bottom: 1px solid var(--line); padding: .35rem .6rem; text-align: right; white-space: nowrap; }
+  th { background: var(--head); font-weight: 600; }
+  th:first-child, td:first-child { text-align: left; }
+  .sig { color: var(--good); font-weight: 600; }
+  dl { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: .5rem 1rem; margin: 1rem 0; }
+  dl div { border: 1px solid var(--line); border-radius: 6px; padding: .5rem .75rem; }
+  dt { color: var(--muted); font-size: .85rem; }
+  dd { margin: 0; font-size: 1.2rem; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; font-size: .75rem; padding: 0 .4rem; border-radius: 4px; border: 1px solid var(--line); vertical-align: middle; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<main>
+<h1>Эксперименты</h1>
+<p class="muted">Сборка {{.Build}} · {{time .Generated}} · <a href="/admin/api/waitlist.csv">лист ожидания (CSV)</a></p>
+
+{{with .Summary}}
+<dl>
+  <div><dt>Посетителей (assign)</dt><dd>{{.Visitors}}</dd></div>
+  <div><dt>Прислали события</dt><dd>{{.VisitorsWithEvent}}</dd></div>
+  <div><dt>Активированы</dt><dd>{{.Activated}} <span class="muted">({{ratio .Activated .VisitorsWithEvent}})</span></dd></div>
+  <div><dt>Поделились</dt><dd>{{.Shared}} <span class="muted">({{ratio .Shared .Activated}} акт.)</span></dd></div>
+  <div><dt>Лист ожидания / активированные</dt><dd>{{optpct .WaitlistRate}} <span class="muted">({{.WaitlistVisitors}} / {{.Activated}})</span></dd></div>
+  <div><dt>Адресов в листе ожидания</dt><dd>{{.Waitlist}}</dd></div>
+  <div><dt>Кейсов · просмотров</dt><dd>{{.Cases}} · {{.CaseViews}}</dd></div>
+  <div><dt>Открыли ссылку → свой выстрел</dt><dd>{{.ShareOpened}} → {{.ShareConverted}} <span class="muted">({{ratio .ShareConverted .ShareOpened}})</span></dd></div>
+  <div><dt>Оценки 👍 / 👎</dt><dd>{{.RatingsUp}} / {{.RatingsDown}}</dd></div>
+  <div><dt>Возвраты D1 · D7</dt><dd>{{.ReturnD1}} · {{.ReturnD7}}</dd></div>
+</dl>
+{{end}}
+
+{{range .Experiments}}
+<h2>{{.Key}} {{if .Active}}<span class="badge">идёт</span>{{else}}<span class="badge">выключен</span>{{end}}</h2>
+<p class="muted">Варианты {{join .Variants ", "}} · веса {{.Weights}} · главная метрика <b>{{.Metric}}</b> ·
+  <a href="/admin/api/experiments/{{.Key}}">JSON</a></p>
+{{if .Err}}<p>Не удалось посчитать: {{.Err}}</p>{{else}}
+<div class="wrap"><table>
+  <thead><tr>
+    <th>Вариант</th><th>Посетители</th><th>sim_ready</th><th>Выстрел</th><th>Активация</th><th>Поделились</th><th>Клик «Оформить»</th><th>Почта</th>
+    <th>Конверсия ({{.Metric}})</th><th>95 % интервал</th><th>Разница с a</th><th>p</th>
+  </tr></thead>
+  <tbody>
+  {{range .Rows}}<tr>
+    <td>{{.Variant}}</td><td>{{.Visitors}}</td><td>{{.Funnel.SimReady}}</td><td>{{.Funnel.Shot}}</td><td>{{.Funnel.Activated}}</td>
+    <td>{{.Funnel.Shared}}</td><td>{{.Funnel.DoorClick}}</td><td>{{.Funnel.Waitlist}}</td>
+    <td>{{.Converted}} · {{pct .Rate}}</td><td>{{pct (index .CI 0)}} – {{pct (index .CI 1)}}</td>
+    {{with .Cmp}}<td>{{pp .Diff}}</td><td{{if significant .P}} class="sig"{{end}}>{{pval .P}}</td>{{else}}<td>—</td><td>—</td>{{end}}
+  </tr>{{end}}
+  </tbody>
+</table></div>
+{{end}}
+{{else}}<p>Экспериментов нет.</p>{{end}}
+
+<p class="muted">Единица — посетитель: он сконвертировался, если хотя бы одна его сессия сконвертировалась. Интервал — Вильсона,
+  p — двусторонний z-тест двух долей против варианта a (зелёным p &lt; 0.05, без поправки на множественные сравнения).</p>
+</main>
+</body>
+</html>
